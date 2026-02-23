@@ -221,6 +221,31 @@ class VectorStoreConfig(_ConfigBase):
         description="API key secret for vector store authentication",
     )
 
+    # SSL/TLS configuration for Elasticsearch
+    ssl_enabled: bool = Field(
+        default=False,
+        env="APP_VECTORSTORE_SSL_ENABLED",
+        description="Enable SSL/TLS for Elasticsearch connections",
+    )
+    ca_certs: str | None = Field(
+        default=None,
+        env="APP_VECTORSTORE_CA_CERTS",
+        description=(
+            "Path to a CA bundle PEM file for verifying the Elasticsearch server certificate. "
+            "Required when ssl_enabled=True and the server uses a self-signed or private CA cert "
+            "(e.g., the ECK-generated CA mounted from the *-es-http-certs-public secret). "
+            "Leave unset to use the system CA bundle (suitable for publicly-trusted certs)."
+        ),
+    )
+    verify_certs: bool = Field(
+        default=True,
+        env="APP_VECTORSTORE_VERIFY_CERTS",
+        description=(
+            "Verify the Elasticsearch server certificate when ssl_enabled=True. "
+            "Set to False only for development/testing; not recommended in production."
+        ),
+    )
+
 
 class NvIngestConfig(_ConfigBase):
     """NV-Ingest configuration."""

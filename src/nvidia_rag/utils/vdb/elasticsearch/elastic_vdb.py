@@ -54,6 +54,7 @@ Retrieval Operations:
 
 import logging
 import os
+import ssl
 import time
 from concurrent.futures import Future
 from typing import Any
@@ -155,7 +156,7 @@ class ElasticVDB(VDBRagIngest):
             else ""
         )
 
-        es_conn_params = {
+        es_conn_params: dict = {
             "hosts": [self.es_url],
         }
 
@@ -165,6 +166,12 @@ class ElasticVDB(VDBRagIngest):
             es_conn_params["api_key"] = self._api_key
         elif self._basic_auth:
             es_conn_params["basic_auth"] = self._basic_auth
+
+        if self.config.vector_store.ssl_enabled:
+            es_conn_params["ssl_context"] = self._build_ssl_context(
+                ca_certs=self.config.vector_store.ca_certs,
+                verify_certs=self.config.vector_store.verify_certs,
+            )
 
         self._es_connection = Elasticsearch(**es_conn_params).options(
             request_timeout=int(os.environ.get("ES_REQUEST_TIMEOUT", 600))
@@ -201,6 +208,33 @@ class ElasticVDB(VDBRagIngest):
             dimensions=self.config.embeddings.dimensions,
             hybrid=self.hybrid,
         )
+
+    @staticmethod
+    def _build_ssl_context(
+        ca_certs: str | None,
+        verify_certs: bool,
+    ) -> ssl.SSLContext:
+        """Build an SSLContext for Elasticsearch connections.
+
+        Args:
+            ca_certs: Path to a PEM CA bundle file, or None to use the system bundle.
+            verify_certs: When False the returned context disables certificate
+                verification entirely (development/testing only).
+
+        Returns:
+            A configured :class:`ssl.SSLContext`.
+        """
+        if not verify_certs:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+        if ca_certs:
+            return ssl.create_default_context(cafile=ca_certs)
+
+        # Fall back to the system CA bundle (correct for publicly-trusted certs).
+        return ssl.create_default_context()
 
     @property
     def collection_name(self) -> str:
@@ -977,6 +1011,16 @@ class ElasticVDB(VDBRagIngest):
                     "es_password": pwd,
                 }
             )
+
+        if self.config.vector_store.ssl_enabled:
+            ssl_ctx = self._build_ssl_context(
+                ca_certs=self.config.vector_store.ca_certs,
+                verify_certs=self.config.vector_store.verify_certs,
+            )
+            vectorstore_params["es_params"] = {
+                **vectorstore_params.get("es_params", {}),
+                "ssl_context": ssl_ctx,
+            }
 
         vectorstore = ElasticsearchStore(**vectorstore_params)
 
