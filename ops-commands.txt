@@ -1,0 +1,163 @@
+NVIDIA RAG Blueprint — Local k3s Ops Commands
+==============================================
+Namespace : rag
+Helm chart: deploy/helm/nvidia-blueprint-rag
+Values    : deploy/helm/values-local.yaml
+Personal  : github.com/joncoons/nvidia-rag-elasticsearch-ssl-tls  (branch: local-deploy)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BRING UP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Option A — Resume after a soft shutdown (fast, no re-download)
+──────────────────────────────────────────────────────────────
+# Scale all app deployments back to 1
+kubectl scale deployment -n rag \
+  rag-server ingestor-server rag-frontend rag-nv-ingest \
+  --replicas=1
+
+# Scale NIM deployments back to 1
+kubectl scale deployment -n rag \
+  nim-llm \
+  nemoretriever-embedding-ms \
+  nemoretriever-ranking-ms \
+  nemoretriever-ocr-v1 \
+  nemoretriever-graphic-elements-v1 \
+  nemoretriever-page-elements-v3 \
+  nemoretriever-table-structure-v1 \
+  --replicas=1
+
+# Scale Redis back up
+kubectl scale statefulset -n rag \
+  rag-redis-master rag-redis-replicas \
+  --replicas=1
+
+# Monitor
+kubectl get pods -n rag -w
+
+
+Option B — Full install (after helm uninstall or fresh cluster)
+───────────────────────────────────────────────────────────────
+# Step 1: Ensure eck-es-ca-cert ConfigMap exists
+#   (ECK must be running and Elasticsearch must be Ready first)
+kubectl get elasticsearch rag-eck-elasticsearch -n rag   # should show "green" / "Ready"
+
+kubectl get configmap eck-es-ca-cert -n rag 2>/dev/null || \
+  kubectl create configmap eck-es-ca-cert -n rag \
+    --from-literal=ca.crt="$(kubectl get secret rag-eck-elasticsearch-es-http-certs-public \
+      -n rag -o jsonpath='{.data.ca\.crt}' | base64 -d)"
+
+# Step 2: Read the ECK-managed elastic user password
+ES_PASS=$(kubectl get secret rag-eck-elasticsearch-es-elastic-user \
+  -n rag -o jsonpath='{.data.elastic}' | base64 -d)
+
+# Step 3: Helm install
+cd /home/joncoons/claude/rag/deploy/helm
+helm upgrade --install rag ./nvidia-blueprint-rag \
+  -n rag --create-namespace \
+  -f values-local.yaml \
+  --set envVars.APP_VECTORSTORE_PASSWORD="${ES_PASS}" \
+  --set "ingestor-server.envVars.APP_VECTORSTORE_PASSWORD=${ES_PASS}"
+
+# Step 4: Re-apply NIMCache PVC patch
+#   (workaround: "| default true" bug in llm-nim.yaml prevents setting
+#    storage.pvc.create=false via values; must be patched every install)
+kubectl patch nimcache nim-llm-cache -n rag --type=merge \
+  -p '{"spec":{"storage":{"pvc":{"create":false,"name":"nim-llm-cache-pvc"}}}}'
+
+# Step 5: Monitor — NIM inspection pod runs first, then NIMService pods start
+kubectl get pods -n rag -w
+kubectl get nimservices -n rag -w
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOCAL ACCESS (port-forwards)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+kubectl port-forward -n rag svc/rag-server      8081:8081 &
+kubectl port-forward -n rag svc/ingestor-server 8082:8082 &
+
+# Health checks
+curl http://localhost:8081/health
+curl http://localhost:8082/health
+
+# Kill port-forwards when done
+pkill -f "kubectl port-forward"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHUT DOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Option A — Soft shutdown (scale to 0 — preserves all state, fast resume)
+─────────────────────────────────────────────────────────────────────────
+# Scale NIM deployments to 0 first (heaviest GPU consumers)
+kubectl scale deployment -n rag \
+  nim-llm \
+  nemoretriever-embedding-ms \
+  nemoretriever-ranking-ms \
+  nemoretriever-ocr-v1 \
+  nemoretriever-graphic-elements-v1 \
+  nemoretriever-page-elements-v3 \
+  nemoretriever-table-structure-v1 \
+  --replicas=0
+
+# Scale app deployments to 0
+kubectl scale deployment -n rag \
+  rag-server ingestor-server rag-frontend rag-nv-ingest \
+  --replicas=0
+
+# Scale Redis to 0 (optional — preserves chat history if left running)
+kubectl scale statefulset -n rag \
+  rag-redis-master rag-redis-replicas \
+  --replicas=0
+
+# Elasticsearch (ECK) is intentionally left running to preserve the vector index.
+# To also stop it:
+#   kubectl scale statefulset rag-eck-elasticsearch-es-default -n rag --replicas=0
+
+
+Option B — Full teardown (helm uninstall — removes all app workloads)
+──────────────────────────────────────────────────────────────────────
+# Removes all Helm-managed resources; ECK operator and NIM Operator keep running.
+# Data PVCs are retained (Elasticsearch index, Redis data, ingestor scratch space).
+# The pre-cached NIM model PV (nim-llm-cache-pv) is unmanaged by Helm and is unaffected.
+
+helm uninstall rag -n rag
+
+# Verify all pods are gone
+kubectl get pods -n rag
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STATUS CHECKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# All pods
+kubectl get pods -n rag
+
+# NIM services and readiness
+kubectl get nimservices -n rag
+
+# NIM cache inspection status
+kubectl get nimcache -n rag
+
+# Elasticsearch cluster health
+kubectl get elasticsearch -n rag
+
+# GPU allocation across nodes
+kubectl get pods -n rag -o json | python3 -c "
+import json, sys
+pods = json.load(sys.stdin)['items']
+for p in pods:
+    node = p['spec'].get('nodeName','?')
+    name = p['metadata']['name']
+    for c in p['spec']['containers']:
+        gpus = c.get('resources',{}).get('limits',{}).get('nvidia.com/gpu','')
+        if gpus:
+            print(f'{name:<55} node={node}  gpu={gpus}')
+"
+
+# LLM NIM logs
+kubectl logs -n rag -l app=nim-llm --tail=50 -f
