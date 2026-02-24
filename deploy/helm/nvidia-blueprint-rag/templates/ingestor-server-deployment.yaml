@@ -89,16 +89,22 @@ spec:
           resources:
 {{ toYaml $cfg.resources | nindent 12 }}
           {{- end }}
-          {{- if $cfg.persistence.enabled }}
+          {{- if or $cfg.persistence.enabled $cfg.extraVolumeMounts }}
           volumeMounts:
+            {{- if $cfg.persistence.enabled }}
             - name: ingestor-server-data
               mountPath: {{ default $cfg.envVars.INGESTOR_SERVER_DATA_DIR $cfg.persistence.mountPath }}
               {{- if $cfg.persistence.subPath }}
               subPath: {{ $cfg.persistence.subPath }}
               {{- end }}
+            {{- end }}
+            {{- if $cfg.extraVolumeMounts }}
+            {{- toYaml $cfg.extraVolumeMounts | nindent 12 }}
+            {{- end }}
           {{- end }}
-      {{- if $cfg.persistence.enabled }}
+      {{- if or $cfg.persistence.enabled $cfg.extraVolumes }}
       volumes:
+        {{- if $cfg.persistence.enabled }}
         - name: ingestor-server-data
           {{- if $cfg.persistence.existingClaim }}
           persistentVolumeClaim:
@@ -107,5 +113,9 @@ spec:
           persistentVolumeClaim:
             claimName: {{ printf "%s-data" $cfg.appName }}
           {{- end }}
+        {{- end }}
+        {{- if $cfg.extraVolumes }}
+        {{- toYaml $cfg.extraVolumes | nindent 8 }}
+        {{- end }}
       {{- end }}
 {{- end }}

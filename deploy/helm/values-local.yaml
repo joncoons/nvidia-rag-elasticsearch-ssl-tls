@@ -1,0 +1,264 @@
+# values-local.yaml
+# Local k3s deployment — Elasticsearch SSL/TLS + full NIM stack
+#
+# GPU sharing strategy (all NIMs):
+#   nvidia.com/gpu device plugin with time-slicing (factor 4)
+#   3 physical GPUs x4 = 12 virtual slots total
+#   NIM Operator DRA disabled — NIM Operator v3.0.2 checks for
+#   resource.k8s.io/v1beta2 which was removed in k8s 1.35 (now v1 GA)
+#
+# Node assignments:
+#   ubuntu-local-dev (2x RTX Pro 6000 Blackwell 96 GB, 8 virtual slots):
+#     LLM NIM (NVFP4 49B, ~25 GB VRAM) + Embedding NIM (~4 GB)
+#     + Reranking NIM (~4 GB) + nv-ingest NIMs (OCR, graphic, page, table)
+#     NOTE: All main NIMs pinned here because NIMCache PVCs are bound to
+#     ubuntu-local-dev (local-path provisioner creates node-local PVs)
+#   ubuntu2 (1x RTX 5090 32 GB, 4 virtual slots):
+#     Available for nv-ingest overflow or future NIMs
+#
+# VRAM budget (worst case all on same 96 GB Blackwell):
+#   LLM 25 + Embedding 4 + Reranking 4 + nv-ingest 4x3 = ~45 GB < 96 GB OK
+#
+# NIM model cache:
+#   LLM NIM: pre-cached at /mnt/nvme4/nim_cache/nim — static PV nim-llm-cache-pv
+#   Other NIMs: downloaded by NIMCache jobs to local-path PVCs
+
+# ---------------------------------------------------------------------------
+# NGC secrets — reuse the ones already in the cluster
+# ---------------------------------------------------------------------------
+imagePullSecret:
+  create: false
+  name: "ngc-secret"
+
+ngcApiSecret:
+  create: false
+  name: "ngc-api"
+
+
+# ---------------------------------------------------------------------------
+# RAG Server — Elasticsearch over HTTPS with ECK-managed elastic user auth
+# ECK 3.x always enables TLS + creates 'elastic' user automatically.
+# Password is in secret: rag-eck-elasticsearch-es-elastic-user (key: elastic)
+#
+# SSL note: elastic_transport ignores APP_VECTORSTORE_VERIFY_CERTS; TLS trust
+# is established by mounting the ECK CA cert and setting SSL_CERT_FILE.
+# The ConfigMap eck-es-ca-cert must exist (created once: see cluster-setup notes).
+# ---------------------------------------------------------------------------
+envVars:
+  # Elasticsearch (ECK)
+  APP_VECTORSTORE_URL: "https://rag-eck-elasticsearch-es-http:9200"
+  APP_VECTORSTORE_NAME: "elasticsearch"
+  APP_VECTORSTORE_SSL_ENABLED: "true"
+  APP_VECTORSTORE_VERIFY_CERTS: "false"
+  APP_VECTORSTORE_USERNAME: "elastic"
+  APP_VECTORSTORE_PASSWORD: ""  # kubectl get secret rag-eck-elasticsearch-es-elastic-user -n rag -o jsonpath='{.data.elastic}' | base64 -d
+  APP_VECTORSTORE_APIKEY: ""
+  APP_VECTORSTORE_APIKEY_ID: ""
+  APP_VECTORSTORE_APIKEY_SECRET: ""
+  APP_VECTORSTORE_ENABLEGPUSEARCH: "False"
+  # TLS trust for ECK self-signed cert (elastic_transport uses SSL_CERT_FILE)
+  SSL_CERT_FILE: "/etc/ssl/eck/ca.crt"
+  REQUESTS_CA_BUNDLE: "/etc/ssl/eck/ca.crt"
+  # Local NIM service endpoints (overrides default NVIDIA API catalog URLs)
+  APP_LLM_SERVERURL: "nim-llm:8000"
+  APP_EMBEDDINGS_SERVERURL: "nemoretriever-embedding-ms:8000/v1"
+  APP_RANKING_SERVERURL: "nemoretriever-ranking-ms:8000"
+  APP_QUERYREWRITER_SERVERURL: "nim-llm:8000"
+  APP_FILTEREXPRESSIONGENERATOR_SERVERURL: "nim-llm:8000"
+  REFLECTION_LLM_SERVERURL: "nim-llm:8000"
+
+# ECK CA cert volume — mounts into the nvidia-blueprint-rag container
+# ConfigMap eck-es-ca-cert must be pre-created (not managed by this chart):
+#   kubectl create configmap eck-es-ca-cert -n rag \
+#     --from-literal=ca.crt="$(kubectl get secret rag-eck-elasticsearch-es-http-certs-public \
+#     -n rag -o jsonpath='{.data.ca\.crt}' | base64 -d)"
+extraVolumes:
+  - name: eck-ca
+    configMap:
+      name: eck-es-ca-cert
+
+extraVolumeMounts:
+  - name: eck-ca
+    mountPath: /etc/ssl/eck
+    readOnly: true
+
+# ---------------------------------------------------------------------------
+# Ingestor Server — same Elasticsearch config + ECK CA cert
+# ---------------------------------------------------------------------------
+ingestor-server:
+  imagePullSecret:
+    create: false
+    name: "ngc-secret"
+  envVars:
+    APP_VECTORSTORE_URL: "https://rag-eck-elasticsearch-es-http:9200"
+    APP_VECTORSTORE_NAME: "elasticsearch"
+    APP_VECTORSTORE_SSL_ENABLED: "true"
+    APP_VECTORSTORE_VERIFY_CERTS: "false"
+    APP_VECTORSTORE_USERNAME: "elastic"
+    APP_VECTORSTORE_PASSWORD: ""  # kubectl get secret rag-eck-elasticsearch-es-elastic-user -n rag -o jsonpath='{.data.elastic}' | base64 -d
+    APP_VECTORSTORE_APIKEY: ""
+    APP_VECTORSTORE_APIKEY_ID: ""
+    APP_VECTORSTORE_APIKEY_SECRET: ""
+    APP_VECTORSTORE_ENABLEGPUINDEX: "False"
+    APP_VECTORSTORE_ENABLEGPUSEARCH: "False"
+    APP_EMBEDDINGS_SERVERURL: "nemoretriever-embedding-ms:8000/v1"
+    SSL_CERT_FILE: "/etc/ssl/eck/ca.crt"
+    REQUESTS_CA_BUNDLE: "/etc/ssl/eck/ca.crt"
+  extraVolumes:
+    - name: eck-ca
+      configMap:
+        name: eck-es-ca-cert
+  extraVolumeMounts:
+    - name: eck-ca
+      mountPath: /etc/ssl/eck
+      readOnly: true
+
+# ---------------------------------------------------------------------------
+# ECK Elasticsearch — HTTPS with ECK self-signed cert + elastic user auth
+# ECK 3.x manages xpack.security internally (cannot be overridden).
+# It always enables TLS and creates the 'elastic' user automatically.
+# Password is stored in secret: rag-eck-elasticsearch-es-elastic-user (key: elastic)
+# RAG/ingestor servers authenticate as 'elastic' using APP_VECTORSTORE_USERNAME/PASSWORD above.
+#
+# IMPORTANT: Do NOT set xpack.security.enabled or xpack.security.authc.anonymous.*
+# in nodeSet config — these are "reserved for internal use" in ECK 3.x. Setting them
+# causes ECK to emit a warning and ES to boot with security disabled.
+# ---------------------------------------------------------------------------
+eck-elasticsearch:
+  enabled: true
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: false        # ECK generates and rotates the CA + cert automatically
+  nodeSets:
+  - name: default
+    count: 1
+    config:
+      node.store.allow_mmap: false    # only safe non-reserved setting here
+    podTemplate:
+      spec:
+        containers:
+        - name: elasticsearch
+
+# ---------------------------------------------------------------------------
+# NIMs — nvidia.com/gpu device plugin (time-sliced factor 4)
+# nodeSelector pins each NIM to the correct node; GPU allocated by device plugin
+# ---------------------------------------------------------------------------
+nimOperator:
+  # DRA disabled — NIM Operator 3.0.2 requires resource.k8s.io/v1beta2
+  # which was removed in k8s 1.35 (promoted to v1 GA)
+  draResources:
+    enabled: false
+
+  # LLM NIM — Nemotron Super 49B, NVFP4 on Blackwell
+  # Pre-cached model at /mnt/nvme4/nim_cache/nim — static PV nim-llm-cache-pv
+  nim-llm:
+    nodeSelector:
+      kubernetes.io/hostname: ubuntu-local-dev
+    image:
+      tag: "1.15.5"            # 1.15.5 uses vllm-nvfp4-tp1-pp1-<hash> profile naming; 1.14.0 uses different names
+    model:
+      engine: vllm             # actual cache is vLLM nvfp4 profile (workspace hash ab39d...)
+      precision: "nvfp4"
+      qosProfile: "throughput"
+      tensorParallelism: "1"
+    env:
+      - name: NIM_HTTP_API_PORT
+        value: "8000"
+      - name: NIM_TRITON_LOG_VERBOSE
+        value: "1"
+      - name: NIM_SERVED_MODEL_NAME
+        value: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+      - name: NIM_MODEL_PROFILE
+        value: "vllm-nvfp4-tp1-pp1-ab39d94965dfbc763e58acb18470a9d5e794e47b5772efa1a033d488f87e1e0c"
+      - name: NIM_KVCACHE_PERCENT
+        value: "0.70"    # 70% of GPU memory for KV cache; leaves headroom for smaller NIMs on the same GPU
+      - name: NIM_MAX_MODEL_LEN
+        value: "65536"   # Limit context to 64K tokens to reduce KV cache memory footprint
+      - name: NIM_MAX_NUM_SEQS
+        value: "8"       # Limit to 8 concurrent sequences to cap KV cache size
+      - name: NIM_RELAX_MEM_CONSTRAINTS
+        value: "1"       # Bypass pre-launch 90% free-memory gate; actual usage governed by NIM_KVCACHE_PERCENT above
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+      requests:
+        nvidia.com/gpu: "1"
+    storage:
+      pvc:
+        create: false          # PVC pre-provisioned pointing to /mnt/nvme4/nim_cache/nim
+        # NOTE: create:false cannot be set via helm values due to "| default true" in
+        # llm-nim.yaml template (line 19). Re-apply NIMCache patch after any helm upgrade.
+        name: nim-llm-cache-pvc
+
+  # Embedding NIM — 1B model on ubuntu-local-dev
+  nvidia-nim-llama-32-nv-embedqa-1b-v2:
+    nodeSelector:
+      kubernetes.io/hostname: ubuntu-local-dev
+    env:
+      - name: NIM_NUM_MODEL_INSTANCES
+        value: "1"          # Single Triton instance; prevents auto-scaling to many instances (~27 GB default)
+      - name: NIM_TRITON_PERFORMANCE_MODE
+        value: "latency"    # Single-instance latency mode; default but explicit
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+      requests:
+        nvidia.com/gpu: "1"
+
+  # Reranking NIM — 1B model, pinned to ubuntu-local-dev
+  # (NIMCache PVC is bound to ubuntu-local-dev via local-path provisioner)
+  nvidia-nim-llama-32-nv-rerankqa-1b-v2:
+    nodeSelector:
+      kubernetes.io/hostname: ubuntu-local-dev
+    env:
+      - name: NIM_NUM_MODEL_INSTANCES
+        value: "1"          # Single Triton instance; limits memory to ~2-3 GB vs unconstrained default
+      - name: NIM_TRITON_PERFORMANCE_MODE
+        value: "latency"    # Single-instance latency mode; default but explicit
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+      requests:
+        nvidia.com/gpu: "1"
+
+# ---------------------------------------------------------------------------
+# nv-ingest — all document NIMs enabled
+# These use legacy nvidia.com/gpu (time-sliced via device plugin, factor 4)
+# Milvus disabled — Elasticsearch is the vector store
+# ---------------------------------------------------------------------------
+nv-ingest:
+  milvusDeployed: false
+  nimOperator:
+    nemoretriever_ocr_v1:
+      enabled: true
+      env:
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"    # Single Triton instance; OCR default is unconstrained and expensive
+    graphic_elements:
+      enabled: true
+      env:
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"    # Single Triton instance to minimize GPU memory footprint
+    page_elements:
+      enabled: true
+      env:
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"    # Single Triton instance; page-elements default consumes ~15 GB unconstrained
+    table_structure:
+      enabled: true
+      env:
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"    # Single Triton instance to minimize GPU memory footprint
+
+# ---------------------------------------------------------------------------
+# Observability — disabled for local testing
+# ---------------------------------------------------------------------------
+opentelemetry-collector:
+  enabled: false
+
+zipkin:
+  enabled: false
+
+kube-prometheus-stack:
+  enabled: false
