@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -372,6 +373,24 @@ class DocumentUploadRequest(BaseModel):
             "'markdown_no_bbox' before ingestion, producing high-quality structured "
             "Markdown. Documents with no complex elements fall back to the standard "
             "NV-Ingest pipeline. Requires APP_NEMOPARSE_SERVERURL to be configured."
+        ),
+    )
+
+    upload_batch_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        description=(
+            "Unique identifier for this upload batch. Auto-generated if not supplied. "
+            "All documents in this request share the same batch ID so they can be "
+            "queried or deleted together via metadata filtering."
+        ),
+    )
+
+    source_system: str = Field(
+        default="",
+        description=(
+            "Optional label for the origin of the documents "
+            "(e.g. 'sharepoint', 's3', 'local'). Stored as document metadata for "
+            "lineage tracking and query filtering."
         ),
     )
 

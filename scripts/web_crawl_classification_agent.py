@@ -53,6 +53,7 @@ Usage
 import argparse
 import base64
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -62,7 +63,9 @@ import sys
 import time
 import tempfile
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlsplit
 
@@ -130,12 +133,168 @@ class ContentBlock:
 class PageResult:
     url: str
     slug: str
-    method: str          # "bs4_only" | "bs4+vlm"
+    method: str              # "bs4_only" | "bs4+vlm"
     detected_types: list[str]
-    md_path: str
+    md_paths: list[str]      # one entry per pre-chunked .md file (usually just one)
     screenshot_path: str
-    status: str          # "ok" | "error"
+    status: str              # "ok" | "error"
+    crawl_depth: int = 0
     error: str = ""
+
+    @property
+    def md_path(self) -> str:
+        """Return the first chunk path for backward-compatible single-file access."""
+        return self.md_paths[0] if self.md_paths else ""
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.md_paths)
+
+
+# ---------------------------------------------------------------------------
+# Markdown-aware chunker (shared by PageProcessor and ingestor submission)
+# ---------------------------------------------------------------------------
+
+# Target chunk size in characters (512 tokens × ~4 chars/token)
+_CHUNK_MAX_CHARS: int = 2048
+_CHUNK_OVERLAP_CHARS: int = 600
+
+
+def _split_markdown(
+    text: str, max_chars: int = _CHUNK_MAX_CHARS, overlap_chars: int = _CHUNK_OVERLAP_CHARS
+) -> list[str]:
+    """
+    Split markdown text into chunks that respect header, table, and code-fence boundaries.
+
+    - Never splits inside a fenced code block or a markdown table.
+    - Flushes a chunk at every header boundary.
+    - Prepends the last H1–H3 breadcrumb when starting a new chunk mid-section.
+    - Falls back to paragraph boundaries for oversized prose sections.
+    """
+    if len(text) <= max_chars:
+        return [text.strip()] if text.strip() else [text]
+
+    units = _tokenise_markdown_units(text)
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+    last_headers: dict[int, str] = {}
+
+    def flush() -> None:
+        nonlocal current_parts, current_len
+        body = "\n\n".join(p for p in current_parts if p).strip()
+        if body:
+            chunks.append(body)
+        current_parts = []
+        current_len = 0
+
+    for unit_type, unit_text in units:
+        unit_len = len(unit_text)
+
+        if unit_type == "header":
+            m = re.match(r"^(#+)", unit_text)
+            if m:
+                level = len(m.group(1))
+                last_headers[level] = unit_text.rstrip()
+                for k in list(last_headers):
+                    if k > level:
+                        del last_headers[k]
+            if current_parts:
+                flush()
+            current_parts = [unit_text]
+            current_len = unit_len
+            continue
+
+        needed = current_len + (2 if current_parts else 0) + unit_len
+        if needed <= max_chars or not current_parts:
+            current_parts.append(unit_text)
+            current_len += (2 if len(current_parts) > 1 else 0) + unit_len
+        else:
+            flush()
+            ctx = _build_header_context(last_headers)
+            current_parts = ([ctx] if ctx else []) + [unit_text]
+            current_len = (len(ctx) + 2 if ctx else 0) + unit_len
+
+    flush()
+    return chunks if chunks else [text.strip()]
+
+
+def _tokenise_markdown_units(text: str) -> list[tuple[str, str]]:
+    """Tokenise markdown into (type, content) tuples: header/code_fence/table/paragraph."""
+    units: list[tuple[str, str]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = "```" if stripped.startswith("```") else "~~~"
+            block = [line]
+            i += 1
+            while i < len(lines):
+                block.append(lines[i])
+                if lines[i].strip().startswith(marker) and i > (len(block) - 2):
+                    i += 1
+                    break
+                i += 1
+            units.append(("code_fence", "\n".join(block)))
+            continue
+
+        if stripped.startswith("|") and "|" in stripped:
+            block = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith("|") and "|" in lines[i]:
+                block.append(lines[i])
+                i += 1
+            units.append(("table", "\n".join(block)))
+            continue
+
+        if re.match(r"^#{1,6}\s", line):
+            units.append(("header", line))
+            i += 1
+            continue
+
+        if not stripped:
+            i += 1
+            continue
+
+        block = [line]
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            ns = nxt.strip()
+            if (
+                not ns
+                or re.match(r"^#{1,6}\s", nxt)
+                or ns.startswith("```")
+                or ns.startswith("~~~")
+                or (ns.startswith("|") and "|" in ns)
+            ):
+                break
+            block.append(nxt)
+            i += 1
+        units.append(("paragraph", "\n".join(block)))
+
+    return units
+
+
+def _build_header_context(last_headers: dict[int, str]) -> str:
+    """Return H1–H3 breadcrumb for chunk context carry-forward."""
+    lines = [last_headers[lvl] for lvl in sorted(last_headers) if lvl <= 3]
+    return "\n".join(lines)
+
+
+def _compute_content_hash(filepath: str) -> str:
+    """Return the hex SHA-256 digest of the file, or '' on read error."""
+    h = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as fh:
+            for block in iter(lambda: fh.read(65536), b""):
+                h.update(block)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +733,10 @@ class WebCrawlClassificationAgent:
         self.visited: set[str] = set()
         self.queue: list[str] = [self.start_url]
         self.results: list[PageResult] = []
+        # Lineage tracking
+        self.crawl_session_id: str = str(uuid.uuid4())
+        self.crawl_depth: dict[str, int] = {self.start_url: 0}
+        logger.info("Crawl session ID: %s", self.crawl_session_id)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -591,7 +754,9 @@ class WebCrawlClassificationAgent:
             with open(self.manifest_path, "w", newline="", encoding="utf-8") as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=[
                     "url", "slug", "method", "detected_types",
-                    "md_path", "screenshot_path", "status", "error",
+                    "md_path", "chunk_count", "screenshot_path",
+                    "crawl_depth", "crawl_session_id", "domain",
+                    "status", "error",
                 ])
                 writer.writeheader()
 
@@ -617,7 +782,11 @@ class WebCrawlClassificationAgent:
                         "method": result.method,
                         "detected_types": "|".join(result.detected_types),
                         "md_path": result.md_path,
+                        "chunk_count": result.chunk_count,
                         "screenshot_path": result.screenshot_path,
+                        "crawl_depth": result.crawl_depth,
+                        "crawl_session_id": self.crawl_session_id,
+                        "domain": self.start_netloc,
                         "status": result.status,
                         "error": result.error,
                     })
@@ -664,19 +833,28 @@ class WebCrawlClassificationAgent:
                 url, self.driver, screenshot_path
             )
 
-            # Write Markdown file
-            with open(md_path, "w", encoding="utf-8") as fh:
-                fh.write(f"# {title}\n\n")
-                fh.write(merged_md)
+            # Pre-chunk the markdown and write one file per semantic chunk
+            full_md = f"# {title}\n\n{merged_md}"
+            chunks = _split_markdown(full_md)
+            md_paths: list[str] = []
+            for idx, chunk_text in enumerate(chunks):
+                if len(chunks) == 1:
+                    chunk_path = md_path  # keep original slug.md name for single chunks
+                else:
+                    chunk_path = str(self.pages_dir / f"{slug}_{idx + 1:03d}.md")
+                with open(chunk_path, "w", encoding="utf-8") as fh:
+                    fh.write(chunk_text)
+                md_paths.append(chunk_path)
 
             return PageResult(
                 url=url,
                 slug=slug,
                 method=method,
                 detected_types=detected_types,
-                md_path=md_path,
+                md_paths=md_paths,
                 screenshot_path=screenshot_path,
                 status="ok",
+                crawl_depth=self.crawl_depth.get(url, 0),
             )
 
         except Exception as exc:
@@ -686,15 +864,17 @@ class WebCrawlClassificationAgent:
                 slug=slug,
                 method="error",
                 detected_types=[],
-                md_path="",
+                md_paths=[],
                 screenshot_path="",
                 status="error",
+                crawl_depth=self.crawl_depth.get(url, 0),
                 error=str(exc),
             )
 
     def _enqueue_links(self) -> None:
         """Collect all same-domain links from the current page and add to queue."""
         try:
+            current_depth = self.crawl_depth.get(self.driver.current_url, 0)
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
             for tag in soup.find_all("a", href=True):
                 link = urljoin(self.driver.current_url, tag["href"])
@@ -708,6 +888,8 @@ class WebCrawlClassificationAgent:
                     and not _is_binary_url(link)
                 ):
                     self.queue.append(clean)
+                    if clean not in self.crawl_depth:
+                        self.crawl_depth[clean] = current_depth + 1
         except Exception as exc:
             logger.debug("Link discovery failed: %s", exc)
 
@@ -716,31 +898,71 @@ class WebCrawlClassificationAgent:
     # ------------------------------------------------------------------
 
     def _submit_to_ingestor(self) -> None:
-        """POST all successfully generated .md files to the RAG ingestor API."""
-        md_files = [r.md_path for r in self.results if r.status == "ok" and r.md_path]
+        """POST all successfully generated .md chunk files to the RAG ingestor API."""
+        # Collect all chunk paths and their parent PageResult for lineage metadata
+        chunk_to_result: dict[str, PageResult] = {}
+        for r in self.results:
+            if r.status == "ok":
+                for p in r.md_paths:
+                    if p:
+                        chunk_to_result[p] = r
+
+        md_files = list(chunk_to_result.keys())
         if not md_files:
             logger.info("No markdown files to submit to ingestor")
             return
 
         logger.info(
-            "Submitting %d files to ingestor at %s (collection: %s)",
+            "Submitting %d chunk file(s) to ingestor at %s (collection: %s, session: %s)",
             len(md_files),
             self.ingestor_url,
             self.collection_name,
+            self.crawl_session_id,
         )
+
+        ingested_at = datetime.now(timezone.utc).isoformat()
 
         # Submit in batches of 16 to stay within the ingestor's default batch size
         batch_size = 16
         for batch_start in range(0, len(md_files), batch_size):
             batch = md_files[batch_start: batch_start + batch_size]
             try:
-                files = [("documents", (Path(fp).name, open(fp, "rb"), "text/markdown")) for fp in batch]
+                files = [
+                    ("documents", (Path(fp).name, open(fp, "rb"), "text/markdown"))
+                    for fp in batch
+                ]
+
+                # Build per-file lineage metadata
+                custom_metadata = []
+                for fp in batch:
+                    result = chunk_to_result.get(fp)
+                    meta: dict = {
+                        "content_hash": _compute_content_hash(fp),
+                        "ingested_at": ingested_at,
+                        "pipeline_type": (
+                            "web_crawl_bs4_vlm"
+                            if result and result.method == "bs4+vlm"
+                            else "web_crawl_bs4"
+                        ),
+                        "crawl_session_id": self.crawl_session_id,
+                        "domain": self.start_netloc,
+                        "last_crawled_at": ingested_at,
+                    }
+                    if result:
+                        meta["source_uri"] = result.url
+                        meta["crawl_depth"] = result.crawl_depth
+                    custom_metadata.append({
+                        "filename": Path(fp).name,
+                        "metadata": meta,
+                    })
+
                 payload = json.dumps({
                     "collection_name": self.collection_name,
                     "blocking": False,
-                    # We have already done VLM extraction — do not re-classify
+                    # VLM extraction already done; standard NV-Ingest pipeline for text splitting
                     "use_nemoretriever_parse": False,
                     "split_options": {"chunk_size": 512, "chunk_overlap": 150},
+                    "custom_metadata": custom_metadata,
                 })
                 resp = requests.post(
                     f"{self.ingestor_url}/documents",

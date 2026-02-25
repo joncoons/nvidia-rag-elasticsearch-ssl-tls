@@ -38,6 +38,7 @@ Private methods:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -98,6 +99,22 @@ from nvidia_rag.utils.vdb.vdb_base import VDBRag
 # Initialize logger
 logger = logging.getLogger(__name__)
 TRACER = get_tracer("nvidia_rag.ingestor.main")
+
+
+def _compute_content_hash(filepath: str) -> str:
+    """Return the hex SHA-256 digest of the file at ``filepath``.
+
+    Returns an empty string if the file cannot be read (e.g. temp file already
+    deleted), so callers can store the value unconditionally.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as fh:
+            for block in iter(lambda: fh.read(65536), b""):
+                h.update(block)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 class Mode(str, Enum):
@@ -270,6 +287,8 @@ class NvidiaRAGIngestor:
         enable_pdf_split_processing: bool = False,
         pdf_split_processing_options: dict[str, Any] | None = None,
         use_nemoretriever_parse: bool = False,
+        upload_batch_id: str = "",
+        source_system: str = "",
     ) -> dict[str, Any]:
         """Upload documents to the vector store.
 
@@ -353,10 +372,13 @@ class NvidiaRAGIngestor:
         # has an endpoint configured, run the classifier router on all PDF
         # files before they reach NV-Ingest.  PDFs that contain complex data
         # elements (tables, charts, etc.) are replaced in the file list with
-        # temp Markdown files produced by nemoretriever-parse.  The temp files
-        # are tracked for cleanup after the ingest task completes.
+        # markdown-aware pre-chunked temp files produced by nemoretriever-parse.
         # ----------------------------------------------------------------
         _nemoparse_temp_files: list[str] = []
+        # Maps each temp chunk path back to the original uploaded file path.
+        # Used below for computing content hashes and pipeline_type metadata.
+        chunk_to_original: dict[str, str] = {}
+
         if use_nemoretriever_parse and self.config.nemo_parse.endpoint_url:
             from nvidia_rag.ingestor_server.document_classifier_router import (
                 DocumentClassifierRouter,
@@ -371,14 +393,16 @@ class NvidiaRAGIngestor:
 
             replaced_filepaths: list[str] = []
             for fp in filepaths:
-                temp_md = routing_map.get(fp)
-                if temp_md is not None:
-                    replaced_filepaths.append(temp_md)
-                    _nemoparse_temp_files.append(temp_md)
+                temp_mds = routing_map.get(fp)
+                if temp_mds is not None:
+                    replaced_filepaths.extend(temp_mds)
+                    _nemoparse_temp_files.extend(temp_mds)
+                    for tmp in temp_mds:
+                        chunk_to_original[tmp] = fp
                     logger.info(
-                        "nemoretriever-parse: '%s' → '%s'",
+                        "nemoretriever-parse: '%s' → %d chunk file(s)",
                         os.path.basename(fp),
-                        os.path.basename(temp_md),
+                        len(temp_mds),
                     )
                 else:
                     replaced_filepaths.append(fp)
@@ -389,6 +413,47 @@ class NvidiaRAGIngestor:
                 "use_nemoretriever_parse=True but APP_NEMOPARSE_SERVERURL is not configured "
                 "— falling back to standard NV-Ingest pipeline"
             )
+
+        # ----------------------------------------------------------------
+        # Lineage metadata injection
+        # Automatically augment custom_metadata for every file with:
+        #   content_hash   — SHA-256 of the original source file bytes
+        #   ingested_at    — ISO-8601 timestamp of this ingest call
+        #   pipeline_type  — which pipeline processed the file
+        #   source_uri     — original filename (best proxy for uploaded files)
+        #   upload_batch_id— shared UUID for all files in this upload request
+        #   source_system  — caller-supplied origin label (optional)
+        # ----------------------------------------------------------------
+        ingested_at = datetime.now(UTC).isoformat()
+        if not upload_batch_id:
+            upload_batch_id = str(uuid4())
+
+        # Build lookup: original filename → caller-supplied metadata dict
+        cm_by_name: dict[str, dict] = {
+            m["filename"]: m.get("metadata", {})
+            for m in (custom_metadata or [])
+        }
+
+        augmented_metadata: list[dict] = []
+        for fp in filepaths:
+            original_fp = chunk_to_original.get(fp, fp)
+            original_name = os.path.basename(original_fp)
+            fp_name = os.path.basename(fp)
+
+            base = dict(cm_by_name.get(original_name, {}))
+            base["content_hash"] = _compute_content_hash(original_fp)
+            base["ingested_at"] = ingested_at
+            base["pipeline_type"] = (
+                "nemoretriever_parse" if fp in chunk_to_original else "nv_ingest"
+            )
+            base["source_uri"] = original_name
+            base["upload_batch_id"] = upload_batch_id
+            if source_system:
+                base["source_system"] = source_system
+
+            augmented_metadata.append({"filename": fp_name, "metadata": base})
+
+        custom_metadata = augmented_metadata
 
         # Initialize document-wise status
         nv_ingest_status = await state_manager.initialize_nv_ingest_status(filepaths)
