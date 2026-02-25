@@ -138,6 +138,7 @@ class PageResult:
     md_paths: list[str]      # one entry per pre-chunked .md file (usually just one)
     screenshot_path: str
     status: str              # "ok" | "error"
+    page_title: str = ""
     crawl_depth: int = 0
     error: str = ""
 
@@ -854,6 +855,7 @@ class WebCrawlClassificationAgent:
                 md_paths=md_paths,
                 screenshot_path=screenshot_path,
                 status="ok",
+                page_title=title,
                 crawl_depth=self.crawl_depth.get(url, 0),
             )
 
@@ -939,6 +941,7 @@ class WebCrawlClassificationAgent:
                     meta: dict = {
                         "content_hash": _compute_content_hash(fp),
                         "ingested_at": ingested_at,
+                        "document_type": "md",
                         "pipeline_type": (
                             "web_crawl_bs4_vlm"
                             if result and result.method == "bs4+vlm"
@@ -951,6 +954,8 @@ class WebCrawlClassificationAgent:
                     if result:
                         meta["source_uri"] = result.url
                         meta["crawl_depth"] = result.crawl_depth
+                        if result.page_title:
+                            meta["page_title"] = result.page_title
                     custom_metadata.append({
                         "filename": Path(fp).name,
                         "metadata": meta,

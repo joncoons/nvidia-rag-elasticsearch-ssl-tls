@@ -423,6 +423,7 @@ class NvidiaRAGIngestor:
         #   source_uri     — original filename (best proxy for uploaded files)
         #   upload_batch_id— shared UUID for all files in this upload request
         #   source_system  — caller-supplied origin label (optional)
+        #   document_type  — lowercase file extension of the original file
         # ----------------------------------------------------------------
         ingested_at = datetime.now(UTC).isoformat()
         if not upload_batch_id:
@@ -448,6 +449,7 @@ class NvidiaRAGIngestor:
             )
             base["source_uri"] = original_name
             base["upload_batch_id"] = upload_batch_id
+            base["document_type"] = Path(original_fp).suffix.lstrip(".").lower() or "unknown"
             if source_system:
                 base["source_system"] = source_system
 
