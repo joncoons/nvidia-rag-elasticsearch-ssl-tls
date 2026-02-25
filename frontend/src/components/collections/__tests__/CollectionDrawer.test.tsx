@@ -29,8 +29,10 @@ vi.mock('../../../store/useCollectionDrawerStore', () => ({
     },
     closeDrawer: vi.fn(),
     toggleUploader: vi.fn(),
+    toggleCrawler: vi.fn(),
     deleteError: null,
     showUploader: false,
+    showCrawler: false,
     updateActiveCollection: vi.fn()
   }))
 }));
@@ -38,6 +40,8 @@ vi.mock('../../../store/useCollectionDrawerStore', () => ({
 vi.mock('../../../hooks/useCollectionActions', () => ({
   useCollectionActions: vi.fn(() => ({
     handleDeleteCollection: vi.fn(),
+    deleteCollectionWithoutConfirm: vi.fn(),
+    handleStartCrawl: vi.fn(),
     isDeleting: false
   }))
 }));
@@ -66,16 +70,20 @@ vi.mock('../../../api/useCollectionsApi', () => ({
 interface MockDrawerActionsProps {
   onDelete: () => void;
   onAddSource: () => void;
+  onAddCrawl: () => void;
+  onCloseCrawler: () => void;
   isDeleting: boolean;
+  showCrawler?: boolean;
 }
 
 vi.mock('../../../components/drawer/DrawerActions', () => ({
-  DrawerActions: ({ onDelete, onAddSource, isDeleting }: MockDrawerActionsProps) => (
+  DrawerActions: ({ onDelete, onAddSource, onAddCrawl, isDeleting }: MockDrawerActionsProps) => (
     <div data-testid="drawer-actions">
       <button data-testid="delete-button" onClick={onDelete} disabled={isDeleting}>
         {isDeleting ? 'Deleting...' : 'Delete'}
       </button>
       <button data-testid="add-source-button" onClick={onAddSource}>Add Source</button>
+      <button data-testid="crawl-web-button" onClick={onAddCrawl}>Crawl Web</button>
     </div>
   )
 }));
@@ -86,6 +94,10 @@ vi.mock('../../tasks/DocumentsList', () => ({
 
 vi.mock('../../../components/drawer/UploaderSection', () => ({
   UploaderSection: () => <div data-testid="uploader-section">Uploader Section</div>
+}));
+
+vi.mock('../../../components/drawer/WebCrawlSection', () => ({
+  WebCrawlSection: () => <div data-testid="web-crawl-section">Web Crawl Section</div>
 }));
 
 vi.mock('../CollectionCatalogInfo', () => ({

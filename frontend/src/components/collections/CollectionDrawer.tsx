@@ -24,6 +24,7 @@ import { ConfirmationModal } from "../modals/ConfirmationModal";
 import { Notification, SidePanel, Stack } from "@kui/react";
 import { DocumentsList } from "../tasks/DocumentsList";
 import { UploaderSection } from "../drawer/UploaderSection";
+import { WebCrawlSection } from "../drawer/WebCrawlSection";
 import { CollectionCatalogInfo } from "./CollectionCatalogInfo";
 import type { Collection } from "../../types/collections";
 
@@ -37,7 +38,7 @@ export { UploaderSection } from "../drawer/UploaderSection";
 export { DrawerActions } from "../drawer/DrawerActions";
 
 export default function CollectionDrawer() {
-  const { activeCollection, closeDrawer, toggleUploader, deleteError, showUploader, updateActiveCollection } = useCollectionDrawerStore();
+  const { activeCollection, closeDrawer, toggleUploader, toggleCrawler, deleteError, showUploader, showCrawler, updateActiveCollection } = useCollectionDrawerStore();
   const { setMetadataSchema } = useNewCollectionStore();
   const { deleteCollectionWithoutConfirm, isDeleting } = useCollectionActions();
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -85,6 +86,15 @@ export default function CollectionDrawer() {
     useNewCollectionStore.getState().reset();
   }, [toggleUploader]);
 
+  const handleAddCrawl = useCallback(() => {
+    toggleCrawler(true);
+  }, [toggleCrawler]);
+
+  const handleCloseCrawler = useCallback(() => {
+    toggleCrawler(false);
+    useNewCollectionStore.getState().reset();
+  }, [toggleCrawler]);
+
   const handleDeleteClick = useCallback(() => {
     if (activeCollection?.collection_name) {
       setShowDeleteModal(true);
@@ -110,12 +120,15 @@ export default function CollectionDrawer() {
       style={{ "--side-panel-width": "50vw" }}
       slotHeading={title}
       slotFooter={
-        <DrawerActions 
+        <DrawerActions
           onDelete={handleDeleteClick}
           onAddSource={handleAddSource}
           onCloseUploader={handleCloseUploader}
+          onAddCrawl={handleAddCrawl}
+          onCloseCrawler={handleCloseCrawler}
           isDeleting={isDeleting}
           showUploader={showUploader}
+          showCrawler={showCrawler}
         />
       }
       closeOnClickOutside
@@ -139,6 +152,7 @@ export default function CollectionDrawer() {
       )}
       
       {showUploader && <UploaderSection />}
+      {showCrawler && <WebCrawlSection />}
         
       <ConfirmationModal
         isOpen={showDeleteModal}

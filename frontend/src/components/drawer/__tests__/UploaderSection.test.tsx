@@ -19,16 +19,22 @@ vi.mock('../../../store/useNewCollectionStore', () => {
   const mockStore = {
     selectedFiles: [],
     hasInvalidFiles: false,
+    collectionConfig: {
+      generateSummary: true,
+      useNemotronParse: false,
+      forceNemotronParse: false,
+    },
     reset: vi.fn(),
     addFiles: vi.fn(),
     setFiles: vi.fn(),
-    setHasInvalidFiles: vi.fn()
+    setHasInvalidFiles: vi.fn(),
+    setCollectionConfig: vi.fn(),
   };
-  
+
   const useNewCollectionStore = () => mockStore;
   useNewCollectionStore.getState = () => mockStore;
   useNewCollectionStore.setState = vi.fn();
-  
+
   return { useNewCollectionStore };
 });
 

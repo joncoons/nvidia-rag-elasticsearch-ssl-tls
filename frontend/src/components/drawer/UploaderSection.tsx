@@ -81,16 +81,28 @@ export const UploaderSection = () => {
       <Flex style={{ paddingTop: '8px', paddingBottom: '4px' }}>
         <Stack gap="density-xs">
           <Switch
-            checked={collectionConfig.useNemotronParse}
-            onCheckedChange={(checked: boolean) => setCollectionConfig({ useNemotronParse: checked })}
+            checked={collectionConfig.useNemotronParse || collectionConfig.forceNemotronParse}
+            onCheckedChange={(checked: boolean) => setCollectionConfig({ useNemotronParse: checked, forceNemotronParse: checked ? collectionConfig.forceNemotronParse : false })}
             size="medium"
             slotLabel="Nemotron Parse (complex data elements)"
-            disabled={isUploading}
+            disabled={isUploading || collectionConfig.forceNemotronParse}
           />
           <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
             Classify PDF pages and route documents containing tables, charts, graphs, or
             infographics through nemoretriever-parse VLM for high-quality markdown extraction.
             Requires APP_NEMOPARSE_SERVERURL to be configured.
+          </Text>
+          <Switch
+            checked={collectionConfig.forceNemotronParse}
+            onCheckedChange={(checked: boolean) => setCollectionConfig({ forceNemotronParse: checked, useNemotronParse: checked ? true : collectionConfig.useNemotronParse })}
+            size="medium"
+            slotLabel="Force full extraction (10-K / 10-Q)"
+            disabled={isUploading}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Skip classification and run all PDF pages through nemoretriever-parse VLM.
+            Recommended for financial filings with dense tables and charts.
+            Implies Nemotron Parse enabled.
           </Text>
         </Stack>
       </Flex>

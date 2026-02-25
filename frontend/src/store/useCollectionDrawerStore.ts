@@ -23,11 +23,13 @@ interface CollectionDrawerState {
   isOpen: boolean;
   activeCollection: Collection | null;
   showUploader: boolean;
+  showCrawler: boolean;
   deleteError: string | null;
-  
+
   openDrawer: (collection: Collection) => void;
   closeDrawer: () => void;
   toggleUploader: (show?: boolean) => void;
+  toggleCrawler: (show?: boolean) => void;
   setDeleteError: (error: string | null) => void;
   updateActiveCollection: (collection: Collection) => void;
   reset: () => void;
@@ -52,27 +54,38 @@ export const useCollectionDrawerStore = create<CollectionDrawerState>((set) => (
   isOpen: false,
   activeCollection: null,
   showUploader: false,
+  showCrawler: false,
   deleteError: null,
 
-  openDrawer: (collection) => 
-    set({ isOpen: true, activeCollection: collection, showUploader: false }),
-  
-  closeDrawer: () => 
-    set({ isOpen: false, activeCollection: null, showUploader: false, deleteError: null }),
-  
-  toggleUploader: (show) => 
-    set((state) => ({ showUploader: show ?? !state.showUploader })),
-  
-  setDeleteError: (error) => 
+  openDrawer: (collection) =>
+    set({ isOpen: true, activeCollection: collection, showUploader: false, showCrawler: false }),
+
+  closeDrawer: () =>
+    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, deleteError: null }),
+
+  // Mutually exclusive: opening uploader closes crawler and vice-versa.
+  toggleUploader: (show) =>
+    set((state) => {
+      const next = show ?? !state.showUploader;
+      return { showUploader: next, showCrawler: next ? false : state.showCrawler };
+    }),
+
+  toggleCrawler: (show) =>
+    set((state) => {
+      const next = show ?? !state.showCrawler;
+      return { showCrawler: next, showUploader: next ? false : state.showUploader };
+    }),
+
+  setDeleteError: (error) =>
     set({ deleteError: error }),
-  
+
   updateActiveCollection: (collection) =>
-    set((state) => 
-      state.activeCollection?.collection_name === collection.collection_name 
-        ? { activeCollection: collection } 
+    set((state) =>
+      state.activeCollection?.collection_name === collection.collection_name
+        ? { activeCollection: collection }
         : state
     ),
-  
-  reset: () => 
-    set({ isOpen: false, activeCollection: null, showUploader: false, deleteError: null }),
+
+  reset: () =>
+    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, deleteError: null }),
 })); 

@@ -45,7 +45,7 @@ export function useCollectionActions() {
   const { selectedCollections, clearCollections } = useCollectionsStore();
   const { addTaskNotification, updateTaskNotification } = useNotificationStore();
   const { selectedFiles, fileMetadata, reset } = useNewCollectionStore();
-  const { activeCollection, closeDrawer, toggleUploader } = useCollectionDrawerStore();
+  const { activeCollection, closeDrawer, toggleUploader, toggleCrawler } = useCollectionDrawerStore();
   const deleteCollection = useDeleteCollection();
   const deleteAllDocuments = useDeleteAllDocuments();
   const uploadDocuments = useUploadDocuments();
@@ -234,7 +234,8 @@ export function useCollectionActions() {
       custom_metadata: cleanedMetadata,
       split_options: { chunk_size: 512, chunk_overlap: 150 },
       generate_summary: false,
-      use_nemoretriever_parse: collectionConfig.useNemotronParse,
+      use_nemoretriever_parse: collectionConfig.useNemotronParse || collectionConfig.forceNemotronParse,
+      force_nemoretriever_parse: collectionConfig.forceNemotronParse,
     };
 
     uploadDocuments.mutate(
@@ -266,11 +267,54 @@ export function useCollectionActions() {
     );
   };
 
+  const handleStartCrawl = async () => {
+    if (!activeCollection?.collection_name) return;
+
+    const { crawlConfig } = useNewCollectionStore.getState();
+    if (!crawlConfig.startUrl) return;
+
+    const payload = {
+      start_url: crawlConfig.startUrl,
+      collection_name: activeCollection.collection_name,
+      max_pages: crawlConfig.maxPages,
+      use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
+      force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
+      extract_linked_files: crawlConfig.extractLinkedFiles,
+    };
+
+    try {
+      const res = await fetch("/api/crawl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Crawl request failed: ${res.status}`);
+      const data = await res.json();
+
+      if (data?.task_id) {
+        addTaskNotification({
+          id: data.task_id,
+          collection_name: activeCollection.collection_name,
+          documents: [`Web crawl: ${crawlConfig.startUrl}`],
+          state: "PENDING",
+          created_at: new Date().toISOString(),
+        });
+      }
+
+      toggleCrawler(false);
+      useNewCollectionStore.getState().reset();
+      setTimeout(() => openNotificationPanel(), 100);
+    } catch (error) {
+      console.error("Crawl start failed:", error);
+    }
+  };
+
   return {
     handleDeleteCollection,
     deleteCollectionWithoutConfirm,
     handleDeleteAllDocuments,
     handleUploadDocuments,
+    handleStartCrawl,
     isUploading: uploadDocuments.isPending,
     isDeleting: deleteCollection.isPending,
   };

@@ -52,6 +52,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
+      '/api/crawl': {
+        target: VDB_TARGET,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
       '/api/configuration': {
         target: CHAT_TARGET,
         changeOrigin: true,
@@ -94,6 +99,11 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/api/health': {
+        target: VDB_TARGET,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/api/crawl': {
         target: VDB_TARGET,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),

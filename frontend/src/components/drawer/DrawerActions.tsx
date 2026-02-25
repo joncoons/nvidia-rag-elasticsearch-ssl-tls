@@ -13,27 +13,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { 
-  Button, 
-  Flex, 
-  Spinner 
+import {
+  Button,
+  Flex,
+  Spinner
 } from "@kui/react";
-import { Trash2, Plus, X } from "lucide-react";
+import { Trash2, Plus, X, Globe } from "lucide-react";
 
 interface DrawerActionsProps {
   onDelete: () => void;
   onAddSource: () => void;
   onCloseUploader: () => void;
+  onAddCrawl: () => void;
+  onCloseCrawler: () => void;
   isDeleting?: boolean;
   showUploader?: boolean;
+  showCrawler?: boolean;
 }
 
-export const DrawerActions = ({ 
-  onDelete, 
-  onAddSource, 
+export const DrawerActions = ({
+  onDelete,
+  onAddSource,
   onCloseUploader,
+  onAddCrawl,
+  onCloseCrawler,
   isDeleting = false,
-  showUploader = false
+  showUploader = false,
+  showCrawler = false,
 }: DrawerActionsProps) => (
   <Flex gap="3" justify="stretch" style={{ width: '100%' }}>
     <Button
@@ -54,13 +60,21 @@ export const DrawerActions = ({
         </>
       )}
     </Button>
-    
+
     <Button
       color={showUploader ? "neutral" : "brand"}
       onClick={showUploader ? onCloseUploader : onAddSource}
     >
       {showUploader ? <X size={16} /> : <Plus size={16} />}
-      {showUploader ? "Close Uploader" : "Add Source to Collection"}
+      {showUploader ? "Close Uploader" : "Add Source"}
+    </Button>
+
+    <Button
+      color={showCrawler ? "neutral" : "brand"}
+      onClick={showCrawler ? onCloseCrawler : onAddCrawl}
+    >
+      {showCrawler ? <X size={16} /> : <Globe size={16} />}
+      {showCrawler ? "Close Crawler" : "Crawl Web"}
     </Button>
   </Flex>
 );

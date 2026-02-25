@@ -57,6 +57,19 @@ interface CollectionConfiguration {
   generateSummary: boolean;
   /** Whether to route complex data element pages through nemoretriever-parse VLM */
   useNemotronParse: boolean;
+  /** Skip Pass 1 classification and unconditionally run all PDF pages through VLM */
+  forceNemotronParse: boolean;
+}
+
+/**
+ * Configuration for web crawl ingestion.
+ */
+interface CrawlConfiguration {
+  startUrl: string;
+  maxPages: number;
+  extractLinkedFiles: boolean;
+  useCrawlNemotronParse: boolean;
+  forceCrawlNemotronParse: boolean;
 }
 
 /**
@@ -76,6 +89,8 @@ interface NewCollectionState {
   catalogMetadata: CatalogMetadata;
   // Collection configuration
   collectionConfig: CollectionConfiguration;
+  // Crawl configuration
+  crawlConfig: CrawlConfiguration;
   setCollectionName: (name: string) => void;
   setCollectionNameTouched: (touched: boolean) => void;
   setMetadataSchema: (schema: UIMetadataField[]) => void;
@@ -87,6 +102,8 @@ interface NewCollectionState {
   setCatalogMetadata: (updates: Partial<CatalogMetadata>) => void;
   // Collection configuration setters
   setCollectionConfig: (updates: Partial<CollectionConfiguration>) => void;
+  // Crawl configuration setters
+  setCrawlConfig: (updates: Partial<CrawlConfiguration>) => void;
   addFiles: (files: File[]) => void;
   setFiles: (files: File[]) => void;
   removeFile: (index: number) => void;
@@ -121,6 +138,15 @@ const defaultCatalogMetadata: CatalogMetadata = {
 const defaultCollectionConfig: CollectionConfiguration = {
   generateSummary: true,
   useNemotronParse: false,
+  forceNemotronParse: false,
+};
+
+const defaultCrawlConfig: CrawlConfiguration = {
+  startUrl: "",
+  maxPages: 50,
+  extractLinkedFiles: false,
+  useCrawlNemotronParse: false,
+  forceCrawlNemotronParse: false,
 };
 
 export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
@@ -135,6 +161,7 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
   hasInvalidFiles: false,
   catalogMetadata: { ...defaultCatalogMetadata },
   collectionConfig: { ...defaultCollectionConfig },
+  crawlConfig: { ...defaultCrawlConfig },
 
   setCollectionName: (name) => set({ collectionName: name }),
   setCollectionNameTouched: (touched) => set({ collectionNameTouched: touched }),
@@ -147,6 +174,9 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
   })),
   setCollectionConfig: (updates) => set((state) => ({
     collectionConfig: { ...state.collectionConfig, ...updates }
+  })),
+  setCrawlConfig: (updates) => set((state) => ({
+    crawlConfig: { ...state.crawlConfig, ...updates }
   })),
 
   setMetadataSchema: (schema) => {
@@ -290,5 +320,6 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
       hasInvalidFiles: false,
       catalogMetadata: { ...defaultCatalogMetadata },
       collectionConfig: { ...defaultCollectionConfig },
+      crawlConfig: { ...defaultCrawlConfig },
     }),
 }));

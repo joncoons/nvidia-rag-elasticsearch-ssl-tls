@@ -146,9 +146,21 @@ class DocumentClassifierRouter:
     # Public API
     # ------------------------------------------------------------------
 
-    def route_document(self, filepath: str) -> list[tuple[str, dict]] | None:
+    def route_document(self, filepath: str, force: bool = False) -> list[tuple[str, dict]] | None:
         """
         Classify and (if warranted) parse a single PDF file.
+
+        Parameters
+        ----------
+        filepath : str
+            Path to the PDF file to process.
+        force : bool
+            When ``True``, skip Pass 1 classification entirely and unconditionally
+            route all pages through Pass 2 (``markdown_no_bbox``).  Useful for
+            structured financial documents (10-K, 10-Q) where tables and charts
+            are always present.  The ``pipeline_type`` metadata field will be
+            set to ``"nemoretriever_parse_forced"`` instead of
+            ``"nemoretriever_parse"``.
 
         Returns
         -------
@@ -184,32 +196,42 @@ class DocumentClassifierRouter:
 
         # ----------------------------------------------------------------
         # Pass 1 — lightweight classification (detection_only)
+        # Skipped when force=True; all pages are unconditionally routed.
         # ----------------------------------------------------------------
-        has_complex = False
-        page_is_complex: list[bool] = []
         all_detected_types: set[str] = set()
 
-        for i, page_img in enumerate(pages):
-            b64, mime = self._pil_to_base64(page_img)
-            detected = self._classify_page(b64, mime)
-            all_detected_types |= (detected & COMPLEX_ELEMENT_TYPES)
-            is_complex = bool(detected & COMPLEX_ELEMENT_TYPES)
-            page_is_complex.append(is_complex)
-            if is_complex:
-                has_complex = True
-                logger.info(
-                    "Complex element(s) detected on page %d of '%s': %s",
-                    i + 1,
-                    os.path.basename(filepath),
-                    detected,
-                )
-
-        if not has_complex:
+        if force:
             logger.info(
-                "No complex elements in '%s' — standard NV-Ingest pipeline will be used",
+                "Force mode: skipping Pass 1 classification for '%s', routing all %d page(s) "
+                "directly through nemoretriever-parse",
                 os.path.basename(filepath),
+                page_count,
             )
-            return None
+        else:
+            has_complex = False
+            page_is_complex: list[bool] = []
+
+            for i, page_img in enumerate(pages):
+                b64, mime = self._pil_to_base64(page_img)
+                detected = self._classify_page(b64, mime)
+                all_detected_types |= (detected & COMPLEX_ELEMENT_TYPES)
+                is_complex = bool(detected & COMPLEX_ELEMENT_TYPES)
+                page_is_complex.append(is_complex)
+                if is_complex:
+                    has_complex = True
+                    logger.info(
+                        "Complex element(s) detected on page %d of '%s': %s",
+                        i + 1,
+                        os.path.basename(filepath),
+                        detected,
+                    )
+
+            if not has_complex:
+                logger.info(
+                    "No complex elements in '%s' — standard NV-Ingest pipeline will be used",
+                    os.path.basename(filepath),
+                )
+                return None
 
         logger.info(
             "Routing '%s' through nemoretriever-parse (%d pages total)",
@@ -275,6 +297,8 @@ class DocumentClassifierRouter:
                     "total_chunks": len(chunk_pairs),
                     "page_count": page_count,
                 }
+                if force:
+                    chunk_meta["pipeline_type"] = "nemoretriever_parse_forced"
                 if section_path:
                     chunk_meta["section_path"] = section_path
                 if all_detected_types:
@@ -295,9 +319,19 @@ class DocumentClassifierRouter:
         )
         return temp_pairs
 
-    def route_documents(self, filepaths: list[str]) -> dict[str, list[tuple[str, dict]] | None]:
+    def route_documents(
+        self, filepaths: list[str], force: bool = False
+    ) -> dict[str, list[tuple[str, dict]] | None]:
         """
         Classify and route a batch of file paths.
+
+        Parameters
+        ----------
+        filepaths : list[str]
+            Paths to the files to process.
+        force : bool
+            When ``True``, skip Pass 1 for all PDFs and unconditionally run
+            Pass 2.  Forwarded to :meth:`route_document`.
 
         Returns
         -------
@@ -308,7 +342,7 @@ class DocumentClassifierRouter:
         """
         results: dict[str, list[tuple[str, dict]] | None] = {}
         for fp in filepaths:
-            results[fp] = self.route_document(fp)
+            results[fp] = self.route_document(fp, force=force)
         return results
 
     # ------------------------------------------------------------------

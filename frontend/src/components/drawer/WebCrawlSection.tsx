@@ -1,0 +1,211 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { useCallback, useState } from "react";
+import { useNewCollectionStore } from "../../store/useNewCollectionStore";
+import { useCollectionDrawerStore } from "../../store/useCollectionDrawerStore";
+import { useCollectionActions } from "../../hooks/useCollectionActions";
+import { Button, Stack, Flex, Text, Switch, Spinner } from "@kui/react";
+
+const CloseIcon = () => (
+  <svg style={{ width: '16px', height: '16px', color: 'var(--text-color-inverse)' }} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+  </svg>
+);
+
+export const WebCrawlSection = () => {
+  const { crawlConfig, setCrawlConfig } = useNewCollectionStore();
+  const { toggleCrawler } = useCollectionDrawerStore();
+  const { handleStartCrawl } = useCollectionActions();
+  const [isCrawling, setIsCrawling] = useState(false);
+  const [urlError, setUrlError] = useState("");
+
+  const handleClose = useCallback(() => {
+    toggleCrawler(false);
+    useNewCollectionStore.getState().reset();
+  }, [toggleCrawler]);
+
+  const validateUrl = (url: string): boolean => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setCrawlConfig({ startUrl: val });
+    if (val && !validateUrl(val)) {
+      setUrlError("Please enter a valid URL (e.g. https://example.com)");
+    } else {
+      setUrlError("");
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!crawlConfig.startUrl || !validateUrl(crawlConfig.startUrl)) {
+      setUrlError("Please enter a valid URL");
+      return;
+    }
+    setIsCrawling(true);
+    try {
+      await handleStartCrawl();
+    } finally {
+      setIsCrawling(false);
+    }
+  };
+
+  const canSubmit = !!crawlConfig.startUrl && !urlError && !isCrawling;
+
+  return (
+    <Stack
+      gap="density-xl"
+      style={{
+        borderTop: '1px solid var(--border-color-subtle)',
+        paddingTop: '24px',
+        marginTop: '24px',
+      }}
+    >
+      <Flex justify="between" align="center" style={{ marginBottom: '16px' }}>
+        <Text kind="body/bold/lg" style={{ color: 'var(--text-color-inverse)' }}>
+          Crawl Website
+        </Text>
+        <Button
+          onClick={handleClose}
+          disabled={isCrawling}
+          kind="tertiary"
+          size="small"
+          data-testid="crawler-close-button"
+        >
+          <CloseIcon />
+        </Button>
+      </Flex>
+
+      <Stack gap="density-sm">
+        <Text kind="body/regular/sm" style={{ color: 'var(--text-color-inverse)' }}>
+          Start URL
+        </Text>
+        <input
+          type="url"
+          value={crawlConfig.startUrl}
+          onChange={handleUrlChange}
+          placeholder="https://docs.example.com/"
+          disabled={isCrawling}
+          style={{
+            width: '100%',
+            padding: '8px 12px',
+            background: 'var(--surface-color-default)',
+            border: `1px solid ${urlError ? 'var(--color-danger)' : 'var(--border-color-default)'}`,
+            borderRadius: '4px',
+            color: 'var(--text-color-inverse)',
+            fontSize: '14px',
+            boxSizing: 'border-box',
+          }}
+        />
+        {urlError && (
+          <Text kind="body/regular/xs" style={{ color: 'var(--color-danger)' }}>
+            {urlError}
+          </Text>
+        )}
+      </Stack>
+
+      <Stack gap="density-sm">
+        <Text kind="body/regular/sm" style={{ color: 'var(--text-color-inverse)' }}>
+          Max pages (1–500)
+        </Text>
+        <input
+          type="number"
+          min={1}
+          max={500}
+          value={crawlConfig.maxPages}
+          onChange={(e) => setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(e.target.value) || 50)) })}
+          disabled={isCrawling}
+          style={{
+            width: '120px',
+            padding: '8px 12px',
+            background: 'var(--surface-color-default)',
+            border: '1px solid var(--border-color-default)',
+            borderRadius: '4px',
+            color: 'var(--text-color-inverse)',
+            fontSize: '14px',
+          }}
+        />
+      </Stack>
+
+      <Flex style={{ paddingTop: '4px' }}>
+        <Stack gap="density-xs">
+          <Switch
+            checked={crawlConfig.extractLinkedFiles}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({ extractLinkedFiles: checked })}
+            size="medium"
+            slotLabel="Extract linked files (PDF / DOCX / XLSX)"
+            disabled={isCrawling}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Download and ingest binary documents found as href links on crawled pages.
+          </Text>
+
+          <Switch
+            checked={crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({
+              useCrawlNemotronParse: checked,
+              forceCrawlNemotronParse: checked ? crawlConfig.forceCrawlNemotronParse : false,
+            })}
+            size="medium"
+            slotLabel="Nemotron Parse (complex data elements)"
+            disabled={isCrawling || crawlConfig.forceCrawlNemotronParse}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Route PDFs containing tables, charts, or infographics through nemoretriever-parse VLM.
+          </Text>
+
+          <Switch
+            checked={crawlConfig.forceCrawlNemotronParse}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({
+              forceCrawlNemotronParse: checked,
+              useCrawlNemotronParse: checked ? true : crawlConfig.useCrawlNemotronParse,
+            })}
+            size="medium"
+            slotLabel="Force full extraction (10-K / 10-Q)"
+            disabled={isCrawling}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Skip classification and run all PDF pages through VLM. Implies Nemotron Parse enabled.
+          </Text>
+        </Stack>
+      </Flex>
+
+      <Button
+        onClick={handleSubmit}
+        disabled={!canSubmit}
+        kind="primary"
+        color="brand"
+        size="large"
+        style={{ width: '100%' }}
+      >
+        {isCrawling ? (
+          <Flex align="center" gap="density-sm">
+            <Spinner size="small" aria-label="Starting crawl" />
+            Starting crawl...
+          </Flex>
+        ) : (
+          "Start Crawl"
+        )}
+      </Button>
+    </Stack>
+  );
+};

@@ -287,6 +287,7 @@ class NvidiaRAGIngestor:
         enable_pdf_split_processing: bool = False,
         pdf_split_processing_options: dict[str, Any] | None = None,
         use_nemoretriever_parse: bool = False,
+        force_nemoretriever_parse: bool = False,
         upload_batch_id: str = "",
         source_system: str = "",
     ) -> dict[str, Any]:
@@ -381,17 +382,22 @@ class NvidiaRAGIngestor:
         # Per-chunk metadata from the markdown pre-chunker (e.g. section_path).
         chunk_to_meta: dict[str, dict] = {}
 
+        # force implies use
+        if force_nemoretriever_parse:
+            use_nemoretriever_parse = True
+
         if use_nemoretriever_parse and self.config.nemo_parse.endpoint_url:
             from nvidia_rag.ingestor_server.document_classifier_router import (
                 DocumentClassifierRouter,
             )
 
             logger.info(
-                "nemoretriever-parse routing enabled for upload to collection '%s'",
+                "nemoretriever-parse routing enabled for upload to collection '%s'%s",
                 collection_name,
+                " (force mode — Pass 1 skipped)" if force_nemoretriever_parse else "",
             )
             router = DocumentClassifierRouter.from_config(self.config)
-            routing_map = router.route_documents(filepaths)
+            routing_map = router.route_documents(filepaths, force=force_nemoretriever_parse)
 
             replaced_filepaths: list[str] = []
             for fp in filepaths:
@@ -459,9 +465,12 @@ class NvidiaRAGIngestor:
             base.update(chunk_to_meta.get(fp, {}))
             base["content_hash"] = _compute_content_hash(original_fp)
             base["ingested_at"] = ingested_at
-            base["pipeline_type"] = (
-                "nemoretriever_parse" if fp in chunk_to_original else "nv_ingest"
-            )
+            # Preserve pipeline_type set by the router (e.g. "nemoretriever_parse_forced");
+            # fall back to the standard labels if not already set.
+            if "pipeline_type" not in base:
+                base["pipeline_type"] = (
+                    "nemoretriever_parse" if fp in chunk_to_original else "nv_ingest"
+                )
             base["source_uri"] = original_name
             base["upload_batch_id"] = upload_batch_id
             base["document_type"] = Path(original_fp).suffix.lstrip(".").lower() or "unknown"

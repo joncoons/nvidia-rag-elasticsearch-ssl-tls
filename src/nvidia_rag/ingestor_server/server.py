@@ -376,6 +376,17 @@ class DocumentUploadRequest(BaseModel):
         ),
     )
 
+    force_nemoretriever_parse: bool = Field(
+        default=False,
+        description=(
+            "When True, skips Pass 1 classification and unconditionally routes all "
+            "PDF pages through nemoretriever-parse VLM for high-quality extraction. "
+            "Useful for structured financial documents (10-K, 10-Q) where tables and "
+            "charts are always present. Implies use_nemoretriever_parse=True. "
+            "Requires APP_NEMOPARSE_SERVERURL to be configured."
+        ),
+    )
+
     upload_batch_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
         description=(
@@ -609,6 +620,33 @@ class UpdateMetadataResponse(BaseModel):
     collection_name: str = Field(..., description="Collection name")
 
 
+class CrawlRequest(BaseModel):
+    """Request model for web crawling and ingestion."""
+
+    start_url: str = Field(..., description="URL to start crawling from.")
+    collection_name: str = Field(
+        "multimodal_data", description="Name of the collection in the vector database."
+    )
+    max_pages: int = Field(
+        50, ge=1, le=500, description="Maximum number of HTML pages to crawl."
+    )
+    use_nemoretriever_parse: bool = Field(
+        default=False,
+        description="Route complex PDF/document elements through nemoretriever-parse VLM.",
+    )
+    force_nemoretriever_parse: bool = Field(
+        default=False,
+        description=(
+            "Skip Pass 1 classification and unconditionally run all PDF pages "
+            "through nemoretriever-parse VLM. Implies use_nemoretriever_parse=True."
+        ),
+    )
+    extract_linked_files: bool = Field(
+        default=False,
+        description="Download and ingest binary files (PDF, DOCX, XLSX, PPTX) found as hrefs.",
+    )
+
+
 @app.exception_handler(RequestValidationError)
 @trace_function("ingestor.server.request_validation_exception_handler", tracer=TRACER)
 async def request_validation_exception_handler(
@@ -757,6 +795,52 @@ async def upload_document(
         )
         return JSONResponse(
             content={"message": f"Ingestion of files failed with error: {e}"},
+            status_code=500,
+        )
+
+
+@app.post(
+    "/crawl",
+    tags=["Ingestion APIs"],
+    response_model=IngestionTaskResponse,
+    responses={
+        500: {
+            "description": "Internal Server Error",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Internal server error occurred"}
+                }
+            },
+        },
+    },
+)
+@trace_function("ingestor.server.crawl_web", tracer=TRACER)
+async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskResponse:
+    """Crawl a website and ingest discovered pages and linked files into the vector store."""
+    from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
+    from nvidia_rag.utils.web_crawler import SimpleWebCrawler
+
+    try:
+        vdb_auth_token = _extract_vdb_auth_token(request)
+        crawler = SimpleWebCrawler(
+            start_url=payload.start_url,
+            max_pages=payload.max_pages,
+            extract_linked_files=payload.extract_linked_files,
+            use_nemoretriever_parse=payload.use_nemoretriever_parse,
+            force_nemoretriever_parse=payload.force_nemoretriever_parse,
+        )
+
+        async def _crawl_task():
+            return await crawler.crawl(
+                NV_INGEST_INGESTOR, payload.collection_name, vdb_auth_token
+            )
+
+        task_id = await INGESTION_TASK_HANDLER.submit_task(_crawl_task)
+        return IngestionTaskResponse(message="Crawl started", task_id=task_id)
+    except Exception as e:
+        logger.error(f"Error starting crawl task: {e}")
+        return JSONResponse(
+            content={"message": f"Failed to start crawl: {e}"},
             status_code=500,
         )
 
