@@ -378,6 +378,8 @@ class NvidiaRAGIngestor:
         # Maps each temp chunk path back to the original uploaded file path.
         # Used below for computing content hashes and pipeline_type metadata.
         chunk_to_original: dict[str, str] = {}
+        # Per-chunk metadata from the markdown pre-chunker (e.g. section_path).
+        chunk_to_meta: dict[str, dict] = {}
 
         if use_nemoretriever_parse and self.config.nemo_parse.endpoint_url:
             from nvidia_rag.ingestor_server.document_classifier_router import (
@@ -393,16 +395,18 @@ class NvidiaRAGIngestor:
 
             replaced_filepaths: list[str] = []
             for fp in filepaths:
-                temp_mds = routing_map.get(fp)
-                if temp_mds is not None:
-                    replaced_filepaths.extend(temp_mds)
-                    _nemoparse_temp_files.extend(temp_mds)
-                    for tmp in temp_mds:
-                        chunk_to_original[tmp] = fp
+                temp_pairs = routing_map.get(fp)
+                if temp_pairs is not None:
+                    for tmp_path, chunk_meta in temp_pairs:
+                        replaced_filepaths.append(tmp_path)
+                        _nemoparse_temp_files.append(tmp_path)
+                        chunk_to_original[tmp_path] = fp
+                        if chunk_meta:
+                            chunk_to_meta[tmp_path] = chunk_meta
                     logger.info(
                         "nemoretriever-parse: '%s' → %d chunk file(s)",
                         os.path.basename(fp),
-                        len(temp_mds),
+                        len(temp_pairs),
                     )
                 else:
                     replaced_filepaths.append(fp)
@@ -424,6 +428,8 @@ class NvidiaRAGIngestor:
         #   upload_batch_id— shared UUID for all files in this upload request
         #   source_system  — caller-supplied origin label (optional)
         #   document_type  — lowercase file extension of the original file
+        #   section_path   — H1>H2>H3 breadcrumb of the chunk's position in
+        #                    the document (nemoretriever_parse pipeline only)
         # ----------------------------------------------------------------
         ingested_at = datetime.now(UTC).isoformat()
         if not upload_batch_id:
@@ -442,6 +448,9 @@ class NvidiaRAGIngestor:
             fp_name = os.path.basename(fp)
 
             base = dict(cm_by_name.get(original_name, {}))
+            # Merge per-chunk metadata (e.g. section_path from pre-chunker).
+            # Applied before fixed lineage fields so those always take precedence.
+            base.update(chunk_to_meta.get(fp, {}))
             base["content_hash"] = _compute_content_hash(original_fp)
             base["ingested_at"] = ingested_at
             base["pipeline_type"] = (

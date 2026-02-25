@@ -307,6 +307,7 @@ automatically. No client-side action is required; the ingestor injects them at i
 | `upload_batch_id` | API field (auto-UUID) | UUID shared by all documents in a single upload request. Auto-generated if not supplied. |
 | `source_system` | API field (optional) | Caller-supplied origin label, e.g. `"sharepoint"`, `"s3"`, `"local"`. |
 | `document_type` | Ingestor (auto) | Lowercase file extension of the original file, e.g. `"pdf"`, `"docx"`, `"md"`. Falls back to `"unknown"` if no extension. |
+| `section_path` | Ingestor (auto, nemoretriever_parse only) | H1→H2→H3 breadcrumb of the document section containing the chunk, e.g. `"Results > Revenue > Q4"`. Empty for standard NV-Ingest pipeline chunks. |
 
 ### Querying by lineage metadata
 
@@ -412,6 +413,7 @@ crawl_output/
 | `md_path` | Path to the first (or only) chunk file |
 | `chunk_count` | Total number of chunk files produced for this page |
 | `screenshot_path` | Full-page screenshot path |
+| `section_h1` | Text of the first `<h1>` on the page (empty string if absent) |
 | `crawl_depth` | BFS hop distance from the seed URL |
 | `crawl_session_id` | UUID shared across all pages in this crawl run |
 | `domain` | Netloc of the seed URL |
@@ -435,6 +437,7 @@ submitted file:
 | `crawl_depth` | BFS hop distance from seed URL |
 | `document_type` | Always `"md"` for web crawl chunks |
 | `page_title` | HTML `<title>` of the crawled page (omitted if blank) |
+| `section_h1` | Text of the first `<h1>` element on the page (omitted if absent) |
 
 ### Query web crawl content
 
@@ -613,7 +616,8 @@ collection creation time via `POST /collection`.
 
 ### Base lineage schema — all collections
 
-These seven fields are injected automatically by the ingestor for every uploaded document.
+These eight fields are injected automatically by the ingestor for every uploaded document
+(`section_path` is only populated for nemoretriever_parse-routed chunks).
 Declaring them in the schema enables type-safe filtering and LLM-assisted filter
 generation against them.
 
@@ -678,6 +682,14 @@ curl -X POST http://<node-ip>:8082/collection \
         "support_dynamic_filtering": true,
         "max_length": 32,
         "description": "Lowercase file extension of the source file: pdf, docx, md, etc."
+      },
+      {
+        "name": "section_path",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 512,
+        "description": "H1>H2>H3 breadcrumb of the chunk position, e.g. Results > Revenue > Q4 (nemoretriever_parse pipeline only)"
       }
     ]
   }'
@@ -685,7 +697,7 @@ curl -X POST http://<node-ip>:8082/collection \
 
 ### Web crawl extension — additional fields for crawled collections
 
-Add these six fields to the `metadata_schema` array (in addition to the seven base lineage
+Add these seven fields to the `metadata_schema` array (in addition to the eight base lineage
 fields) when the collection will hold web crawl content.  They are automatically attached
 by the web crawl agent on submission.
 
@@ -788,6 +800,14 @@ curl -X POST http://<node-ip>:8082/collection \
         "support_dynamic_filtering": true,
         "max_length": 512,
         "description": "HTML <title> of the crawled page; omitted if blank"
+      },
+      {
+        "name": "section_h1",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 512,
+        "description": "Text of the first <h1> element on the page; omitted if absent"
       }
     ]
   }'
@@ -805,7 +825,9 @@ curl -X POST http://<node-ip>:8082/collection \
 | `source_uri` | `string` | `true` | "Docs from annual_report.pdf" is meaningful |
 | `source_system` | `string` | `true` | "Docs from SharePoint" is meaningful |
 | `document_type` | `string` | `true` | "Only PDF documents" or "Only markdown pages" is meaningful |
+| `section_path` | `string` | `true` | "Only chunks from the Revenue section" is meaningful (nemoretriever_parse only) |
 | `page_title` | `string` | `true` | "Pages about authentication" (title-match) is meaningful (web crawl only) |
+| `section_h1` | `string` | `true` | "Pages whose heading is Installation" is meaningful (web crawl only) |
 | `domain` | `string` | `true` | "Pages from docs.nvidia.com" is meaningful |
 | `crawl_depth` | `integer` | `true` | "Top-level pages only (depth ≤ 1)" is meaningful |
 | `last_crawled_at` | `datetime` | `true` | "Pages crawled this month" is meaningful |
@@ -837,9 +859,11 @@ ingested_at after "2025-06-01T00:00:00Z"
 ingested_at between "2025-01-01" and "2025-12-31"
 source_system in ["sharepoint", "s3"]
 document_type in ["pdf", "docx"]
+section_path like "%Revenue%"
 crawl_depth <= 2
 source_uri like "%annual_report%"
 page_title like "%authentication%"
+section_h1 like "%Installation%"
 ```
 
 ---
@@ -917,7 +941,8 @@ curl -X POST http://<node-ip>:8082/collection \
       {"name":"source_uri",      "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":1024, "description":"Original filename"},
       {"name":"upload_batch_id", "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":36,   "description":"Upload batch UUID"},
       {"name":"source_system",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":128,  "description":"Origin system label"},
-      {"name":"document_type",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":32,   "description":"Lowercase file extension: pdf, docx, md, etc."}
+      {"name":"document_type",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":32,   "description":"Lowercase file extension: pdf, docx, md, etc."},
+      {"name":"section_path",    "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"H1>H2>H3 breadcrumb (nemoretriever_parse only)"}
     ]
   }'
 ```
@@ -942,7 +967,8 @@ curl -X POST http://<node-ip>:8082/collection \
       {"name":"domain",           "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":253,  "description":"Seed URL netloc"},
       {"name":"crawl_depth",      "type":"integer",  "required":false,"support_dynamic_filtering":true,                    "description":"BFS hops from seed URL"},
       {"name":"last_crawled_at",  "type":"datetime", "required":false,"support_dynamic_filtering":true,                    "description":"Last crawl timestamp"},
-      {"name":"page_title",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"HTML title of the crawled page"}
+      {"name":"page_title",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"HTML title of the crawled page"},
+      {"name":"section_h1",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"First <h1> element text on the page"}
     ]
   }'
 ```

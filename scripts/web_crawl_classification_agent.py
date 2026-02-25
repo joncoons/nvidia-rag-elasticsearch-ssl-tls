@@ -139,6 +139,7 @@ class PageResult:
     screenshot_path: str
     status: str              # "ok" | "error"
     page_title: str = ""
+    section_h1: str = ""
     crawl_depth: int = 0
     error: str = ""
 
@@ -756,7 +757,7 @@ class WebCrawlClassificationAgent:
                 writer = csv.DictWriter(csvfile, fieldnames=[
                     "url", "slug", "method", "detected_types",
                     "md_path", "chunk_count", "screenshot_path",
-                    "crawl_depth", "crawl_session_id", "domain",
+                    "section_h1", "crawl_depth", "crawl_session_id", "domain",
                     "status", "error",
                 ])
                 writer.writeheader()
@@ -785,6 +786,7 @@ class WebCrawlClassificationAgent:
                         "md_path": result.md_path,
                         "chunk_count": result.chunk_count,
                         "screenshot_path": result.screenshot_path,
+                        "section_h1": result.section_h1,
                         "crawl_depth": result.crawl_depth,
                         "crawl_session_id": self.crawl_session_id,
                         "domain": self.start_netloc,
@@ -829,6 +831,10 @@ class WebCrawlClassificationAgent:
             # Get page title for Markdown header
             title = self.driver.title or slug
 
+            # Extract first H1 for section_h1 metadata field
+            _h1 = BeautifulSoup(self.driver.page_source, "html.parser").find("h1")
+            section_h1 = _h1.get_text(strip=True) if _h1 else ""
+
             # Process through PageProcessor (prose + optional VLM)
             merged_md, method, detected_types = self.processor.process(
                 url, self.driver, screenshot_path
@@ -856,6 +862,7 @@ class WebCrawlClassificationAgent:
                 screenshot_path=screenshot_path,
                 status="ok",
                 page_title=title,
+                section_h1=section_h1,
                 crawl_depth=self.crawl_depth.get(url, 0),
             )
 
@@ -956,6 +963,8 @@ class WebCrawlClassificationAgent:
                         meta["crawl_depth"] = result.crawl_depth
                         if result.page_title:
                             meta["page_title"] = result.page_title
+                        if result.section_h1:
+                            meta["section_h1"] = result.section_h1
                     custom_metadata.append({
                         "filename": Path(fp).name,
                         "metadata": meta,

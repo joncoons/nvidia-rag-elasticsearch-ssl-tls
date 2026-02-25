@@ -146,17 +146,19 @@ class DocumentClassifierRouter:
     # Public API
     # ------------------------------------------------------------------
 
-    def route_document(self, filepath: str) -> list[str] | None:
+    def route_document(self, filepath: str) -> list[tuple[str, dict]] | None:
         """
         Classify and (if warranted) parse a single PDF file.
 
         Returns
         -------
-        list[str]
-            One or more temporary ``.md`` chunk files produced by splitting the
-            nemoretriever-parse output with a markdown-aware chunker.  The list
-            contains at least one path.  **The caller is responsible for deleting
-            all returned files after they have been submitted to NV-Ingest.**
+        list[tuple[str, dict]]
+            One or more ``(path, chunk_meta)`` pairs where ``path`` is a
+            temporary ``.md`` chunk file and ``chunk_meta`` is a dict of
+            per-chunk metadata (e.g. ``{"section_path": "Intro > Background"}``;
+            empty dict if no header context was active at the chunk boundary).
+            **The caller is responsible for deleting all returned files after
+            they have been submitted to NV-Ingest.**
         None
             The document contains no complex data elements; use the standard
             NV-Ingest pipeline.
@@ -250,24 +252,25 @@ class DocumentClassifierRouter:
         # ----------------------------------------------------------------
         stem = Path(filepath).stem
         full_text = f"# {stem}\n\n" + "\n\n---\n\n".join(output_parts)
-        chunks = self._split_markdown(
+        chunk_pairs = self._split_markdown(
             full_text,
             max_chars=self._chunk_max_chars,
             overlap_chars=self._chunk_overlap_chars,
         )
 
-        temp_paths: list[str] = []
+        temp_pairs: list[tuple[str, dict]] = []
         try:
-            for idx, chunk_text in enumerate(chunks):
-                suffix = f"_{idx + 1:03d}.md" if len(chunks) > 1 else ".md"
+            for idx, (chunk_text, section_path) in enumerate(chunk_pairs):
+                suffix = f"_{idx + 1:03d}.md" if len(chunk_pairs) > 1 else ".md"
                 tmp_fd, tmp_path = tempfile.mkstemp(
                     suffix=suffix, prefix=f"{stem}_nemoparse_"
                 )
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
                     fh.write(chunk_text)
-                temp_paths.append(tmp_path)
+                chunk_meta: dict = {"section_path": section_path} if section_path else {}
+                temp_pairs.append((tmp_path, chunk_meta))
         except Exception:
-            for tp in temp_paths:
+            for tp, _ in temp_pairs:
                 try:
                     os.unlink(tp)
                 except OSError:
@@ -277,22 +280,22 @@ class DocumentClassifierRouter:
         logger.info(
             "nemoretriever-parse output for '%s' written to %d chunk file(s)",
             os.path.basename(filepath),
-            len(temp_paths),
+            len(temp_pairs),
         )
-        return temp_paths
+        return temp_pairs
 
-    def route_documents(self, filepaths: list[str]) -> dict[str, list[str] | None]:
+    def route_documents(self, filepaths: list[str]) -> dict[str, list[tuple[str, dict]] | None]:
         """
         Classify and route a batch of file paths.
 
         Returns
         -------
-        dict[str, list[str] | None]
+        dict[str, list[tuple[str, dict]] | None]
             Maps each original file path to either:
-              - A list of temp ``.md`` chunk paths (caller must delete all after ingest), or
+              - A list of ``(path, chunk_meta)`` pairs (caller must delete all paths after ingest), or
               - ``None`` (no complex elements; use standard NV-Ingest pipeline).
         """
-        results: dict[str, list[str] | None] = {}
+        results: dict[str, list[tuple[str, dict]] | None] = {}
         for fp in filepaths:
             results[fp] = self.route_document(fp)
         return results
@@ -395,7 +398,7 @@ class DocumentClassifierRouter:
     @staticmethod
     def _split_markdown(
         text: str, max_chars: int = 2048, overlap_chars: int = 600
-    ) -> list[str]:
+    ) -> list[tuple[str, str]]:
         """
         Split markdown text into chunks that respect header, table, and
         code-fence boundaries.
@@ -409,24 +412,28 @@ class DocumentClassifierRouter:
         - Fall back to paragraph boundaries when a non-atomic section
           exceeds ``max_chars``.
 
-        Returns a list of chunk strings; never empty.
+        Returns a list of ``(chunk_text, section_path)`` tuples; never empty.
+        ``section_path`` is a human-readable breadcrumb of the H1–H3 headers
+        active at the start of each chunk, e.g. ``"Introduction > Background"``.
+        Empty string if no headers precede the chunk.
         """
         import re as _re  # already imported at module level; local alias for static
 
         if len(text) <= max_chars:
-            return [text.strip()] if text.strip() else [text]
+            return [(text.strip(), "")] if text.strip() else [(text, "")]
 
         units = DocumentClassifierRouter._tokenise_markdown_units(text)
-        chunks: list[str] = []
+        chunks: list[tuple[str, str]] = []
         current_parts: list[str] = []
         current_len = 0
         last_headers: dict[int, str] = {}
+        current_section_path: str = ""
 
         def flush() -> None:
             nonlocal current_parts, current_len
             body = "\n\n".join(p for p in current_parts if p).strip()
             if body:
-                chunks.append(body)
+                chunks.append((body, current_section_path))
             current_parts = []
             current_len = 0
 
@@ -443,6 +450,7 @@ class DocumentClassifierRouter:
                             del last_headers[k]
                 if current_parts:
                     flush()
+                current_section_path = DocumentClassifierRouter._section_path_string(last_headers)
                 current_parts = [unit_text]
                 current_len = unit_len
                 continue
@@ -453,12 +461,13 @@ class DocumentClassifierRouter:
                 current_len += (2 if len(current_parts) > 1 else 0) + unit_len
             else:
                 flush()
+                current_section_path = DocumentClassifierRouter._section_path_string(last_headers)
                 ctx = DocumentClassifierRouter._build_header_context(last_headers)
                 current_parts = ([ctx] if ctx else []) + [unit_text]
                 current_len = (len(ctx) + 2 if ctx else 0) + unit_len
 
         flush()
-        return chunks if chunks else [text.strip()]
+        return chunks if chunks else [(text.strip(), "")]
 
     @staticmethod
     def _tokenise_markdown_units(text: str) -> list[tuple[str, str]]:
@@ -539,3 +548,13 @@ class DocumentClassifierRouter:
         """Return a breadcrumb of the last H1–H3 headers for chunk context carry-forward."""
         lines = [last_headers[lvl] for lvl in sorted(last_headers) if lvl <= 3]
         return "\n".join(lines)
+
+    @staticmethod
+    def _section_path_string(last_headers: dict[int, str]) -> str:
+        """Return a human-readable section path for metadata, e.g. 'Introduction > Background'.
+
+        Strips leading ``#`` symbols so the value is suitable for storage as a
+        metadata field and natural-language filter generation.
+        """
+        parts = [last_headers[lvl].lstrip("#").strip() for lvl in sorted(last_headers) if lvl <= 3]
+        return " > ".join(p for p in parts if p)
