@@ -104,6 +104,16 @@ ingestor-server:
     APP_EMBEDDINGS_SERVERURL: "nemoretriever-embedding-ms:8000/v1"
     SSL_CERT_FILE: "/etc/ssl/eck/ca.crt"
     REQUESTS_CA_BUNDLE: "/etc/ssl/eck/ca.crt"
+    # ---------------------------------------------------------------------------
+    # nemoretriever-parse — complex data element routing (tables, charts, etc.)
+    # Toggle APP_NEMOPARSE_ENABLED to activate server-side default; individual
+    # uploads can also set use_nemoretriever_parse=true via the API/GUI toggle.
+    # APP_NEMOPARSE_SERVERURL points to the nemoretriever-parse NIM service.
+    # ---------------------------------------------------------------------------
+    APP_NEMOPARSE_ENABLED: "false"
+    APP_NEMOPARSE_SERVERURL: "http://nemoretriever-parse-ms:8000/v1/chat/completions"
+    APP_NEMOPARSE_MODELNAME: "nvdev/nvidia/nemoretriever-parse"
+    APP_NEMOPARSE_APIKEY: ""   # inject via --set if NGC API key required
   extraVolumes:
     - name: eck-ca
       configMap:
@@ -250,6 +260,28 @@ nv-ingest:
       env:
         - name: NIM_NUM_MODEL_INSTANCES
           value: "1"    # Single Triton instance to minimize GPU memory footprint
+
+    # -----------------------------------------------------------------------
+    # nemoretriever-parse — VLM for high-quality structured extraction
+    # Used by DocumentClassifierRouter when use_nemoretriever_parse=True.
+    # Single instance: model is large (~20+ GB VRAM); one concurrent request
+    # at a time is the right constraint for the ingest workload.
+    # Pin to ubuntu-local-dev (high VRAM) — NIMCache PVC is node-local.
+    # -----------------------------------------------------------------------
+    nemoretriever_parse:
+      enabled: true
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu-local-dev
+      env:
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"    # Single instance — serialises ingest requests, caps VRAM usage
+        - name: NIM_TRITON_PERFORMANCE_MODE
+          value: "latency"    # Optimise for low single-request latency over throughput
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"
 
 # ---------------------------------------------------------------------------
 # Observability — disabled for local testing

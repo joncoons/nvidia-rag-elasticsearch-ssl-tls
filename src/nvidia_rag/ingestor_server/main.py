@@ -269,6 +269,7 @@ class NvidiaRAGIngestor:
         vdb_auth_token: str = "",
         enable_pdf_split_processing: bool = False,
         pdf_split_processing_options: dict[str, Any] | None = None,
+        use_nemoretriever_parse: bool = False,
     ) -> dict[str, Any]:
         """Upload documents to the vector store.
 
@@ -346,28 +347,86 @@ class NvidiaRAGIngestor:
                 f"Collection {collection_name} does not exist. Ensure a collection is created using POST /collection endpoint first."
             )
 
+        # ----------------------------------------------------------------
+        # nemoretriever-parse pre-processing
+        # If the caller toggled use_nemoretriever_parse AND the server config
+        # has an endpoint configured, run the classifier router on all PDF
+        # files before they reach NV-Ingest.  PDFs that contain complex data
+        # elements (tables, charts, etc.) are replaced in the file list with
+        # temp Markdown files produced by nemoretriever-parse.  The temp files
+        # are tracked for cleanup after the ingest task completes.
+        # ----------------------------------------------------------------
+        _nemoparse_temp_files: list[str] = []
+        if use_nemoretriever_parse and self.config.nemo_parse.endpoint_url:
+            from nvidia_rag.ingestor_server.document_classifier_router import (
+                DocumentClassifierRouter,
+            )
+
+            logger.info(
+                "nemoretriever-parse routing enabled for upload to collection '%s'",
+                collection_name,
+            )
+            router = DocumentClassifierRouter.from_config(self.config)
+            routing_map = router.route_documents(filepaths)
+
+            replaced_filepaths: list[str] = []
+            for fp in filepaths:
+                temp_md = routing_map.get(fp)
+                if temp_md is not None:
+                    replaced_filepaths.append(temp_md)
+                    _nemoparse_temp_files.append(temp_md)
+                    logger.info(
+                        "nemoretriever-parse: '%s' → '%s'",
+                        os.path.basename(fp),
+                        os.path.basename(temp_md),
+                    )
+                else:
+                    replaced_filepaths.append(fp)
+
+            filepaths = replaced_filepaths
+        elif use_nemoretriever_parse:
+            logger.warning(
+                "use_nemoretriever_parse=True but APP_NEMOPARSE_SERVERURL is not configured "
+                "— falling back to standard NV-Ingest pipeline"
+            )
+
         # Initialize document-wise status
         nv_ingest_status = await state_manager.initialize_nv_ingest_status(filepaths)
+
+        def _cleanup_nemoparse_temps(temp_files: list[str]) -> None:
+            """Delete temp .md files produced by nemoretriever-parse after ingest."""
+            for fp in temp_files:
+                try:
+                    os.unlink(fp)
+                    logger.debug("Deleted nemoretriever-parse temp file: %s", fp)
+                except OSError as exc:
+                    logger.warning("Could not delete temp file '%s': %s", fp, exc)
 
         try:
             if not blocking:
                 state_manager.is_background = True
 
-                def _task():
-                    return self.__run_background_ingest_task(
-                        filepaths=filepaths,
-                        collection_name=collection_name,
-                        vdb_endpoint=vdb_endpoint,
-                        vdb_op=vdb_op,
-                        split_options=split_options,
-                        custom_metadata=custom_metadata,
-                        generate_summary=generate_summary,
-                        summary_options=summary_options,
-                        additional_validation_errors=additional_validation_errors,
-                        state_manager=state_manager,
-                        documents_catalog_metadata=documents_catalog_metadata,
-                        vdb_auth_token=vdb_auth_token,
-                    )
+                # Capture temp files in closure so background task can clean up.
+                _temp_files_for_cleanup = list(_nemoparse_temp_files)
+
+                async def _task():
+                    try:
+                        return await self.__run_background_ingest_task(
+                            filepaths=filepaths,
+                            collection_name=collection_name,
+                            vdb_endpoint=vdb_endpoint,
+                            vdb_op=vdb_op,
+                            split_options=split_options,
+                            custom_metadata=custom_metadata,
+                            generate_summary=generate_summary,
+                            summary_options=summary_options,
+                            additional_validation_errors=additional_validation_errors,
+                            state_manager=state_manager,
+                            documents_catalog_metadata=documents_catalog_metadata,
+                            vdb_auth_token=vdb_auth_token,
+                        )
+                    finally:
+                        _cleanup_nemoparse_temps(_temp_files_for_cleanup)
 
                 task_id = await INGESTION_TASK_HANDLER.submit_task(
                     _task, task_id=task_id
@@ -402,24 +461,28 @@ class NvidiaRAGIngestor:
                     "task_id": task_id,
                 }
             else:
-                response_dict = await self.__run_background_ingest_task(
-                    filepaths=filepaths,
-                    collection_name=collection_name,
-                    vdb_endpoint=vdb_endpoint,
-                    vdb_op=vdb_op,
-                    split_options=split_options,
-                    custom_metadata=custom_metadata,
-                    generate_summary=generate_summary,
-                    summary_options=summary_options,
-                    additional_validation_errors=additional_validation_errors,
-                    state_manager=state_manager,
-                    documents_catalog_metadata=documents_catalog_metadata,
-                    vdb_auth_token=vdb_auth_token,
-                )
+                try:
+                    response_dict = await self.__run_background_ingest_task(
+                        filepaths=filepaths,
+                        collection_name=collection_name,
+                        vdb_endpoint=vdb_endpoint,
+                        vdb_op=vdb_op,
+                        split_options=split_options,
+                        custom_metadata=custom_metadata,
+                        generate_summary=generate_summary,
+                        summary_options=summary_options,
+                        additional_validation_errors=additional_validation_errors,
+                        state_manager=state_manager,
+                        documents_catalog_metadata=documents_catalog_metadata,
+                        vdb_auth_token=vdb_auth_token,
+                    )
+                finally:
+                    _cleanup_nemoparse_temps(_nemoparse_temp_files)
             return response_dict
 
         except Exception as e:
             logger.exception(f"Failed to upload documents: {e}")
+            _cleanup_nemoparse_temps(_nemoparse_temp_files)
             return {
                 "message": f"Failed to upload documents due to error: {str(e)}",
                 "total_documents": len(filepaths),

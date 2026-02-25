@@ -55,6 +55,8 @@ interface CatalogMetadata {
 interface CollectionConfiguration {
   /** Whether to generate summaries when uploading documents */
   generateSummary: boolean;
+  /** Whether to route complex data element pages through nemoretriever-parse VLM */
+  useNemotronParse: boolean;
 }
 
 /**
@@ -118,6 +120,7 @@ const defaultCatalogMetadata: CatalogMetadata = {
 
 const defaultCollectionConfig: CollectionConfiguration = {
   generateSummary: true,
+  useNemotronParse: false,
 };
 
 export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({

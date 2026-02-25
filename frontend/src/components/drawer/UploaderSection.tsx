@@ -18,7 +18,7 @@ import { useNewCollectionStore } from "../../store/useNewCollectionStore";
 import { useCollectionDrawerStore } from "../../store/useCollectionDrawerStore";
 import { useCollectionActions } from "../../hooks/useCollectionActions";
 import NvidiaUpload from "../files/NvidiaUpload";
-import { Button, Stack, Flex, Text, Spinner } from "@kui/react";
+import { Button, Stack, Flex, Text, Spinner, Switch } from "@kui/react";
 
 const CloseIcon = () => (
   <svg style={{ width: '16px', height: '16px', color: 'var(--text-color-inverse)' }} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -27,7 +27,7 @@ const CloseIcon = () => (
 );
 
 export const UploaderSection = () => {
-  const { selectedFiles, hasInvalidFiles } = useNewCollectionStore();
+  const { selectedFiles, hasInvalidFiles, collectionConfig, setCollectionConfig } = useNewCollectionStore();
   const { toggleUploader } = useCollectionDrawerStore();
   const { handleUploadDocuments, isUploading } = useCollectionActions();
 
@@ -77,7 +77,24 @@ export const UploaderSection = () => {
         acceptedTypes={['.bmp', '.docx', '.html', '.jpeg', '.json', '.md', '.pdf', '.png', '.pptx', '.sh', '.tiff', '.txt', '.mp3', '.wav', '.mp4', '.mov', '.avi', '.mkv']}
         maxFileSize={400}
       />
-      
+
+      <Flex style={{ paddingTop: '8px', paddingBottom: '4px' }}>
+        <Stack gap="density-xs">
+          <Switch
+            checked={collectionConfig.useNemotronParse}
+            onCheckedChange={(checked: boolean) => setCollectionConfig({ useNemotronParse: checked })}
+            size="medium"
+            slotLabel="Nemotron Parse (complex data elements)"
+            disabled={isUploading}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Classify PDF pages and route documents containing tables, charts, graphs, or
+            infographics through nemoretriever-parse VLM for high-quality markdown extraction.
+            Requires APP_NEMOPARSE_SERVERURL to be configured.
+          </Text>
+        </Stack>
+      </Flex>
+
       {selectedFiles.length > 0 && (
         <Button
           onClick={handleUploadDocuments}

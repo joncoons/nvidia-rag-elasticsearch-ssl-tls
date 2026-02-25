@@ -424,6 +424,31 @@ class NvIngestConfig(_ConfigBase):
     )
 
 
+class NemoParseConfig(_ConfigBase):
+    """nemoretriever-parse VLM configuration for complex document element routing."""
+
+    enabled: bool = Field(
+        default=False,
+        env="APP_NEMOPARSE_ENABLED",
+        description="Enable nemoretriever-parse routing for documents with complex data elements",
+    )
+    endpoint_url: str = Field(
+        default="",
+        env="APP_NEMOPARSE_SERVERURL",
+        description="nemoretriever-parse inference endpoint URL (e.g. http://nemoretriever-parse-ms:8000/v1/chat/completions)",
+    )
+    model_name: str = Field(
+        default="nvdev/nvidia/nemoretriever-parse",
+        env="APP_NEMOPARSE_MODELNAME",
+        description="Model identifier sent in the nemoretriever-parse API request",
+    )
+    api_key: str = Field(
+        default="",
+        env="APP_NEMOPARSE_APIKEY",
+        description="Bearer token for the nemoretriever-parse endpoint (empty = no auth header)",
+    )
+
+
 class ModelParametersConfig(_ConfigBase):
     """Model parameters configuration."""
 
@@ -1064,6 +1089,7 @@ class NvidiaRAGConfig(_ConfigBase):
     ranking: RankingConfig = PydanticField(default_factory=RankingConfig)
     retriever: RetrieverConfig = PydanticField(default_factory=RetrieverConfig)
     nv_ingest: NvIngestConfig = PydanticField(default_factory=NvIngestConfig)
+    nemo_parse: NemoParseConfig = PydanticField(default_factory=NemoParseConfig)
     tracing: TracingConfig = PydanticField(default_factory=TracingConfig)
     vlm: VLMConfig = PydanticField(default_factory=VLMConfig)
     minio: MinioConfig = PydanticField(default_factory=MinioConfig)

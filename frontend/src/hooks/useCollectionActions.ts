@@ -226,12 +226,15 @@ export function useCollectionActions() {
       };
     });
 
+    const { collectionConfig } = useNewCollectionStore.getState();
+
     const metadata = {
       collection_name: activeCollection.collection_name,
       blocking: false,
       custom_metadata: cleanedMetadata,
       split_options: { chunk_size: 512, chunk_overlap: 150 },
       generate_summary: false,
+      use_nemoretriever_parse: collectionConfig.useNemotronParse,
     };
 
     uploadDocuments.mutate(

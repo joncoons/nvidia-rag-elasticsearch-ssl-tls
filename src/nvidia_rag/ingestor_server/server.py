@@ -363,6 +363,18 @@ class DocumentUploadRequest(BaseModel):
         description="Options for PDF split processing.",
     )
 
+    use_nemoretriever_parse: bool = Field(
+        default=False,
+        description=(
+            "When True, PDF pages are first classified with nemoretriever-parse "
+            "'detection_only'. Documents that contain complex data elements "
+            "(tables, charts, graphs, infographics) are fully parsed with "
+            "'markdown_no_bbox' before ingestion, producing high-quality structured "
+            "Markdown. Documents with no complex elements fall back to the standard "
+            "NV-Ingest pipeline. Requires APP_NEMOPARSE_SERVERURL to be configured."
+        ),
+    )
+
     # Reserved for future use
     # embedding_model: str = Field(
     #     os.getenv("APP_EMBEDDINGS_MODELNAME", ""),
