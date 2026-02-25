@@ -211,7 +211,11 @@ When the toggle is on, the ingestor server will:
 - Run `detection_only` on every page via nemoretriever-parse
 - For any document where a table, chart, graph, or infographic is detected, run
   `markdown_no_bbox` on all pages of that document
-- Replace the PDF with a structured Markdown file before submitting to NV-Ingest
+- Split the resulting markdown with a header/table/code-fence-aware chunker into
+  one or more pre-sized `.md` temp files (≈ 512-token sections); code fences and
+  table blocks are treated as atomic units and never bisected
+- Submit each chunk file individually to NV-Ingest so the token splitter receives
+  semantic units rather than an arbitrary cross-section of the document
 - Documents with no complex elements fall through to the standard NV-Ingest pipeline
 
 ### Via the API directly
@@ -221,6 +225,21 @@ When the toggle is on, the ingestor server will:
 curl -X POST http://<node-ip>:8082/documents \
   -F "documents=@/path/to/report.pdf" \
   -F 'data={"collection_name":"my-collection","blocking":false,"use_nemoretriever_parse":true}'
+```
+
+Optional lineage fields (both default to safe values if omitted):
+
+```bash
+# With explicit batch ID and source system for lineage tracking
+curl -X POST http://<node-ip>:8082/documents \
+  -F "documents=@/path/to/report.pdf" \
+  -F 'data={
+    "collection_name":"my-collection",
+    "blocking":false,
+    "use_nemoretriever_parse":true,
+    "upload_batch_id":"your-uuid-here",
+    "source_system":"sharepoint"
+  }'
 ```
 
 Check the returned `task_id` against the status endpoint:
@@ -263,7 +282,177 @@ Log lines to expect:
 Starting classifier pass for: annual_report.pdf
 Complex element(s) detected on page 3 of 'annual_report.pdf': {'table', 'chart'}
 Routing 'annual_report.pdf' through nemoretriever-parse (12 pages total)
-nemoretriever-parse output for 'annual_report.pdf' written to: /tmp/annual_report_nemoparse_XXXX.md
+nemoretriever-parse output for 'annual_report.pdf' written to 4 chunk file(s)
+nemoretriever-parse: 'annual_report.pdf' → 4 chunk file(s)
+```
+
+The number of chunk files depends on document length and section structure. A 12-page
+report with mixed prose and tables typically produces 3–6 chunks. A document that fits
+within one ≈ 2 048-character section produces a single chunk file (no suffix appended).
+
+---
+
+## Document Lineage Metadata
+
+Every document ingested through the ingestor server — whether via the standard NV-Ingest
+pipeline or via the nemoretriever-parse route — now carries the following lineage fields
+automatically. No client-side action is required; the ingestor injects them at ingest time.
+
+| Metadata Field | Source | Description |
+|---|---|---|
+| `content_hash` | Ingestor (auto) | SHA-256 hex digest of the original source file bytes. Identical hash = unchanged content; use for delta-ingest logic. |
+| `ingested_at` | Ingestor (auto) | ISO-8601 UTC timestamp of the upload call. |
+| `pipeline_type` | Ingestor (auto) | `"nv_ingest"` for the standard pipeline; `"nemoretriever_parse"` for VLM-routed documents. |
+| `source_uri` | Ingestor (auto) | Original filename (best proxy for uploaded files). |
+| `upload_batch_id` | API field (auto-UUID) | UUID shared by all documents in a single upload request. Auto-generated if not supplied. |
+| `source_system` | API field (optional) | Caller-supplied origin label, e.g. `"sharepoint"`, `"s3"`, `"local"`. |
+
+### Querying by lineage metadata
+
+The `FilterExpressionGenerator` in the RAG server can translate natural-language queries
+into Elasticsearch filter expressions against these fields.  Examples:
+
+```bash
+# Find all documents ingested after a specific date
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "quarterly earnings",
+    "collection_names": ["finance-docs"],
+    "filter": "ingested_at >= \"2025-01-01T00:00:00+00:00\""
+  }' | jq .
+
+# Find all documents from a specific upload batch
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "supply chain risk",
+    "collection_names": ["reports"],
+    "filter": "upload_batch_id == \"<your-uuid>\""
+  }' | jq .
+
+# Find only nemoretriever_parse-processed documents
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "revenue table",
+    "collection_names": ["reports"],
+    "filter": "pipeline_type == \"nemoretriever_parse\""
+  }' | jq .
+```
+
+### Delta ingest pattern
+
+To avoid re-ingesting unchanged documents, compare `content_hash` before uploading:
+
+```bash
+# 1. Query the collection for the document's stored hash
+STORED_HASH=$(curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"","collection_names":["my-collection"],"filter":"source_uri == \"report.pdf\"","vdb_top_k":1}' \
+  | jq -r '.chunks[0].metadata.content_metadata.content_hash // empty')
+
+# 2. Compute hash of the local file
+LOCAL_HASH=$(sha256sum /path/to/report.pdf | awk '{print $1}')
+
+# 3. Only upload if changed (or new)
+if [ "$LOCAL_HASH" != "$STORED_HASH" ]; then
+  curl -X DELETE "http://<node-ip>:8082/documents?collection_name=my-collection&filename=report.pdf"
+  curl -X POST http://<node-ip>:8082/documents \
+    -F "documents=@/path/to/report.pdf" \
+    -F 'data={"collection_name":"my-collection","blocking":false}'
+fi
+```
+
+---
+
+## Web Crawl Classification Agent
+
+The `scripts/web_crawl_classification_agent.py` script crawls a website domain and
+produces ingestion-ready Markdown files with position-aware content merging and optional
+VLM classification for complex elements.
+
+### Run the crawl agent
+
+```bash
+python3 scripts/web_crawl_classification_agent.py \
+  --start-url  https://docs.example.com/ \
+  --output-dir ./crawl_output \
+  --nemo-parse-url http://nemoretriever-parse-ms:8000/v1/chat/completions \
+  --ingestor-url  http://<node-ip>:8082 \
+  --collection    web-docs \
+  --max-pages     200
+```
+
+Omit `--nemo-parse-url` to run in BS4-only mode (no GPU, no complex-element detection).
+Omit `--ingestor-url` to write files to disk only without submitting to the pipeline.
+
+### Output structure
+
+```
+crawl_output/
+  pages/
+    docs_example_com_guide.md          (single-chunk page)
+    docs_example_com_api_reference_001.md   (multi-chunk page, part 1)
+    docs_example_com_api_reference_002.md   (part 2)
+  screenshots/
+    docs_example_com_guide.png
+  crawl_manifest.csv
+```
+
+**Manifest CSV columns:**
+
+| Column | Description |
+|---|---|
+| `url` | Full URL of the crawled page |
+| `slug` | Filesystem-safe slug derived from the URL |
+| `method` | `bs4_only` or `bs4+vlm` |
+| `detected_types` | Pipe-delimited list of detected complex element types |
+| `md_path` | Path to the first (or only) chunk file |
+| `chunk_count` | Total number of chunk files produced for this page |
+| `screenshot_path` | Full-page screenshot path |
+| `crawl_depth` | BFS hop distance from the seed URL |
+| `crawl_session_id` | UUID shared across all pages in this crawl run |
+| `domain` | Netloc of the seed URL |
+| `status` | `ok` or `error` |
+| `error` | Error message if status is `error` |
+
+### Lineage metadata stored per chunk
+
+When `--ingestor-url` is provided, the agent attaches the following metadata to every
+submitted file:
+
+| Field | Value |
+|---|---|
+| `source_uri` | Original page URL |
+| `content_hash` | SHA-256 of the chunk file bytes |
+| `ingested_at` | ISO-8601 UTC timestamp of submission |
+| `pipeline_type` | `web_crawl_bs4_vlm` or `web_crawl_bs4` |
+| `crawl_session_id` | UUID for this crawl run — filter to refresh a full crawl |
+| `domain` | Netloc of the seed URL |
+| `last_crawled_at` | Same as `ingested_at` for current implementations |
+| `crawl_depth` | BFS hop distance from seed URL |
+
+### Query web crawl content
+
+```bash
+# All documents from a specific crawl session
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "authentication flow",
+    "collection_names": ["web-docs"],
+    "filter": "crawl_session_id == \"<session-uuid>\""
+  }' | jq .
+
+# Only pages with VLM-enhanced extraction (contained tables/charts)
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "performance benchmark",
+    "collection_names": ["web-docs"],
+    "filter": "pipeline_type == \"web_crawl_bs4_vlm\""
+  }' | jq .
 ```
 
 ---
@@ -422,6 +611,22 @@ All settings live in `values-local.yaml` under `ingestor-server.envVars`.
 | `APP_NEMOPARSE_SERVERURL` | `http://nemoretriever-parse-ms:8000/v1/chat/completions` | Full URL of the inference endpoint |
 | `APP_NEMOPARSE_MODELNAME` | `nvdev/nvidia/nemoretriever-parse` | Model identifier sent in the API payload |
 | `APP_NEMOPARSE_APIKEY` | `""` | Bearer token — inject at deploy time via `--set` if the NIM requires authentication |
+
+**Chunking behaviour** (derived from `nv_ingest` config — `APP_NV_INGEST_CHUNK_SIZE` /
+`APP_NV_INGEST_CHUNK_OVERLAP`):
+
+The markdown pre-chunker uses the same `chunk_size` and `chunk_overlap` values as the
+NV-Ingest text splitter (defaults: 512 tokens / 150 tokens).  The conversion to
+characters uses a 4 chars-per-token approximation, giving a soft limit of ≈ 2 048
+characters per chunk.  Tables and code fences are always treated as atomic units
+regardless of size.
+
+**`POST /documents` API fields for lineage:**
+
+| Field | Default | Description |
+|---|---|---|
+| `upload_batch_id` | Auto-generated UUID | Shared identifier for all documents in one upload call. Persist and reuse to correlate re-uploads to the same logical batch. |
+| `source_system` | `""` (omitted) | Free-text origin label stored as metadata, e.g. `"sharepoint"`, `"s3"`, `"local"`. |
 
 **NIM deployment settings** (under `nv-ingest.nimOperator.nemoretriever_parse`):
 
