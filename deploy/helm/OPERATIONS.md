@@ -214,6 +214,9 @@ When the toggle is on, the ingestor server will:
 - Split the resulting markdown with a header/table/code-fence-aware chunker into
   one or more pre-sized `.md` temp files (≈ 512-token sections); code fences and
   table blocks are treated as atomic units and never bisected
+- Record the active H1→H2→H3 breadcrumb at each chunk boundary as a `section_path`
+  metadata field (e.g. `"Results > Revenue > Q4"`) so chunks can be filtered by
+  document section at query time
 - Submit each chunk file individually to NV-Ingest so the token splitter receives
   semantic units rather than an arbitrary cross-section of the document
 - Documents with no complex elements fall through to the standard NV-Ingest pipeline
@@ -341,6 +344,15 @@ curl -s -X POST http://<node-ip>:8081/v1/search \
     "collection_names": ["reports"],
     "filter": "pipeline_type == \"nemoretriever_parse\""
   }' | jq .
+
+# Scope retrieval to a specific document section
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "quarterly earnings",
+    "collection_names": ["reports"],
+    "filter": "section_path like \"%Revenue%\""
+  }' | jq .
 ```
 
 ### Delta ingest pattern
@@ -458,6 +470,15 @@ curl -s -X POST http://<node-ip>:8081/v1/search \
     "query": "performance benchmark",
     "collection_names": ["web-docs"],
     "filter": "pipeline_type == \"web_crawl_bs4_vlm\""
+  }' | jq .
+
+# Scope to pages whose primary heading matches a topic
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "package requirements",
+    "collection_names": ["web-docs"],
+    "filter": "section_h1 like \"%Installation%\""
   }' | jq .
 ```
 
@@ -886,7 +907,9 @@ The markdown pre-chunker uses the same `chunk_size` and `chunk_overlap` values a
 NV-Ingest text splitter (defaults: 512 tokens / 150 tokens).  The conversion to
 characters uses a 4 chars-per-token approximation, giving a soft limit of ≈ 2 048
 characters per chunk.  Tables and code fences are always treated as atomic units
-regardless of size.
+regardless of size.  At every chunk boundary the chunker records the active H1→H2→H3
+breadcrumb as a `section_path` metadata field; this is stored alongside the chunk in
+Elasticsearch and is available for pre-filter queries (e.g. `section_path like "%Risk%"`).
 
 **`POST /documents` API fields for lineage:**
 
