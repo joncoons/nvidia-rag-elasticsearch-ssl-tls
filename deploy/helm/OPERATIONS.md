@@ -854,6 +854,59 @@ regardless of size.
 - [ ] `GET /health` returns 200 on RAG server and ingestor
 - [ ] `nemoretriever-parse-ms` pod Running and `/v1/health/ready` returns 200
 
+### Create collections (first-time or after cluster wipe)
+
+Run once per collection after the ingestor is healthy.  Skip if collections already
+exist and PVCs were preserved from a previous deployment.
+
+**Document collection (PDF / file uploads):**
+
+```bash
+curl -X POST http://<node-ip>:8082/collection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_name": "reports",
+    "description": "Financial and technical reports",
+    "metadata_schema": [
+      {"name":"content_hash",    "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":64,   "description":"SHA-256 of source file"},
+      {"name":"ingested_at",     "type":"datetime", "required":false,"support_dynamic_filtering":true,                    "description":"Ingest timestamp"},
+      {"name":"pipeline_type",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":64,   "description":"nv_ingest or nemoretriever_parse"},
+      {"name":"source_uri",      "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":1024, "description":"Original filename"},
+      {"name":"upload_batch_id", "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":36,   "description":"Upload batch UUID"},
+      {"name":"source_system",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":128,  "description":"Origin system label"}
+    ]
+  }'
+```
+
+**Web crawl collection:**
+
+```bash
+curl -X POST http://<node-ip>:8082/collection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_name": "web-docs",
+    "description": "Crawled web documentation",
+    "metadata_schema": [
+      {"name":"content_hash",     "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":64,   "description":"SHA-256 of chunk file"},
+      {"name":"ingested_at",      "type":"datetime", "required":false,"support_dynamic_filtering":true,                    "description":"Ingest timestamp"},
+      {"name":"pipeline_type",    "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":64,   "description":"web_crawl_bs4 or web_crawl_bs4_vlm"},
+      {"name":"source_uri",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":1024, "description":"Original page URL"},
+      {"name":"upload_batch_id",  "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":36,   "description":"Submission batch UUID"},
+      {"name":"source_system",    "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":128,  "description":"Origin label"},
+      {"name":"crawl_session_id", "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":36,   "description":"Crawl run UUID"},
+      {"name":"domain",           "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":253,  "description":"Seed URL netloc"},
+      {"name":"crawl_depth",      "type":"integer",  "required":false,"support_dynamic_filtering":true,                    "description":"BFS hops from seed URL"},
+      {"name":"last_crawled_at",  "type":"datetime", "required":false,"support_dynamic_filtering":true,                    "description":"Last crawl timestamp"}
+    ]
+  }'
+```
+
+Verify collection was created:
+
+```bash
+curl -s http://<node-ip>:8082/collections | jq '.collections[].collection_name'
+```
+
 ### Shutdown
 
 - [ ] `helm uninstall rag -n rag`
