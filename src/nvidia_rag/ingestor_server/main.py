@@ -430,6 +430,12 @@ class NvidiaRAGIngestor:
         #   document_type  — lowercase file extension of the original file
         #   section_path   — H1>H2>H3 breadcrumb of the chunk's position in
         #                    the document (nemoretriever_parse pipeline only)
+        #   chunk_index    — 0-based position of this chunk within the document
+        #   total_chunks   — total chunks produced from this document
+        #   page_count     — number of pages in the source PDF
+        #                    (nemoretriever_parse pipeline only)
+        #   detected_element_types — complex element types found (e.g. table,
+        #                    chart) — nemoretriever_parse pipeline only
         # ----------------------------------------------------------------
         ingested_at = datetime.now(UTC).isoformat()
         if not upload_batch_id:

@@ -311,6 +311,10 @@ automatically. No client-side action is required; the ingestor injects them at i
 | `source_system` | API field (optional) | Caller-supplied origin label, e.g. `"sharepoint"`, `"s3"`, `"local"`. |
 | `document_type` | Ingestor (auto) | Lowercase file extension of the original file, e.g. `"pdf"`, `"docx"`, `"md"`. Falls back to `"unknown"` if no extension. |
 | `section_path` | Ingestor (auto, nemoretriever_parse only) | H1→H2→H3 breadcrumb of the document section containing the chunk, e.g. `"Results > Revenue > Q4"`. Empty for standard NV-Ingest pipeline chunks. |
+| `chunk_index` | Ingestor (auto) | 0-based position of this chunk within the source document. `0` = first chunk (introduction / executive summary). |
+| `total_chunks` | Ingestor (auto) | Total number of chunks produced from the source document. Combined with `chunk_index` enables sequential reconstruction. |
+| `page_count` | Ingestor (auto, nemoretriever_parse only) | Number of pages in the source PDF, as rasterised during the classification pass. |
+| `detected_element_types` | Ingestor (auto, nemoretriever_parse only) | Sorted array of complex element types found across the document, e.g. `["chart","table"]`. Empty for documents with no complex elements. |
 
 ### Querying by lineage metadata
 
@@ -352,6 +356,24 @@ curl -s -X POST http://<node-ip>:8081/v1/search \
     "query": "quarterly earnings",
     "collection_names": ["reports"],
     "filter": "section_path like \"%Revenue%\""
+  }' | jq .
+
+# Only introductory / executive-summary chunks (first chunk of each document)
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "company overview",
+    "collection_names": ["reports"],
+    "filter": "chunk_index == 0"
+  }' | jq .
+
+# Only long-form reports (skip short stubs) that contain tables
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "financial summary",
+    "collection_names": ["reports"],
+    "filter": "total_chunks >= 8 and \"table\" in detected_element_types"
   }' | jq .
 ```
 
@@ -426,6 +448,7 @@ crawl_output/
 | `chunk_count` | Total number of chunk files produced for this page |
 | `screenshot_path` | Full-page screenshot path |
 | `section_h1` | Text of the first `<h1>` on the page (empty string if absent) |
+| `meta_description` | Content of `<meta name="description">` or `og:description` (empty string if absent) |
 | `crawl_depth` | BFS hop distance from the seed URL |
 | `crawl_session_id` | UUID shared across all pages in this crawl run |
 | `domain` | Netloc of the seed URL |
@@ -450,6 +473,10 @@ submitted file:
 | `document_type` | Always `"md"` for web crawl chunks |
 | `page_title` | HTML `<title>` of the crawled page (omitted if blank) |
 | `section_h1` | Text of the first `<h1>` element on the page (omitted if absent) |
+| `meta_description` | Content of `<meta name="description">` or `og:description` (omitted if absent) |
+| `chunk_index` | 0-based position of this chunk within the page's chunks |
+| `total_chunks` | Total chunks produced for this page |
+| `detected_element_types` | Complex element types detected by VLM, e.g. `["table","chart"]` (`bs4+vlm` method only) |
 
 ### Query web crawl content
 
@@ -479,6 +506,24 @@ curl -s -X POST http://<node-ip>:8081/v1/search \
     "query": "package requirements",
     "collection_names": ["web-docs"],
     "filter": "section_h1 like \"%Installation%\""
+  }' | jq .
+
+# Use meta description for pages with generic headings
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "quick start",
+    "collection_names": ["web-docs"],
+    "filter": "meta_description like \"%getting started%\""
+  }' | jq .
+
+# Only first chunk of each page and only pages with complex elements
+curl -s -X POST http://<node-ip>:8081/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "comparison table",
+    "collection_names": ["web-docs"],
+    "filter": "chunk_index == 0 and \"table\" in detected_element_types"
   }' | jq .
 ```
 
@@ -637,8 +682,8 @@ collection creation time via `POST /collection`.
 
 ### Base lineage schema — all collections
 
-These eight fields are injected automatically by the ingestor for every uploaded document
-(`section_path` is only populated for nemoretriever_parse-routed chunks).
+These fields are injected automatically by the ingestor for every uploaded document.
+Fields marked *(nemoretriever_parse only)* are populated only for VLM-routed chunks.
 Declaring them in the schema enables type-safe filtering and LLM-assisted filter
 generation against them.
 
@@ -710,7 +755,35 @@ curl -X POST http://<node-ip>:8082/collection \
         "required": false,
         "support_dynamic_filtering": true,
         "max_length": 512,
-        "description": "H1>H2>H3 breadcrumb of the chunk position, e.g. Results > Revenue > Q4 (nemoretriever_parse pipeline only)"
+        "description": "H1>H2>H3 breadcrumb of the chunk position, e.g. Results > Revenue > Q4 (nemoretriever_parse only)"
+      },
+      {
+        "name": "chunk_index",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "0-based position of this chunk within the document"
+      },
+      {
+        "name": "total_chunks",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "Total chunks produced from the source document"
+      },
+      {
+        "name": "page_count",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "Number of pages in the source PDF (nemoretriever_parse only)"
+      },
+      {
+        "name": "detected_element_types",
+        "type": "array",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "Complex element types found in the document, e.g. table, chart (nemoretriever_parse only)"
       }
     ]
   }'
@@ -718,9 +791,8 @@ curl -X POST http://<node-ip>:8082/collection \
 
 ### Web crawl extension — additional fields for crawled collections
 
-Add these seven fields to the `metadata_schema` array (in addition to the eight base lineage
-fields) when the collection will hold web crawl content.  They are automatically attached
-by the web crawl agent on submission.
+Add these fields to the `metadata_schema` array when the collection will hold web crawl
+content.  They are automatically attached by the web crawl agent on submission.
 
 ```bash
 curl -X POST http://<node-ip>:8082/collection \
@@ -829,6 +901,35 @@ curl -X POST http://<node-ip>:8082/collection \
         "support_dynamic_filtering": true,
         "max_length": 512,
         "description": "Text of the first <h1> element on the page; omitted if absent"
+      },
+      {
+        "name": "meta_description",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 512,
+        "description": "Content of <meta name=description> or og:description; omitted if absent"
+      },
+      {
+        "name": "chunk_index",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "0-based position of this chunk within the page's chunks"
+      },
+      {
+        "name": "total_chunks",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "Total chunks produced for this page"
+      },
+      {
+        "name": "detected_element_types",
+        "type": "array",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "Complex element types detected by VLM, e.g. table, chart (bs4+vlm method only)"
       }
     ]
   }'
@@ -847,8 +948,13 @@ curl -X POST http://<node-ip>:8082/collection \
 | `source_system` | `string` | `true` | "Docs from SharePoint" is meaningful |
 | `document_type` | `string` | `true` | "Only PDF documents" or "Only markdown pages" is meaningful |
 | `section_path` | `string` | `true` | "Only chunks from the Revenue section" is meaningful (nemoretriever_parse only) |
+| `chunk_index` | `integer` | `true` | "First chunk only (intro/summary)" or "skip first chunk" is meaningful |
+| `total_chunks` | `integer` | `true` | "Only long documents (≥ 8 chunks)" filters out stubs |
+| `page_count` | `integer` | `true` | "Only reports ≥ 20 pages" is meaningful (nemoretriever_parse only) |
+| `detected_element_types` | `array` | `true` | `"table" in detected_element_types` scopes to documents with structured data |
 | `page_title` | `string` | `true` | "Pages about authentication" (title-match) is meaningful (web crawl only) |
 | `section_h1` | `string` | `true` | "Pages whose heading is Installation" is meaningful (web crawl only) |
+| `meta_description` | `string` | `true` | Summary-level content filter when headings are generic (web crawl only) |
 | `domain` | `string` | `true` | "Pages from docs.nvidia.com" is meaningful |
 | `crawl_depth` | `integer` | `true` | "Top-level pages only (depth ≤ 1)" is meaningful |
 | `last_crawled_at` | `datetime` | `true` | "Pages crawled this month" is meaningful |
@@ -881,10 +987,15 @@ ingested_at between "2025-01-01" and "2025-12-31"
 source_system in ["sharepoint", "s3"]
 document_type in ["pdf", "docx"]
 section_path like "%Revenue%"
+chunk_index == 0
+total_chunks >= 8
+page_count >= 20
+"table" in detected_element_types
 crawl_depth <= 2
 source_uri like "%annual_report%"
 page_title like "%authentication%"
 section_h1 like "%Installation%"
+meta_description like "%getting started%"
 ```
 
 ---
@@ -964,8 +1075,12 @@ curl -X POST http://<node-ip>:8082/collection \
       {"name":"source_uri",      "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":1024, "description":"Original filename"},
       {"name":"upload_batch_id", "type":"string",   "required":false,"support_dynamic_filtering":false,"max_length":36,   "description":"Upload batch UUID"},
       {"name":"source_system",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":128,  "description":"Origin system label"},
-      {"name":"document_type",   "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":32,   "description":"Lowercase file extension: pdf, docx, md, etc."},
-      {"name":"section_path",    "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"H1>H2>H3 breadcrumb (nemoretriever_parse only)"}
+      {"name":"document_type",          "type":"string",  "required":false,"support_dynamic_filtering":true, "max_length":32,  "description":"Lowercase file extension: pdf, docx, md, etc."},
+      {"name":"section_path",           "type":"string",  "required":false,"support_dynamic_filtering":true, "max_length":512, "description":"H1>H2>H3 breadcrumb (nemoretriever_parse only)"},
+      {"name":"chunk_index",            "type":"integer", "required":false,"support_dynamic_filtering":true,                   "description":"0-based chunk position within the document"},
+      {"name":"total_chunks",           "type":"integer", "required":false,"support_dynamic_filtering":true,                   "description":"Total chunks from this document"},
+      {"name":"page_count",             "type":"integer", "required":false,"support_dynamic_filtering":true,                   "description":"PDF page count (nemoretriever_parse only)"},
+      {"name":"detected_element_types", "type":"array",   "required":false,"support_dynamic_filtering":true,                   "description":"Complex element types found, e.g. table, chart"}
     ]
   }'
 ```
@@ -990,8 +1105,12 @@ curl -X POST http://<node-ip>:8082/collection \
       {"name":"domain",           "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":253,  "description":"Seed URL netloc"},
       {"name":"crawl_depth",      "type":"integer",  "required":false,"support_dynamic_filtering":true,                    "description":"BFS hops from seed URL"},
       {"name":"last_crawled_at",  "type":"datetime", "required":false,"support_dynamic_filtering":true,                    "description":"Last crawl timestamp"},
-      {"name":"page_title",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"HTML title of the crawled page"},
-      {"name":"section_h1",       "type":"string",   "required":false,"support_dynamic_filtering":true, "max_length":512,  "description":"First <h1> element text on the page"}
+      {"name":"page_title",             "type":"string",  "required":false,"support_dynamic_filtering":true, "max_length":512, "description":"HTML title of the crawled page"},
+      {"name":"section_h1",             "type":"string",  "required":false,"support_dynamic_filtering":true, "max_length":512, "description":"First <h1> element text on the page"},
+      {"name":"meta_description",       "type":"string",  "required":false,"support_dynamic_filtering":true, "max_length":512, "description":"<meta name=description> or og:description content"},
+      {"name":"chunk_index",            "type":"integer", "required":false,"support_dynamic_filtering":true,                   "description":"0-based chunk position within the page"},
+      {"name":"total_chunks",           "type":"integer", "required":false,"support_dynamic_filtering":true,                   "description":"Total chunks produced for this page"},
+      {"name":"detected_element_types", "type":"array",   "required":false,"support_dynamic_filtering":true,                   "description":"Complex element types detected by VLM, e.g. table, chart"}
     ]
   }'
 ```

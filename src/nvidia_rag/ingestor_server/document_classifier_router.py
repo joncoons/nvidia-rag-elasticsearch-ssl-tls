@@ -173,6 +173,7 @@ class DocumentClassifierRouter:
             from pdf2image import convert_from_path  # lazy import — optional dep
 
             pages = convert_from_path(filepath, dpi=self.dpi)
+            page_count = len(pages)
         except Exception as exc:
             logger.warning(
                 "Could not rasterise PDF '%s': %s — falling back to standard pipeline",
@@ -186,10 +187,12 @@ class DocumentClassifierRouter:
         # ----------------------------------------------------------------
         has_complex = False
         page_is_complex: list[bool] = []
+        all_detected_types: set[str] = set()
 
         for i, page_img in enumerate(pages):
             b64, mime = self._pil_to_base64(page_img)
             detected = self._classify_page(b64, mime)
+            all_detected_types |= (detected & COMPLEX_ELEMENT_TYPES)
             is_complex = bool(detected & COMPLEX_ELEMENT_TYPES)
             page_is_complex.append(is_complex)
             if is_complex:
@@ -267,7 +270,15 @@ class DocumentClassifierRouter:
                 )
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
                     fh.write(chunk_text)
-                chunk_meta: dict = {"section_path": section_path} if section_path else {}
+                chunk_meta: dict = {
+                    "chunk_index": idx,
+                    "total_chunks": len(chunk_pairs),
+                    "page_count": page_count,
+                }
+                if section_path:
+                    chunk_meta["section_path"] = section_path
+                if all_detected_types:
+                    chunk_meta["detected_element_types"] = sorted(all_detected_types)
                 temp_pairs.append((tmp_path, chunk_meta))
         except Exception:
             for tp, _ in temp_pairs:

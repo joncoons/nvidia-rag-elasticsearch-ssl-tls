@@ -140,6 +140,7 @@ class PageResult:
     status: str              # "ok" | "error"
     page_title: str = ""
     section_h1: str = ""
+    meta_description: str = ""
     crawl_depth: int = 0
     error: str = ""
 
@@ -757,7 +758,8 @@ class WebCrawlClassificationAgent:
                 writer = csv.DictWriter(csvfile, fieldnames=[
                     "url", "slug", "method", "detected_types",
                     "md_path", "chunk_count", "screenshot_path",
-                    "section_h1", "crawl_depth", "crawl_session_id", "domain",
+                    "section_h1", "meta_description",
+                    "crawl_depth", "crawl_session_id", "domain",
                     "status", "error",
                 ])
                 writer.writeheader()
@@ -787,6 +789,7 @@ class WebCrawlClassificationAgent:
                         "chunk_count": result.chunk_count,
                         "screenshot_path": result.screenshot_path,
                         "section_h1": result.section_h1,
+                        "meta_description": result.meta_description,
                         "crawl_depth": result.crawl_depth,
                         "crawl_session_id": self.crawl_session_id,
                         "domain": self.start_netloc,
@@ -831,9 +834,13 @@ class WebCrawlClassificationAgent:
             # Get page title for Markdown header
             title = self.driver.title or slug
 
-            # Extract first H1 for section_h1 metadata field
-            _h1 = BeautifulSoup(self.driver.page_source, "html.parser").find("h1")
+            # Extract H1 and meta description for metadata fields (single parse)
+            _page_soup = BeautifulSoup(self.driver.page_source, "html.parser")
+            _h1 = _page_soup.find("h1")
             section_h1 = _h1.get_text(strip=True) if _h1 else ""
+            _meta_tag = (_page_soup.find("meta", {"name": "description"}) or
+                         _page_soup.find("meta", {"property": "og:description"}))
+            meta_description = _meta_tag.get("content", "").strip() if _meta_tag else ""
 
             # Process through PageProcessor (prose + optional VLM)
             merged_md, method, detected_types = self.processor.process(
@@ -863,6 +870,7 @@ class WebCrawlClassificationAgent:
                 status="ok",
                 page_title=title,
                 section_h1=section_h1,
+                meta_description=meta_description,
                 crawl_depth=self.crawl_depth.get(url, 0),
             )
 
@@ -910,11 +918,13 @@ class WebCrawlClassificationAgent:
         """POST all successfully generated .md chunk files to the RAG ingestor API."""
         # Collect all chunk paths and their parent PageResult for lineage metadata
         chunk_to_result: dict[str, PageResult] = {}
+        chunk_to_index: dict[str, int] = {}
         for r in self.results:
             if r.status == "ok":
-                for p in r.md_paths:
+                for idx, p in enumerate(r.md_paths):
                     if p:
                         chunk_to_result[p] = r
+                        chunk_to_index[p] = idx
 
         md_files = list(chunk_to_result.keys())
         if not md_files:
@@ -958,6 +968,8 @@ class WebCrawlClassificationAgent:
                         "domain": self.start_netloc,
                         "last_crawled_at": ingested_at,
                     }
+                    meta["chunk_index"] = chunk_to_index.get(fp, 0)
+                    meta["total_chunks"] = result.chunk_count if result else 1
                     if result:
                         meta["source_uri"] = result.url
                         meta["crawl_depth"] = result.crawl_depth
@@ -965,6 +977,10 @@ class WebCrawlClassificationAgent:
                             meta["page_title"] = result.page_title
                         if result.section_h1:
                             meta["section_h1"] = result.section_h1
+                        if result.meta_description:
+                            meta["meta_description"] = result.meta_description
+                        if result.detected_types:
+                            meta["detected_element_types"] = result.detected_types
                     custom_metadata.append({
                         "filename": Path(fp).name,
                         "metadata": meta,
