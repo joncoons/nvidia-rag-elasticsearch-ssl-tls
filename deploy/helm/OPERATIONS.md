@@ -601,6 +601,206 @@ kubectl delete pod -n rag -l elasticsearch.k8s.elastic.co/cluster-name=rag-eck-e
 
 ---
 
+## Collection Metadata Schema
+
+The collection metadata schema tells the ingestor server which fields to index, what
+types they carry, and whether the `FilterExpressionGenerator` LLM should reason about
+them when a user asks a natural-language filtered query.  The schema is set once at
+collection creation time via `POST /collection`.
+
+### Base lineage schema — all collections
+
+These six fields are injected automatically by the ingestor for every uploaded document.
+Declaring them in the schema enables type-safe filtering and LLM-assisted filter
+generation against them.
+
+```bash
+curl -X POST http://<node-ip>:8082/collection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_name": "reports",
+    "description": "Financial and technical reports",
+    "metadata_schema": [
+      {
+        "name": "content_hash",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": false,
+        "max_length": 64,
+        "description": "SHA-256 hex digest of the original source file"
+      },
+      {
+        "name": "ingested_at",
+        "type": "datetime",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "ISO-8601 UTC timestamp of when this document was ingested"
+      },
+      {
+        "name": "pipeline_type",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 64,
+        "description": "Pipeline that processed the document: nv_ingest | nemoretriever_parse"
+      },
+      {
+        "name": "source_uri",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 1024,
+        "description": "Original filename or URL the document was sourced from"
+      },
+      {
+        "name": "upload_batch_id",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": false,
+        "max_length": 36,
+        "description": "UUID shared by all documents in a single upload request"
+      },
+      {
+        "name": "source_system",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 128,
+        "description": "Origin label: sharepoint, s3, local, web_crawl, etc."
+      }
+    ]
+  }'
+```
+
+### Web crawl extension — additional fields for crawled collections
+
+Add these four fields to the `metadata_schema` array when the collection will hold web
+crawl content.  They are automatically attached by the web crawl agent on submission.
+
+```bash
+curl -X POST http://<node-ip>:8082/collection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_name": "web-docs",
+    "description": "Crawled web documentation",
+    "metadata_schema": [
+      {
+        "name": "content_hash",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": false,
+        "max_length": 64,
+        "description": "SHA-256 hex digest of the chunk file"
+      },
+      {
+        "name": "ingested_at",
+        "type": "datetime",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "ISO-8601 UTC timestamp of ingest"
+      },
+      {
+        "name": "pipeline_type",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 64,
+        "description": "web_crawl_bs4 | web_crawl_bs4_vlm"
+      },
+      {
+        "name": "source_uri",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 1024,
+        "description": "Original page URL"
+      },
+      {
+        "name": "upload_batch_id",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": false,
+        "max_length": 36,
+        "description": "UUID shared by all files in one ingestor submission batch"
+      },
+      {
+        "name": "source_system",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 128,
+        "description": "Origin label — typically web_crawl"
+      },
+      {
+        "name": "crawl_session_id",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": false,
+        "max_length": 36,
+        "description": "UUID shared by all pages from one crawl run"
+      },
+      {
+        "name": "domain",
+        "type": "string",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "max_length": 253,
+        "description": "Netloc of the seed URL (e.g. docs.nvidia.com)"
+      },
+      {
+        "name": "crawl_depth",
+        "type": "integer",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "BFS hop distance from the seed URL; 0 = seed page"
+      },
+      {
+        "name": "last_crawled_at",
+        "type": "datetime",
+        "required": false,
+        "support_dynamic_filtering": true,
+        "description": "ISO-8601 UTC timestamp of when the page was last crawled"
+      }
+    ]
+  }'
+```
+
+### Field reference
+
+| Field | Type | `support_dynamic_filtering` | Reason |
+|---|---|---|---|
+| `content_hash` | `string` | `false` | Opaque hex — LLM has no basis for generating a filter value |
+| `upload_batch_id` | `string` | `false` | Opaque UUID — same |
+| `crawl_session_id` | `string` | `false` | Opaque UUID — same |
+| `ingested_at` | `datetime` | `true` | "Show me docs ingested this week" is a valid natural-language query |
+| `pipeline_type` | `string` | `true` | "Only VLM-extracted documents" is meaningful |
+| `source_uri` | `string` | `true` | "Docs from annual_report.pdf" is meaningful |
+| `source_system` | `string` | `true` | "Docs from SharePoint" is meaningful |
+| `domain` | `string` | `true` | "Pages from docs.nvidia.com" is meaningful |
+| `crawl_depth` | `integer` | `true` | "Top-level pages only (depth ≤ 1)" is meaningful |
+| `last_crawled_at` | `datetime` | `true` | "Pages crawled this month" is meaningful |
+
+### Filter operators by type
+
+| Type | Valid operators |
+|---|---|
+| `string` | `==` `!=` `like` `in` `not in` |
+| `datetime` | `==` `!=` `>` `>=` `<` `<=` `between` `before` `after` |
+| `integer` | `==` `!=` `>` `>=` `<` `<=` `between` `in` `not in` |
+
+Example filter expressions:
+
+```
+pipeline_type == "nemoretriever_parse"
+ingested_at after "2025-06-01T00:00:00Z"
+ingested_at between "2025-01-01" and "2025-12-31"
+source_system in ["sharepoint", "s3"]
+crawl_depth <= 2
+source_uri like "%annual_report%"
+```
+
+---
+
 ## Configuration Reference — Nemotron Parse
 
 All settings live in `values-local.yaml` under `ingestor-server.envVars`.
