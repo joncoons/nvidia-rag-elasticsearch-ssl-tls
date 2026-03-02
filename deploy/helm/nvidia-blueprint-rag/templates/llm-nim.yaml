@@ -22,6 +22,10 @@ spec:
       {{- end }}
       size: {{ $nimLlm.storage.pvc.size | default "120Gi" }}
       volumeAccessMode: {{ $nimLlm.storage.pvc.volumeAccessMode | default "ReadWriteMany" }}
+  {{- with $nimLlm.cacheNodeSelector }}
+  nodeSelector:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
   resources: {}
 ---
 apiVersion: apps.nvidia.com/v1alpha1

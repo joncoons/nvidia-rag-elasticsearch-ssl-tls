@@ -20,6 +20,9 @@ spec:
       {{- end }}
       size: {{ $nimModel.storage.pvc.size | default "50Gi" }}
       volumeAccessMode: {{ $nimModel.storage.pvc.volumeAccessMode | default "ReadWriteMany" }}
+  {{- with $nimModel.cacheNodeSelector }}
+  nodeSelector:
+{{ toYaml . | nindent 4 }}  {{- end }}
 ---
 apiVersion: apps.nvidia.com/v1alpha1
 kind: NIMService

@@ -374,6 +374,9 @@ class NvidiaRAGIngestor:
         # files before they reach NV-Ingest.  PDFs that contain complex data
         # elements (tables, charts, etc.) are replaced in the file list with
         # markdown-aware pre-chunked temp files produced by nemoretriever-parse.
+        # APP_NEMOPARSE_ENABLED acts as a server-side default: when True, all
+        # uploads behave as if use_nemoretriever_parse=True was sent by the
+        # client (the two-pass image filter runs on every PDF upload).
         # ----------------------------------------------------------------
         _nemoparse_temp_files: list[str] = []
         # Maps each temp chunk path back to the original uploaded file path.
@@ -381,6 +384,9 @@ class NvidiaRAGIngestor:
         chunk_to_original: dict[str, str] = {}
         # Per-chunk metadata from the markdown pre-chunker (e.g. section_path).
         chunk_to_meta: dict[str, dict] = {}
+
+        # Apply server-side default from APP_NEMOPARSE_ENABLED
+        use_nemoretriever_parse = use_nemoretriever_parse or self.config.nemo_parse.enabled
 
         # force implies use
         if force_nemoretriever_parse:
@@ -1105,7 +1111,7 @@ class NvidiaRAGIngestor:
             )
             nv_ingest_status = INGESTION_TASK_HANDLER.get_task_state_dict(task_id).get(
                 "nv_ingest_status"
-            )
+            ) or {}
             if status_and_result.get("state") == "PENDING":
                 logger.info(f"Task {task_id} is pending")
                 return {

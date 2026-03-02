@@ -1,0 +1,68 @@
+{{- $nimParse := index .Values.nimOperator "nemotron-parse" -}}
+{{- if and (.Capabilities.APIVersions.Has "apps.nvidia.com/v1alpha1") (eq $nimParse.enabled true) }}
+apiVersion: apps.nvidia.com/v1alpha1
+kind: NIMCache
+metadata:
+  name: {{ $nimParse.service.name }}-cache
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  source:
+    ngc:
+      modelPuller: "{{ $nimParse.image.repository }}:{{ $nimParse.image.tag }}"
+      pullSecret: {{ .Values.imagePullSecret.name }}
+      authSecret: {{ .Values.ngcApiSecret.name }}
+  storage:
+    pvc:
+      create: {{ $nimParse.storage.pvc.create | default true }}
+      {{- if $nimParse.storage.pvc.storageClass }}
+      storageClass: {{ $nimParse.storage.pvc.storageClass }}
+      {{- end }}
+      size: {{ $nimParse.storage.pvc.size | default "50Gi" }}
+      volumeAccessMode: {{ $nimParse.storage.pvc.volumeAccessMode | default "ReadWriteOnce" }}
+  {{- with $nimParse.cacheNodeSelector }}
+  nodeSelector:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+  env:
+    - name: LOCAL_NIM_CACHE
+      value: /opt/nim/.cache
+  resources: {}
+---
+apiVersion: apps.nvidia.com/v1alpha1
+kind: NIMService
+metadata:
+  name: {{ $nimParse.service.name }}
+spec:
+  image:
+    repository: {{ $nimParse.image.repository }}
+    tag: {{ $nimParse.image.tag }}
+    pullPolicy: {{ $nimParse.image.pullPolicy | default "IfNotPresent" }}
+    pullSecrets:
+      - {{ .Values.imagePullSecret.name }}
+  authSecret: {{ .Values.ngcApiSecret.name }}
+  storage:
+    nimCache:
+      name: {{ $nimParse.service.name }}-cache
+  env:
+{{ toYaml $nimParse.env | nindent 4 }}
+  replicas: {{ $nimParse.replicas | default 1 }}
+  {{- with $nimParse.nodeSelector }}
+  nodeSelector:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+{{- if .Values.nimOperator.draResources.enabled }}
+  draResources:
+{{ toYaml $nimParse.draResources | nindent 4 }}
+{{- end }}
+{{- if not .Values.nimOperator.draResources.enabled }}
+  resources:
+{{ toYaml $nimParse.resources | nindent 4 }}
+{{- end }}
+  {{- with $nimParse.tolerations }}
+  tolerations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+  expose:
+{{ toYaml $nimParse.expose | nindent 4 }}
+{{- end }}
