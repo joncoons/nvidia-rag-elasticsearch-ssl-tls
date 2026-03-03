@@ -263,6 +263,28 @@ nimOperator:
         size: "50Gi"
         volumeAccessMode: ReadWriteMany
 
+  # VLM Embedding NIM — 1B VLM embedding model on ubuntu2 (RTX 5090 / RTX 6000 Ada, best-effort)
+  nvidia-nim-llama-32-nemoretriever-1b-vlm-embed-v1:
+    enabled: true
+    nodeSelector:
+      kubernetes.io/hostname: ubuntu2
+    env:
+      - name: NIM_NUM_MODEL_INSTANCES
+        value: "1"
+      - name: NIM_TRITON_PERFORMANCE_MODE
+        value: "latency"
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+      requests:
+        nvidia.com/gpu: "1"
+    storage:
+      pvc:
+        create: true
+        storageClass: nfs-nim
+        size: "50Gi"
+        volumeAccessMode: ReadWriteMany
+
   # nemotron-parse — DISABLED: NIM v1.1 crashes on Blackwell sm_120 and RTX 5090.
   # Replaced by standalone vLLM deployment: nemotron-parse-v12.yaml
   # (nvidia/NVIDIA-Nemotron-Parse-v1.2 — no NIM available for v1.2)
@@ -291,11 +313,16 @@ nimOperator:
       requests:
         nvidia.com/gpu: "1"
 
-  # VLM NIM — Nemotron Nano 12B Vision-Language Model on ubuntu2 (RTX 6000 Ada, 49 GB, sm_89)
+  # VLM NIM — Nemotron Nano 12B Vision-Language Model on ubuntu-local-dev GPU1 (RTX PRO 6000 Blackwell, 96 GB)
+  # ubuntu2 RTX 6000 Ada (49 GB) is too full (~24 GB free) to fit 12B BF16 model weights (~24 GB)
+  # NIM_KVCACHE_PERCENT=0.30: minimum viable for 12B BF16 (model=24 GB, 0.30×96=28.8 GB budget → 4.8 GB KV cache)
   nim-vlm:
     enabled: true
     nodeSelector:
-      kubernetes.io/hostname: ubuntu2
+      kubernetes.io/hostname: ubuntu-local-dev
+    env:
+      - name: NIM_KVCACHE_PERCENT
+        value: "0.30"
     resources:
       limits:
         nvidia.com/gpu: "1"
@@ -315,6 +342,8 @@ nimOperator:
 # ---------------------------------------------------------------------------
 nv-ingest:
   milvusDeployed: false
+  envVars:
+    APP_NVINGEST_SEGMENTAUDIO: "True"   # Enable audio transcription via parakeet NIM
   nimOperator:
     # OCR on ubuntu2; NFS cache (no nodeAffinity)
     nemoretriever_ocr_v1:
@@ -392,6 +421,33 @@ nv-ingest:
       env:
         - name: NIM_NUM_MODEL_INSTANCES
           value: "1"    # Single Triton instance to minimize GPU memory footprint
+    # Audio NIM — Parakeet 1.1B CTC ASR on ubuntu-local-dev GPU1
+    audio:
+      enabled: true
+      authSecret: ngc-api
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu-local-dev
+      storage:
+        pvc:
+          create: true
+          storageClass: nfs-nim
+          size: "25Gi"
+          volumeAccessMode: ReadWriteMany
+      image:
+        repository: nvcr.io/nim/nvidia/parakeet-1-1b-ctc-en-us
+        tag: "latest"
+      env:
+        - name: NIM_TAGS_SELECTOR
+          value: "name=parakeet-1-1b-ctc-en-us,mode=ofl"
+        - name: NIM_TRITON_LOG_VERBOSE
+          value: "1"
+        - name: NIM_NUM_MODEL_INSTANCES
+          value: "1"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"
 
 
 # ---------------------------------------------------------------------------
