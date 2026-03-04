@@ -425,14 +425,14 @@ nv-ingest:
       env:
         - name: NIM_NUM_MODEL_INSTANCES
           value: "1"    # Single Triton instance to minimize GPU memory footprint
-    # Audio NIM — Parakeet 1.1B CTC ASR on ubuntu-local-dev GPU1
-    # DISABLED: TRT compilation fails on Blackwell sm_120 — cuDNN lib not in LD_LIBRARY_PATH,
-    # falls back to CPU quantization, then SIGKILL during TRT engine build (VRAM OOM, ~1.5 GB short).
+    # Audio NIM — Parakeet 1.1B CTC ASR on ubuntu2 RTX 6000 Ada (sm_89, 49 GB)
+    # Moved from ubuntu-local-dev: TRT compilation failed on Blackwell sm_120 (cuDNN missing,
+    # GPU OOM ~1.5 GB short). RTX 6000 Ada has proper cuDNN support and sufficient free VRAM.
     audio:
-      enabled: false
+      enabled: true
       authSecret: ngc-api
       nodeSelector:
-        kubernetes.io/hostname: ubuntu-local-dev
+        kubernetes.io/hostname: ubuntu2
       storage:
         pvc:
           create: true
