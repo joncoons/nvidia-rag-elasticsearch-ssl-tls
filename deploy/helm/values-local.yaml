@@ -76,6 +76,10 @@ envVars:
   ENABLE_VLM_INFERENCE: "true"
   APP_VLM_SERVERURL: "http://nim-vlm:8000/v1"
   APP_VLM_MODELNAME: "nvidia/nemotron-nano-12b-v2-vl"
+  # Conversation memory — number of prior turns passed to the LLM as context.
+  # Default 0 means all history is stripped before the LLM call; set > 0 to
+  # enable multi-turn conversation.  Also required for query rewriting to work.
+  CONVERSATION_HISTORY: "10"
 
 # ECK CA cert volume — mounts into the nvidia-blueprint-rag container
 # ConfigMap eck-es-ca-cert must be pre-created (not managed by this chart):
