@@ -148,7 +148,15 @@ class DocumentClassifierRouter:
 
         self._session = requests.Session()
         self._session.headers.update(
-            {"Content-Type": "application/json", "Accept": "application/json"}
+            {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                # Disable keep-alive so each inference request opens a new TCP
+                # connection.  The Kubernetes Service round-robins at the
+                # connection level (kube-proxy/iptables), so this distributes
+                # requests evenly across all nemotron-parse replica pods.
+                "Connection": "close",
+            }
         )
         if api_key:
             self._session.headers["Authorization"] = f"Bearer {api_key}"
