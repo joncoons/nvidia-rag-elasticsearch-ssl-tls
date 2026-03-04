@@ -1,0 +1,4 @@
+FROM nvcr.io/nvidia/blueprint/rag-frontend:2.4.0
+
+# Replace compiled frontend dist with our updated build
+COPY frontend/dist /app/frontend/dist
