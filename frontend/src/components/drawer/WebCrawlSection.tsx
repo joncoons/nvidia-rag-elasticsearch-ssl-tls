@@ -17,10 +17,10 @@ import { useCallback, useState } from "react";
 import { useNewCollectionStore } from "../../store/useNewCollectionStore";
 import { useCollectionDrawerStore } from "../../store/useCollectionDrawerStore";
 import { useCollectionActions } from "../../hooks/useCollectionActions";
-import { Button, Stack, Flex, Text, Switch, Spinner } from "@kui/react";
+import { Button, Stack, Flex, Text, Switch, Spinner, TextInput } from "@kui/react";
 
 const CloseIcon = () => (
-  <svg style={{ width: '16px', height: '16px', color: 'var(--text-color-inverse)' }} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+  <svg style={{ width: '16px', height: '16px', color: 'white' }} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
   </svg>
 );
@@ -43,16 +43,6 @@ export const WebCrawlSection = () => {
       return true;
     } catch {
       return false;
-    }
-  };
-
-  const handleUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    setCrawlConfig({ startUrl: val });
-    if (val && !validateUrl(val)) {
-      setUrlError("Please enter a valid URL (e.g. https://example.com)");
-    } else {
-      setUrlError("");
     }
   };
 
@@ -81,7 +71,7 @@ export const WebCrawlSection = () => {
       }}
     >
       <Flex justify="between" align="center" style={{ marginBottom: '16px' }}>
-        <Text kind="body/bold/lg" style={{ color: 'var(--text-color-inverse)' }}>
+        <Text kind="body/bold/lg" style={{ color: 'white' }}>
           Crawl Website
         </Text>
         <Button
@@ -96,25 +86,22 @@ export const WebCrawlSection = () => {
       </Flex>
 
       <Stack gap="density-sm">
-        <Text kind="body/regular/sm" style={{ color: 'var(--text-color-inverse)' }}>
+        <Text kind="body/regular/sm" style={{ color: 'white' }}>
           Start URL
         </Text>
-        <input
-          type="url"
+        <TextInput
           value={crawlConfig.startUrl}
-          onChange={handleUrlChange}
+          onValueChange={(val: string) => {
+            setCrawlConfig({ startUrl: val });
+            if (val && !validateUrl(val)) {
+              setUrlError("Please enter a valid URL (e.g. https://example.com)");
+            } else {
+              setUrlError("");
+            }
+          }}
           placeholder="https://docs.example.com/"
           disabled={isCrawling}
-          style={{
-            width: '100%',
-            padding: '8px 12px',
-            background: 'var(--surface-color-default)',
-            border: `1px solid ${urlError ? 'var(--color-danger)' : 'var(--border-color-default)'}`,
-            borderRadius: '4px',
-            color: 'var(--text-color-inverse)',
-            fontSize: '14px',
-            boxSizing: 'border-box',
-          }}
+          style={{ width: '100%' }}
         />
         {urlError && (
           <Text kind="body/regular/xs" style={{ color: 'var(--color-danger)' }}>
@@ -124,25 +111,15 @@ export const WebCrawlSection = () => {
       </Stack>
 
       <Stack gap="density-sm">
-        <Text kind="body/regular/sm" style={{ color: 'var(--text-color-inverse)' }}>
+        <Text kind="body/regular/sm" style={{ color: 'white' }}>
           Max pages (1–500)
         </Text>
-        <input
+        <TextInput
           type="number"
-          min={1}
-          max={500}
-          value={crawlConfig.maxPages}
-          onChange={(e) => setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(e.target.value) || 50)) })}
+          value={String(crawlConfig.maxPages)}
+          onValueChange={(val: string) => setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(val) || 50)) })}
           disabled={isCrawling}
-          style={{
-            width: '120px',
-            padding: '8px 12px',
-            background: 'var(--surface-color-default)',
-            border: '1px solid var(--border-color-default)',
-            borderRadius: '4px',
-            color: 'var(--text-color-inverse)',
-            fontSize: '14px',
-          }}
+          style={{ width: '120px' }}
         />
       </Stack>
 
@@ -180,7 +157,7 @@ export const WebCrawlSection = () => {
               useCrawlNemotronParse: checked ? true : crawlConfig.useCrawlNemotronParse,
             })}
             size="medium"
-            slotLabel="Force full extraction (10-K / 10-Q)"
+            slotLabel="Nemotron Parse (all)"
             disabled={isCrawling}
           />
           <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>

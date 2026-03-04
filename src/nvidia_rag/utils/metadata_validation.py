@@ -685,7 +685,7 @@ def create_metadata_model_class(schema: MetadataSchema, config) -> type:
         **{k: v[1] for k, v in fields.items()},
         **field_validators,
         "model_config": ConfigDict(
-            extra="forbid", validate_assignment=True, arbitrary_types_allowed=True
+            extra="ignore", validate_assignment=True, arbitrary_types_allowed=True
         ),
     }
 

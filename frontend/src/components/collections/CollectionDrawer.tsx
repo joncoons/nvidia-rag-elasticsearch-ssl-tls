@@ -133,16 +133,21 @@ export default function CollectionDrawer() {
       }
       closeOnClickOutside
     >
-      <Stack gap="density-md">
-        {activeCollection && (
-          <CollectionCatalogInfo 
-            collection={activeCollection} 
-            documentCount={documentsData?.total_documents}
-          />
-        )}
-        <DocumentsList />
-      </Stack>
-      
+      {showUploader && <UploaderSection />}
+      {showCrawler && <WebCrawlSection />}
+
+      {!showUploader && !showCrawler && (
+        <Stack gap="density-md">
+          {activeCollection && (
+            <CollectionCatalogInfo
+              collection={activeCollection}
+              documentCount={documentsData?.total_documents}
+            />
+          )}
+          <DocumentsList />
+        </Stack>
+      )}
+
       {deleteError && (
         <Notification
           status="error"
@@ -150,9 +155,6 @@ export default function CollectionDrawer() {
           slotSubheading={deleteError}
         />
       )}
-      
-      {showUploader && <UploaderSection />}
-      {showCrawler && <WebCrawlSection />}
         
       <ConfirmationModal
         isOpen={showDeleteModal}

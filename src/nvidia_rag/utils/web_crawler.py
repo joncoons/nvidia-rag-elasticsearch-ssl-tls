@@ -112,6 +112,11 @@ class SimpleWebCrawler:
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
+        # Disable environment variable passthrough so that REQUESTS_CA_BUNDLE
+        # (which points to the ECK-internal CA) does not override standard CA
+        # validation for outbound public HTTPS requests.  With trust_env=False
+        # requests uses the certifi bundle it ships with (verify=True default).
+        self._session.trust_env = False
         self._netloc = urlparse(start_url).netloc
 
     # ------------------------------------------------------------------
@@ -141,14 +146,18 @@ class SimpleWebCrawler:
         dict
             Summary dict compatible with ``UploadDocumentResponse``.
         """
-        # Run synchronous crawl in a thread to avoid blocking the event loop.
-        loop = asyncio.get_event_loop()
+        # Capture the running event loop BEFORE entering the executor thread.
+        # The thread will use run_coroutine_threadsafe to submit coroutines
+        # back to this loop — the correct pattern for calling async code from
+        # a worker thread while an event loop is already running.
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             self._crawl_sync,
             ingestor,
             collection_name,
             vdb_auth_token,
+            loop,
         )
 
     # ------------------------------------------------------------------
@@ -160,6 +169,7 @@ class SimpleWebCrawler:
         ingestor: "NvidiaRAGIngestor",
         collection_name: str,
         vdb_auth_token: str,
+        loop: asyncio.AbstractEventLoop,
     ) -> dict[str, Any]:
         visited_html: set[str] = set()
         visited_files: set[str] = set()
@@ -204,7 +214,7 @@ class SimpleWebCrawler:
                     }
                 ]
                 try:
-                    asyncio.get_event_loop().run_until_complete(
+                    future = asyncio.run_coroutine_threadsafe(
                         ingestor.upload_documents(
                             filepaths=[tmp_path],
                             collection_name=collection_name,
@@ -214,8 +224,10 @@ class SimpleWebCrawler:
                             use_nemoretriever_parse=self.use_nemoretriever_parse,
                             force_nemoretriever_parse=self.force_nemoretriever_parse,
                             source_system="web_crawl",
-                        )
+                        ),
+                        loop,
                     )
+                    future.result(timeout=300)
                     pages_crawled += 1
                     logger.info("Ingested HTML page %d/%d: %s", pages_crawled, self.max_pages, url)
                 except Exception as exc:
@@ -230,7 +242,7 @@ class SimpleWebCrawler:
                             visited_files.add(abs_href)
                             self._ingest_binary_file(
                                 abs_href, depth + 1, ingestor, collection_name,
-                                vdb_auth_token, temp_files, errors
+                                vdb_auth_token, loop, temp_files, errors
                             )
                             files_ingested += 1
                     elif (
@@ -240,6 +252,7 @@ class SimpleWebCrawler:
                         and pages_crawled < self.max_pages
                     ):
                         queue.append((abs_href, depth + 1))
+
 
         finally:
             for tp in temp_files:
@@ -316,6 +329,7 @@ class SimpleWebCrawler:
         ingestor: "NvidiaRAGIngestor",
         collection_name: str,
         vdb_auth_token: str,
+        loop: asyncio.AbstractEventLoop,
         temp_files: list[str],
         errors: list[dict],
     ) -> None:
@@ -342,7 +356,7 @@ class SimpleWebCrawler:
             }
         ]
         try:
-            asyncio.get_event_loop().run_until_complete(
+            future = asyncio.run_coroutine_threadsafe(
                 ingestor.upload_documents(
                     filepaths=[tmp_path],
                     collection_name=collection_name,
@@ -352,8 +366,10 @@ class SimpleWebCrawler:
                     use_nemoretriever_parse=self.use_nemoretriever_parse,
                     force_nemoretriever_parse=self.force_nemoretriever_parse,
                     source_system="web_crawl",
-                )
+                ),
+                loop,
             )
+            future.result(timeout=300)
             logger.info("Ingested binary file: %s", url)
         except Exception as exc:
             logger.warning("Failed to ingest binary file %s: %s", url, exc)
