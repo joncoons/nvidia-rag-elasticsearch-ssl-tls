@@ -976,8 +976,8 @@ nv-ingest:
     VLM_CAPTION_MODEL_NAME: nvidia/nemotron-nano-12b-v2-vl
     VLM_CAPTION_ENDPOINT: http://nim-vlm:8000/v1/chat/completions
 
-    # Audio service
-    AUDIO_GRPC_ENDPOINT: nv-ingest-riva-nim:50051
+    # Audio service — endpoint matches the audio NIMService name
+    AUDIO_GRPC_ENDPOINT: audio:50051
     AUDIO_INFER_PROTOCOL: grpc
 
   # Expose internal Milvus/MinIO config managed by nv-ingest subchart

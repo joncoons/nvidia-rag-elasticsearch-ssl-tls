@@ -314,15 +314,19 @@ nimOperator:
         nvidia.com/gpu: "1"
 
   # VLM NIM — Nemotron Nano 12B Vision-Language Model on ubuntu-local-dev GPU1 (RTX PRO 6000 Blackwell, 96 GB)
-  # ubuntu2 RTX 6000 Ada (49 GB) is too full (~24 GB free) to fit 12B BF16 model weights (~24 GB)
-  # NIM_KVCACHE_PERCENT=0.30: minimum viable for 12B BF16 (model=24 GB, 0.30×96=28.8 GB budget → 4.8 GB KV cache)
+  # Model uses BF16 execution (NIM profile: BF16 TP1 + ModelOpt fp8 checkpoint storage)
+  # vLLM profiling footprint: ~31.85 GB (weights ~24 GB + CUDA + 4 GB mm_processor_cache)
+  # NIM_KVCACHE_PERCENT=0.40: 0.40×97=38.8 GB budget − 31.85 GB model = 7 GB KV cache
+  # Minimum viable: 0.34 (~1 GB KV cache). 20% impossible (model alone > 20% of 96 GB).
+  # VRAM barrier: GPU0 has only 6 GB free (nim-llm ~91 GB) → vLLM startup check fails on GPU0
+  # (38.8 GB needed > 6 GB free), passes on GPU1. Pod must be deleted+rescheduled off GPU0.
   nim-vlm:
     enabled: true
     nodeSelector:
       kubernetes.io/hostname: ubuntu-local-dev
     env:
       - name: NIM_KVCACHE_PERCENT
-        value: "0.30"
+        value: "0.40"
     resources:
       limits:
         nvidia.com/gpu: "1"
@@ -422,8 +426,10 @@ nv-ingest:
         - name: NIM_NUM_MODEL_INSTANCES
           value: "1"    # Single Triton instance to minimize GPU memory footprint
     # Audio NIM — Parakeet 1.1B CTC ASR on ubuntu-local-dev GPU1
+    # DISABLED: TRT compilation fails on Blackwell sm_120 — cuDNN lib not in LD_LIBRARY_PATH,
+    # falls back to CPU quantization, then SIGKILL during TRT engine build (VRAM OOM, ~1.5 GB short).
     audio:
-      enabled: true
+      enabled: false
       authSecret: ngc-api
       nodeSelector:
         kubernetes.io/hostname: ubuntu-local-dev
