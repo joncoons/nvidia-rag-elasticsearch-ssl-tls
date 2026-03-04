@@ -93,6 +93,19 @@ extraVolumeMounts:
     readOnly: true
 
 # ---------------------------------------------------------------------------
+# Frontend — patched local image with web crawl UI, white text CSS fixes,
+# CollectionDrawer layout, and KUI TextInput styling.
+# Rebuild: cd /home/joncoons/claude/rag/frontend && npm run build
+#          docker build -f Dockerfile.frontend-patch -t rag-frontend-local:latest .
+# Import:  docker save rag-frontend-local:latest | sudo k3s ctr images import -
+# ---------------------------------------------------------------------------
+frontend:
+  image:
+    repository: rag-frontend-local
+    tag: "latest"
+    pullPolicy: Never
+
+# ---------------------------------------------------------------------------
 # Ingestor Server — same Elasticsearch config + ECK CA cert
 # ---------------------------------------------------------------------------
 ingestor-server:
