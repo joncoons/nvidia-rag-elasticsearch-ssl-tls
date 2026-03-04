@@ -24,7 +24,8 @@ as well.  Supported linked-file types (requires extract_linked_files=True):
   Text/MD   : .md, .txt
   Images    : PNG, JPG/JPEG, BMP, TIFF
   Audio     : WAV, MP3
-  Video     : MP4, AVI, MKV, MOV
+  XML       : RSS 2.0, Atom 1.0, Sitemap, generic — pre-processed to Markdown
+  Video     : (none — mp4/avi/mkv/mov lack an nv-ingest extractor)
 
 Usage::
 
@@ -49,6 +50,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from nvidia_rag.utils.xml_preprocessor import xml_to_markdown
+
 if TYPE_CHECKING:
     from nvidia_rag.ingestor_server.main import NvidiaRAGIngestor
 
@@ -67,8 +70,9 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset(
         ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
         # Audio
         ".wav", ".mp3",
-        # Video
-        ".mp4", ".avi", ".mkv", ".mov",
+        # XML — pre-processed to Markdown before ingestion via xml_preprocessor
+        ".xml",
+        # Video excluded: avi/mkv/mov/mp4 have no nv-ingest extractor registered
     }
 )
 
@@ -100,8 +104,9 @@ class SimpleWebCrawler:
         counted against this limit).
     extract_linked_files : bool
         When True, ``<a href>`` links pointing to supported binary files
-        (documents, images, audio, video, markdown) are downloaded and
-        ingested in addition to HTML pages.
+        (documents, images, audio, XML, markdown) are downloaded and
+        ingested in addition to HTML pages.  XML files are automatically
+        pre-processed to Markdown via ``xml_preprocessor.xml_to_markdown``.
     use_nemoretriever_parse : bool
         Forwarded to ``upload_documents()`` for each ingested file.
     force_nemoretriever_parse : bool
@@ -363,6 +368,25 @@ class SimpleWebCrawler:
             logger.warning("Failed to download binary file %s: %s", url, exc)
             errors.append({"url": url, "error": str(exc)})
             return
+
+        # XML files are not natively supported by nv-ingest — pre-process to Markdown.
+        if suffix.lower() == ".xml":
+            try:
+                with open(tmp_path, "rb") as fh:
+                    xml_bytes = fh.read()
+                markdown_text = xml_to_markdown(xml_bytes)
+                if not markdown_text.strip():
+                    logger.warning("XML pre-processor produced no content for %s — skipping", url)
+                    return
+                md_path = self._save_temp(markdown_text.encode("utf-8"), suffix=".md")
+                temp_files.append(md_path)
+                # Replace the .xml temp path with the .md one for ingestion
+                tmp_path = md_path
+                logger.info("XML pre-processed to Markdown (%d chars): %s", len(markdown_text), url)
+            except Exception as exc:
+                logger.warning("Failed to pre-process XML %s: %s", url, exc)
+                errors.append({"url": url, "error": str(exc)})
+                return
 
         custom_metadata = [
             {
