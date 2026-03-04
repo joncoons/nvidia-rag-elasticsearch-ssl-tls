@@ -1,0 +1,115 @@
+# Standalone vLLM deployment for nvidia/NVIDIA-Nemotron-Parse-v1.2
+#
+# Replaces the NIM operator nemotron-parse NIMService (which crashes on SM 12.0
+# Blackwell due to TRT-LLM FMHA kernel incompatibility in nemotron-parse:1.5.0).
+# vLLM 0.14.1+ supports the NemotronParseForConditionalGeneration architecture
+# natively with --trust-remote-code.
+#
+# Prerequisites:
+#   1. Accept the NVIDIA Nemotron Open Model License at:
+#      https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.2
+#   2. Create HF token secret:
+#      kubectl create secret generic hf-token -n rag \
+#        --from-literal=token=hf_YOUR_TOKEN_HERE
+#   3. Disable NIM operator nemotron-parse in values-local.yaml:
+#      nimOperator.nemotron-parse.enabled: false
+#      Then: helm upgrade rag ... -f values-local.yaml
+#
+# Service is named nemotron-parse-ms to match APP_NEMOPARSE_SERVERURL.
+# Update APP_NEMOPARSE_MODELNAME to nvidia/NVIDIA-Nemotron-Parse-v1.2.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nemotron-parse-hf-cache-pvc
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi   # ~3.75 GB weights + overhead
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nemotron-parse-vllm
+  namespace: rag
+  labels:
+    app: nemotron-parse-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nemotron-parse-vllm
+  template:
+    metadata:
+      labels:
+        app: nemotron-parse-vllm
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu-local-dev
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.14.1
+          args:
+            - nvidia/NVIDIA-Nemotron-Parse-v1.2
+            - --trust-remote-code
+            - --port
+            - "8000"
+            - --dtype
+            - bfloat16
+            - --max-model-len
+            - "8192"
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /hf-cache
+          ports:
+            - containerPort: 8000
+              name: http
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /hf-cache
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: nemotron-parse-hf-cache-pvc
+      tolerations: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nemotron-parse-ms
+  namespace: rag
+spec:
+  selector:
+    app: nemotron-parse-vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

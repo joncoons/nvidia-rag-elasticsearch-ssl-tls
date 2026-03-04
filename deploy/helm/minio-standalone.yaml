@@ -1,0 +1,84 @@
+---
+# Standalone MinIO deployment to replace the Milvus-bundled MinIO.
+# Provides the rag-minio:9000 service expected by rag-server, ingestor-server,
+# and nv-ingest when milvusDeployed=false (Elasticsearch vector store).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-minio
+  namespace: rag
+  labels:
+    app: rag-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-minio
+  template:
+    metadata:
+      labels:
+        app: rag-minio
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu-local-dev
+      containers:
+        - name: minio
+          image: docker.io/minio/minio:RELEASE.2024-01-16T16-07-38Z
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadmin
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rag-minio-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rag-minio-data
+  namespace: rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-minio
+  namespace: rag
+  labels:
+    app: rag-minio
+spec:
+  selector:
+    app: rag-minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
