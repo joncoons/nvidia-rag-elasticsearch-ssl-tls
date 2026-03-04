@@ -135,7 +135,7 @@ ingestor-server:
     APP_NEMOPARSE_SERVERURL: "http://nemotron-parse-v12:8000/v1/chat/completions"
     # Full container path — vLLM serves local models under the path they were loaded from.
     # Add --served-model-name to vllm serve (nemotron-parse-v12.yaml) to use the canonical short name.
-    APP_NEMOPARSE_MODELNAME: "/hf-models/nvidia/NVIDIA-Nemotron-Parse-v1.2"
+    APP_NEMOPARSE_MODELNAME: "nvidia/NVIDIA-Nemotron-Parse-v1.2"
     APP_NEMOPARSE_APIKEY: ""   # inject via --set if NGC API key required
   extraVolumes:
     - name: eck-ca
