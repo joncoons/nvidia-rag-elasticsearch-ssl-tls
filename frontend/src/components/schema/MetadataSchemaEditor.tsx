@@ -15,10 +15,12 @@
 
 // src/components/MetadataSchemaEditor.tsx
 
+import { useCallback } from "react";
 import { useSchemaEditor } from "../../hooks/useSchemaEditor";
 import { FieldsList } from "./FieldsList";
 import { NewFieldForm } from "./NewFieldForm";
-import { Panel, Text } from "@kui/react";
+import { Panel, Text, Button } from "@kui/react";
+import { useNewCollectionStore, WEB_CRAWL_FIELDS } from "../../store/useNewCollectionStore";
 
 // Export all schema editor components for external use
 export { FieldEditForm } from "./FieldEditForm";
@@ -38,13 +40,43 @@ const SchemaIcon = () => (
   </svg>
 );
 
+const WebCrawlPresetIcon = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"
+      d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+  </svg>
+);
+
 const SchemaContent = () => {
-  
+  const { metadataSchema, setMetadataSchema } = useNewCollectionStore();
+
+  const hasWebCrawlFields = WEB_CRAWL_FIELDS.every(
+    (wf) => metadataSchema.some((f) => f.name === wf.name)
+  );
+
+  const handleAddWebCrawlFields = useCallback(() => {
+    const existing = new Set(metadataSchema.map((f) => f.name));
+    const toAdd = WEB_CRAWL_FIELDS.filter((f) => !existing.has(f.name));
+    setMetadataSchema([...metadataSchema, ...toAdd]);
+  }, [metadataSchema, setMetadataSchema]);
 
   return (
     <>
       <Text kind="body/bold/md">Define metadata fields for this collection.</Text>
-  
+
+      {!hasWebCrawlFields && (
+        <div style={{ marginBottom: "8px" }}>
+          <Button
+            kind="secondary"
+            size="small"
+            onClick={handleAddWebCrawlFields}
+          >
+            <WebCrawlPresetIcon />
+            &nbsp;Add web crawl fields
+          </Button>
+        </div>
+      )}
+
       <FieldsList />
       {<NewFieldForm />}
     </>

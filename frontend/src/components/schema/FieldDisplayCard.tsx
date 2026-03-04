@@ -81,51 +81,62 @@ export const FieldDisplayCard = ({ field, onEdit, onDelete }: FieldDisplayCardPr
   return (
     <>
     <Flex justify="between" align="start" padding="density-lg">
-      <Flex 
-        align="center" 
-        gap="3" 
+      <Flex
+        align="center"
+        gap="3"
         style={{ flex: 1 }}
         data-testid="field-content"
       >
-        <Text 
+        <Text
           kind="body/bold/md"
           data-testid="field-name"
         >
           {field.name}
         </Text>
-          <Badge 
+          <Badge
            kind="solid"
            color={fieldTypeColor}
            data-testid="field-type"
          >
            {field.type}
          </Badge>
+         {field.isDefault && (
+           <Badge
+             kind="outline"
+             color="gray"
+             data-testid="field-default-badge"
+           >
+             built-in
+           </Badge>
+         )}
       </Flex>
-      
-      <Flex 
-        align="center" 
+
+      <Flex
+        align="center"
         gap="2"
         data-testid="field-actions"
       >
-        <Button 
+        <Button
           kind="tertiary"
           size="tiny"
-          onClick={handleEdit} 
+          onClick={handleEdit}
           title="Edit"
           data-testid="edit-button"
         >
           <EditIcon />
         </Button>
-        <Button 
-          kind="tertiary"
-          size="tiny"
-          onClick={handleDelete} 
-          title="Delete"
-          data-testid="delete-button"
-          style={{ color: 'var(--text-color-danger)' }}
-        >
-          <DeleteIcon />
-        </Button>
+        {!field.isDefault && (
+          <Button
+            kind="tertiary"
+            size="tiny"
+            onClick={handleDelete}
+            title="Delete"
+            data-testid="delete-button"
+            style={{ color: 'var(--text-color-danger)' }}
+          >
+            <DeleteIcon />
+          </Button>
+        )}
       </Flex>
     </Flex>
     <Divider />

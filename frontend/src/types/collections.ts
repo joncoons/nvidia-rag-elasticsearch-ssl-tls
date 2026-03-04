@@ -54,6 +54,8 @@ export interface UIMetadataField {
   description?: string;
   // Legacy support for existing code
   optional?: boolean; // Will be computed from !required
+  // UI-only flag: built-in fields pre-populated for every collection; not sent to API
+  isDefault?: boolean;
 }
 
 /**

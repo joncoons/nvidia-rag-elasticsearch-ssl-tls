@@ -126,6 +126,162 @@ interface NewCollectionState {
  * addFiles([file1, file2]);
  * ```
  */
+/**
+ * Built-in fields automatically managed by the platform — present in every collection.
+ * Marked isDefault=true so the delete button is hidden in FieldDisplayCard.
+ */
+const DEFAULT_METADATA_FIELDS: UIMetadataField[] = [
+  {
+    name: "filename",
+    type: "string",
+    required: false,
+    description: "Name of the uploaded file",
+    isDefault: true,
+  },
+  {
+    name: "page_number",
+    type: "integer",
+    required: false,
+    description: "Page number where content appears in the document (1-indexed, first page is 1)",
+    isDefault: true,
+  },
+  {
+    name: "start_time",
+    type: "integer",
+    required: false,
+    description: "Start timestamp in milliseconds for audio or video segments",
+    isDefault: true,
+  },
+  {
+    name: "end_time",
+    type: "integer",
+    required: false,
+    description: "End timestamp in milliseconds for audio or video segments",
+    isDefault: true,
+  },
+];
+
+/**
+ * Standard lineage fields automatically injected by the ingestor for every document.
+ * Pre-populated so users can see them and remove any that are not needed.
+ */
+const STANDARD_DOCUMENT_FIELDS: UIMetadataField[] = [
+  {
+    name: "document_type",
+    type: "string",
+    required: false,
+    description: "Lowercase file extension of the source file: pdf, docx, md, etc.",
+    max_length: 32,
+  },
+  {
+    name: "source_uri",
+    type: "string",
+    required: false,
+    description: "Original filename or URL the document was sourced from",
+    max_length: 1024,
+  },
+  {
+    name: "source_system",
+    type: "string",
+    required: false,
+    description: "Origin label: sharepoint, s3, local, web_crawl, etc.",
+    max_length: 128,
+  },
+  {
+    name: "pipeline_type",
+    type: "string",
+    required: false,
+    description: "Pipeline that processed the document: nv_ingest | nemoretriever_parse",
+    max_length: 64,
+  },
+  {
+    name: "section_path",
+    type: "string",
+    required: false,
+    description: "H1>H2>H3 breadcrumb of the chunk position, e.g. Results > Revenue > Q4 (nemoretriever_parse only)",
+    max_length: 512,
+  },
+  {
+    name: "chunk_index",
+    type: "integer",
+    required: false,
+    description: "0-based position of this chunk within the document",
+  },
+  {
+    name: "total_chunks",
+    type: "integer",
+    required: false,
+    description: "Total chunks produced from the source document",
+  },
+  {
+    name: "page_count",
+    type: "integer",
+    required: false,
+    description: "Number of pages in the source PDF (nemoretriever_parse only)",
+  },
+  {
+    name: "detected_element_types",
+    type: "array",
+    array_type: "string",
+    required: false,
+    description: "Complex element types found in the document, e.g. table, chart (nemoretriever_parse only)",
+  },
+];
+
+/**
+ * Extra fields for collections that will hold web-crawled content.
+ * Not pre-populated — added via the "Add web crawl fields" preset button.
+ */
+export const WEB_CRAWL_FIELDS: UIMetadataField[] = [
+  {
+    name: "domain",
+    type: "string",
+    required: false,
+    description: "Netloc of the seed URL, e.g. docs.nvidia.com",
+    max_length: 253,
+  },
+  {
+    name: "crawl_depth",
+    type: "integer",
+    required: false,
+    description: "BFS hop distance from the seed URL; 0 = seed page",
+  },
+  {
+    name: "page_title",
+    type: "string",
+    required: false,
+    description: "HTML <title> of the crawled page",
+    max_length: 512,
+  },
+  {
+    name: "section_h1",
+    type: "string",
+    required: false,
+    description: "Text of the first <h1> element on the page",
+    max_length: 512,
+  },
+  {
+    name: "meta_description",
+    type: "string",
+    required: false,
+    description: "Content of <meta name=description> or og:description",
+    max_length: 512,
+  },
+  {
+    name: "crawl_session_id",
+    type: "string",
+    required: false,
+    description: "UUID shared by all pages from one crawl run",
+    max_length: 36,
+  },
+  {
+    name: "last_crawled_at",
+    type: "datetime",
+    required: false,
+    description: "ISO-8601 UTC timestamp of when the page was last crawled",
+  },
+];
+
 const defaultCatalogMetadata: CatalogMetadata = {
   description: '',
   tags: [],
@@ -154,7 +310,7 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
   collectionNameTouched: false,
   selectedFiles: [],
   fileMetadata: {},
-  metadataSchema: [],
+  metadataSchema: [...DEFAULT_METADATA_FIELDS, ...STANDARD_DOCUMENT_FIELDS],
   isLoading: false,
   uploadComplete: false,
   error: null,
@@ -313,7 +469,7 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
       collectionNameTouched: false,
       selectedFiles: [],
       fileMetadata: {},
-      metadataSchema: [],
+      metadataSchema: [...DEFAULT_METADATA_FIELDS, ...STANDARD_DOCUMENT_FIELDS],
       isLoading: false,
       uploadComplete: false,
       error: null,
