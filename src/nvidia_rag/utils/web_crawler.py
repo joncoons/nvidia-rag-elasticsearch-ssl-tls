@@ -18,8 +18,13 @@ Simple BFS web crawler for the NVIDIA RAG ingestor server.
 
 Crawls HTML pages within a single domain, saves them as temporary files,
 and uploads them to the vector store via NvidiaRAGIngestor.upload_documents().
-Optionally downloads linked binary files (PDF, DOCX, XLSX, PPTX) found as
-<a href> targets and ingests those as well.
+Optionally downloads linked files found as <a href> targets and ingests those
+as well.  Supported linked-file types (requires extract_linked_files=True):
+  Documents : PDF, DOCX, XLSX, PPTX, DOC, XLS
+  Text/MD   : .md, .txt
+  Images    : PNG, JPG/JPEG, BMP, TIFF
+  Audio     : WAV, MP3
+  Video     : MP4, AVI, MKV, MOV
 
 Usage::
 
@@ -49,9 +54,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# File extensions considered binary / document files (not crawled as HTML)
+# File extensions considered binary / document files (not crawled as HTML).
+# These are downloaded and ingested when extract_linked_files=True.
+# Only extensions supported by nv-ingest are included.
 _BINARY_EXTENSIONS: frozenset[str] = frozenset(
-    {".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls"}
+    {
+        # Documents
+        ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls",
+        # Markdown / plain text
+        ".md", ".txt",
+        # Images
+        ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
+        # Audio
+        ".wav", ".mp3",
+        # Video
+        ".mp4", ".avi", ".mkv", ".mov",
+    }
 )
 
 
@@ -81,8 +99,9 @@ class SimpleWebCrawler:
         Maximum number of HTML pages to crawl (binary file downloads are not
         counted against this limit).
     extract_linked_files : bool
-        When True, ``<a href>`` links pointing to PDF/DOCX/XLSX/PPTX files are
-        downloaded and ingested in addition to HTML pages.
+        When True, ``<a href>`` links pointing to supported binary files
+        (documents, images, audio, video, markdown) are downloaded and
+        ingested in addition to HTML pages.
     use_nemoretriever_parse : bool
         Forwarded to ``upload_documents()`` for each ingested file.
     force_nemoretriever_parse : bool
