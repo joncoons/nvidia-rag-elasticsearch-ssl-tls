@@ -154,6 +154,13 @@ ingestor-server:
     # Add --served-model-name to vllm serve (nemotron-parse-v12.yaml) to use the canonical short name.
     APP_NEMOPARSE_MODELNAME: "nvidia/NVIDIA-Nemotron-Parse-v1.2"
     APP_NEMOPARSE_APIKEY: ""   # inject via --set if NGC API key required
+    # ---------------------------------------------------------------------------
+    # Image extraction — enable VLM captioning for standalone images and images
+    # embedded in PDFs; use multimodal VLM embeddings (nemoretriever-vlm-embedding-ms)
+    # instead of text-only embedding of the caption string.
+    # ---------------------------------------------------------------------------
+    APP_NVINGEST_EXTRACTIMAGES: "True"      # extract + caption images embedded in PDFs
+    IMAGE_ELEMENTS_MODALITY: "multimodal"   # embed image pixels via vlm-embedding-ms
   extraVolumes:
     - name: eck-ca
       configMap:
@@ -365,6 +372,13 @@ nv-ingest:
   milvusDeployed: false
   envVars:
     APP_NVINGEST_SEGMENTAUDIO: "True"   # Enable audio transcription via parakeet NIM
+    # VLM_CAPTION_PROMPT cannot be overridden here — Helm strategic-merge patch ordering
+    # conflict when the var already exists in the nv-ingest Deployment spec.
+    # Applied directly via kubectl (see below). Value committed for reference:
+    # "Provide a detailed description of this image. Identify and transcribe all visible
+    #  text (OCR). Describe all objects, people, diagrams, charts, tables, graphs, and
+    #  spatial relationships. Be thorough and precise so the description can stand alone
+    #  as searchable text."
   nimOperator:
     # OCR on ubuntu2; NFS cache (no nodeAffinity)
     nemoretriever_ocr_v1:
