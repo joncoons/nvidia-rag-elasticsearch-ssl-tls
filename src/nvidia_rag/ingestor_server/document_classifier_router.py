@@ -140,7 +140,7 @@ class DocumentClassifierRouter:
         dpi: int = 200,
         chunk_size: int = 512,
         chunk_overlap: int = 150,
-        max_parallel_pages: int = 4,
+        max_parallel_pages: int = 8,
     ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         self.model_name = model_name
@@ -246,8 +246,8 @@ class DocumentClassifierRouter:
         # request, distributing load across all nemotron-parse replica pods
         # via k8s Service round-robin.
         #
-        # With 2 replica pods × 4 max-num-seqs each = 8 concurrent inference
-        # slots; max_parallel_pages=4 per batch × 2 concurrent batches = 8
+        # With 4 replica pods × 4 max-num-seqs each = 16 concurrent inference
+        # slots; max_parallel_pages=8 per batch × 2 concurrent batches = 16
         # total in-flight requests → fully saturates available capacity.
         # ----------------------------------------------------------------
         all_detected_types: set[str] = set()

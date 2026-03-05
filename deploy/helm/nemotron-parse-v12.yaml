@@ -75,7 +75,7 @@ metadata:
   labels:
     app: nemotron-parse-v12
 spec:
-  replicas: 2
+  replicas: 4
   selector:
     matchLabels:
       app: nemotron-parse-v12
