@@ -849,6 +849,8 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
 
     try:
         vdb_auth_token = _extract_vdb_auth_token(request)
+        registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
+        export_dir = os.getenv("APP_CRAWLER_EXPORT_DIR", "")
         crawler = SimpleWebCrawler(
             start_url=payload.start_url,
             max_pages=payload.max_pages,
@@ -856,9 +858,11 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             batch_ingest_size=payload.batch_ingest_size,
             max_concurrent_batches=payload.max_concurrent_batches,
             force_recrawl=payload.force_recrawl,
+            registry_dir=registry_dir,
             collection_name=payload.collection_name,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
+            export_dir=export_dir,
         )
 
         async def _crawl_task():
@@ -1479,7 +1483,7 @@ async def delete_collections(
         if result.successful:
             from nvidia_rag.utils.web_crawler import SimpleWebCrawler
 
-            registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/mnt/nvme2")
+            registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
             for name in result.successful:
                 removed = SimpleWebCrawler.cleanup_crawl_artifacts(name, registry_dir)
                 if removed:

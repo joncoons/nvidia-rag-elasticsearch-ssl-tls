@@ -198,13 +198,14 @@ class SimpleWebCrawler:
         batch_ingest_size: int = 20,
         max_concurrent_batches: int = 3,
         force_recrawl: bool = False,
-        registry_dir: str = "/mnt/nvme2",
+        registry_dir: str = "/tmp",
         collection_name: str = "",
         use_nemoretriever_parse: bool = False,
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
         user_agent: str = "NVIDIA-RAG-Crawler/1.0",
         html_chunk_max_tokens: int = 1024,
+        export_dir: str = "",
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.max_pages = max_pages
@@ -218,6 +219,7 @@ class SimpleWebCrawler:
         self.force_nemoretriever_parse = force_nemoretriever_parse
         self.request_timeout = request_timeout
         self._html_chunk_max_tokens = html_chunk_max_tokens
+        self.export_dir = export_dir
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
@@ -595,6 +597,7 @@ class SimpleWebCrawler:
                 error_matrix.setdefault("other", []).append(entry)
 
         self._write_error_matrix_csv(error_matrix)
+        self._export_crawl_artifacts()
 
         return {
             "message": (
@@ -640,7 +643,7 @@ class SimpleWebCrawler:
     @staticmethod
     def cleanup_crawl_artifacts(
         collection_name: str,
-        registry_dir: str = "/mnt/nvme2",
+        registry_dir: str = "/tmp",
     ) -> list[str]:
         """Remove URL registry and error-matrix CSV files for a collection.
 
@@ -921,6 +924,36 @@ class SimpleWebCrawler:
             )
         except Exception as exc:
             logger.warning("Could not write error matrix CSV to %s: %s", csv_path, exc)
+
+    def _export_crawl_artifacts(self) -> None:
+        """
+        Copy the URL registry JSON and error-matrix CSV to ``self.export_dir``
+        at the end of a crawl so they are accessible outside the pod.
+
+        No-op when ``export_dir`` is empty or the source files do not exist.
+        """
+        if not self.export_dir:
+            return
+        import shutil
+        slug = self._domain_slug()
+        sources = [
+            os.path.join(self.registry_dir, f"{slug}_url_registry.json"),
+            os.path.join(self.registry_dir, f"{slug}_error_matrix.csv"),
+        ]
+        try:
+            os.makedirs(self.export_dir, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create export_dir '%s': %s", self.export_dir, exc)
+            return
+        for src in sources:
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(self.export_dir, os.path.basename(src))
+            try:
+                shutil.copy2(src, dst)
+                logger.info("Exported crawl artifact: %s → %s", src, dst)
+            except OSError as exc:
+                logger.warning("Failed to export '%s' to '%s': %s", src, dst, exc)
 
     @staticmethod
     def _save_temp(data: bytes, suffix: str = ".html") -> str:

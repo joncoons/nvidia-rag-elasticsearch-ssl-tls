@@ -177,14 +177,28 @@ ingestor-server:
     # ---------------------------------------------------------------------------
     APP_NVINGEST_EXTRACTIMAGES: "True"      # extract + caption images embedded in PDFs
     IMAGE_ELEMENTS_MODALITY: "multimodal"   # embed image pixels via vlm-embedding-ms
+    # ---------------------------------------------------------------------------
+    # Web crawler — registry and export paths
+    # APP_CRAWLER_REGISTRY_DIR: internal pod path for URL registry JSON + error CSV
+    # APP_CRAWLER_EXPORT_DIR:   host-mounted path; files are copied here at crawl end
+    #                           so they are accessible on ubuntu-local-dev after the crawl
+    # ---------------------------------------------------------------------------
+    APP_CRAWLER_REGISTRY_DIR: "/tmp"
+    APP_CRAWLER_EXPORT_DIR: "/crawl-exports"
   extraVolumes:
     - name: eck-ca
       configMap:
         name: eck-es-ca-cert
+    - name: crawl-exports
+      hostPath:
+        path: /home/joncoons/crawl-exports
+        type: DirectoryOrCreate
   extraVolumeMounts:
     - name: eck-ca
       mountPath: /etc/ssl/eck
       readOnly: true
+    - name: crawl-exports
+      mountPath: /crawl-exports
 
 # ---------------------------------------------------------------------------
 # ECK Elasticsearch — HTTPS with ECK self-signed cert + elastic user auth
