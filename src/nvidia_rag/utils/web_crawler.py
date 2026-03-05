@@ -35,6 +35,21 @@ Phase 2 -- Drain: after the BFS loop ends the remaining files (if any) are
     dispatched as a final batch, then the loop polls until all in-flight
     futures complete and aggregates the results before returning.
 
+Delta / cross-run deduplication:
+    A URL registry is persisted to ``<registry_dir>/<domain>_url_registry.json``
+    after each crawl and loaded at the start of the next.
+
+    * HTML pages: always fetched in full (links must be extracted for BFS).
+      SHA-256 of the response body is compared against the stored hash; if
+      unchanged the page is skipped for ingest but links are still followed.
+      The HTTP ``Last-Modified`` and ``ETag`` headers are stored for future use.
+
+    * Binary files: conditional GET with ``If-None-Match`` (ETag) or
+      ``If-Modified-Since``; a ``304 Not Modified`` response skips download
+      and ingest entirely.
+
+    Set ``force_recrawl=True`` to ignore the registry and re-ingest everything.
+
 Supported linked-file types (requires extract_linked_files=True):
   Documents : PDF, DOCX, XLSX, PPTX, DOC, XLS
   Text/MD   : .md, .txt
@@ -59,12 +74,15 @@ Usage::
 
 import asyncio
 import csv
+import hashlib
+import json
 import logging
 import os
 import tempfile
 import time
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
@@ -77,6 +95,9 @@ if TYPE_CHECKING:
     from nvidia_rag.ingestor_server.main import NvidiaRAGIngestor
 
 logger = logging.getLogger(__name__)
+
+# Sentinel returned by _collect_binary_file when server responds 304 Not Modified.
+_UNCHANGED: tuple = ()
 
 # File extensions considered binary / document files (not crawled as HTML).
 # These are downloaded and ingested when extract_linked_files=True.
@@ -112,14 +133,22 @@ def _same_domain(url: str, netloc: str) -> bool:
     return parsed.netloc == netloc or parsed.netloc.endswith("." + netloc)
 
 
+def _sha256(data: bytes) -> str:
+    """Return ``sha256:<hex>`` digest of *data*."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
 class SimpleWebCrawler:
     """
-    Streaming-batch BFS web crawler with back-pressure.
+    Streaming-batch BFS web crawler with back-pressure and delta detection.
 
     Ingest batches are dispatched as files accumulate, but no more than
     ``max_concurrent_batches`` are in-flight at once.  Completed futures are
     harvested eagerly throughout (no per-batch timeout) so nv-ingest results
     are never dropped due to a timeout.
+
+    A URL registry is persisted between runs so that unchanged pages and files
+    are skipped automatically.  Use ``force_recrawl=True`` to override.
 
     Parameters
     ----------
@@ -139,6 +168,12 @@ class SimpleWebCrawler:
         Maximum number of ``upload_documents()`` calls in-flight at the same
         time.  Keeps nv-ingest from being overwhelmed on large crawls.
         Default 3.
+    force_recrawl : bool
+        When True, ignore the URL registry and re-ingest all content even if
+        unchanged since the last crawl.  Default False.
+    registry_dir : str
+        Directory where the URL registry JSON and error-matrix CSV are written.
+        Default ``/mnt/nvme2``.
     use_nemoretriever_parse : bool
         Forwarded to ``upload_documents()`` for every batch.
     force_nemoretriever_parse : bool
@@ -156,6 +191,8 @@ class SimpleWebCrawler:
         extract_linked_files: bool = False,
         batch_ingest_size: int = 20,
         max_concurrent_batches: int = 3,
+        force_recrawl: bool = False,
+        registry_dir: str = "/mnt/nvme2",
         use_nemoretriever_parse: bool = False,
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
@@ -166,6 +203,8 @@ class SimpleWebCrawler:
         self.extract_linked_files = extract_linked_files
         self.batch_ingest_size = max(1, batch_ingest_size)
         self.max_concurrent_batches = max(1, max_concurrent_batches)
+        self.force_recrawl = force_recrawl
+        self.registry_dir = registry_dir
         self.use_nemoretriever_parse = use_nemoretriever_parse
         self.force_nemoretriever_parse = force_nemoretriever_parse
         self.request_timeout = request_timeout
@@ -228,16 +267,18 @@ class SimpleWebCrawler:
         loop: asyncio.AbstractEventLoop,
     ) -> dict[str, Any]:
         """
-        Streaming-batch crawl with back-pressure and eager harvesting.
+        Streaming-batch crawl with back-pressure, eager harvesting, and delta detection.
 
         Phase 1 -- BFS fetch with rolling dispatch:
             Every ``batch_ingest_size`` files, dispatch an ingest batch.
             If ``max_concurrent_batches`` slots are full, block (poll/sleep)
             until a batch completes before dispatching the next one.
+            Unchanged pages/files (per URL registry) are skipped.
 
         Phase 2 -- Drain:
             Submit the final partial batch, then poll until all in-flight
             futures complete (no timeout -- waits as long as nv-ingest needs).
+            Registry is saved after all futures settle.
         """
         visited_html: set[str] = set()
         visited_files: set[str] = set()
@@ -247,6 +288,8 @@ class SimpleWebCrawler:
         all_temp_files: list[str] = []
         errors: list[dict] = []
         pages_crawled = 0
+        pages_skipped = 0   # unchanged HTML pages (hash match)
+        files_skipped = 0   # unchanged binary files (304)
         total_files_dispatched = 0
         files_ingested = 0
 
@@ -256,6 +299,10 @@ class SimpleWebCrawler:
         # In-flight ingest futures: (future, batch_number, file_count)
         in_flight: list[tuple[ConcurrentFuture, int, int]] = []
         batch_num = 0
+
+        # URL registry: loaded once at start, saved in finally
+        registry: dict[str, dict] = self._load_registry()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         def _harvest_done() -> None:
             """Move any completed futures out of in_flight, record results."""
@@ -328,9 +375,10 @@ class SimpleWebCrawler:
         max_pages_display = self.max_pages if self.max_pages is not None else "unlimited"
         logger.info(
             "Crawl starting at %s (max_pages=%s, batch_ingest_size=%d, "
-            "max_concurrent_batches=%d)",
+            "max_concurrent_batches=%d, force_recrawl=%s, registry_entries=%d)",
             self.start_url, max_pages_display,
             self.batch_ingest_size, self.max_concurrent_batches,
+            self.force_recrawl, len(registry),
         )
 
         try:
@@ -345,35 +393,63 @@ class SimpleWebCrawler:
                 _harvest_done()
 
                 logger.info("Crawling [depth=%d] %s", depth, url)
-                html_content, page_title, meta_desc, section_h1, linked_urls, fetch_error = (
+                html_content, page_title, meta_desc, section_h1, linked_urls, fetch_error, resp_meta = (
                     self._fetch_html(url)
                 )
+
                 if html_content is None:
                     if fetch_error:
                         errors.append({"url": url, **fetch_error})
+                    # Still process any links if we got a non-HTML content type
+                    # (fetch_error is None for silent skips like wrong content type)
                     continue
 
-                tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
-                all_temp_files.append(tmp_path)
-                pending.append((
-                    tmp_path,
-                    {
-                        "filename": os.path.basename(tmp_path),
-                        "metadata": {
-                            "source_url": url,
-                            "page_title": page_title,
-                            "crawl_depth": depth,
-                            "section_h1": section_h1,
-                            "meta_description": meta_desc,
-                            "source_system": "web_crawl",
-                        },
-                    },
-                ))
                 pages_crawled += 1
-                logger.info(
-                    "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
-                    pages_crawled, max_pages_display, url, len(pending), len(in_flight),
-                )
+
+                # ── Delta check for HTML: compare content hash ───────────────
+                new_hash = resp_meta.get("content_hash", "")
+                reg_entry = registry.get(url, {})
+                stored_hash = reg_entry.get("content_hash", "")
+
+                if not self.force_recrawl and stored_hash and stored_hash == new_hash:
+                    pages_skipped += 1
+                    logger.info(
+                        "Skipping unchanged page %d/%s: %s  [hash match, skipped=%d]",
+                        pages_crawled, max_pages_display, url, pages_skipped,
+                    )
+                    # Update last_seen but do NOT update last_ingested
+                    registry[url] = {**reg_entry, "last_seen": now_iso}
+                else:
+                    # New or changed — queue for ingest
+                    tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
+                    all_temp_files.append(tmp_path)
+                    pending.append((
+                        tmp_path,
+                        {
+                            "filename": os.path.basename(tmp_path),
+                            "metadata": {
+                                "source_url": url,
+                                "page_title": page_title,
+                                "crawl_depth": depth,
+                                "section_h1": section_h1,
+                                "meta_description": meta_desc,
+                                "source_system": "web_crawl",
+                            },
+                        },
+                    ))
+                    # Update registry entry
+                    registry[url] = {
+                        "last_seen": now_iso,
+                        "last_ingested": now_iso,
+                        "last_modified": resp_meta.get("last_modified"),
+                        "etag": resp_meta.get("etag"),
+                        "content_hash": new_hash,
+                        "status_code": resp_meta.get("status_code", 200),
+                    }
+                    logger.info(
+                        "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
+                        pages_crawled, max_pages_display, url, len(pending), len(in_flight),
+                    )
 
                 # Collect any linked binary files
                 for href in linked_urls:
@@ -381,11 +457,37 @@ class SimpleWebCrawler:
                     if self.extract_linked_files and _is_binary_url(abs_href):
                         if abs_href not in visited_files:
                             visited_files.add(abs_href)
-                            entry = self._collect_binary_file(
-                                abs_href, depth + 1, all_temp_files, errors
+
+                            # Build conditional-GET headers from registry
+                            file_reg = registry.get(abs_href, {})
+                            if_none_match = (
+                                file_reg.get("etag")
+                                if not self.force_recrawl else None
                             )
-                            if entry is not None:
+                            if_modified_since = (
+                                file_reg.get("last_modified")
+                                if not self.force_recrawl and not if_none_match else None
+                            )
+
+                            entry, file_meta = self._collect_binary_file(
+                                abs_href, depth + 1, all_temp_files, errors,
+                                if_none_match=if_none_match,
+                                if_modified_since=if_modified_since,
+                            )
+                            if entry is _UNCHANGED:
+                                files_skipped += 1
+                                # Refresh last_seen
+                                registry[abs_href] = {**file_reg, "last_seen": now_iso}
+                            elif entry is not None:
                                 pending.append(entry)
+                                registry[abs_href] = {
+                                    "last_seen": now_iso,
+                                    "last_ingested": now_iso,
+                                    "last_modified": file_meta.get("last_modified"),
+                                    "etag": file_meta.get("etag"),
+                                    "content_hash": file_meta.get("content_hash"),
+                                    "status_code": file_meta.get("status_code", 200),
+                                }
                     elif (
                         not _is_binary_url(abs_href)
                         and _same_domain(abs_href, self._netloc)
@@ -400,13 +502,15 @@ class SimpleWebCrawler:
                     pending = []
 
             # ── Phase 2: flush remainder, then drain all in-flight batches ───
-            _dispatch_batch(pending)  # back-pressure applies here too
+            _dispatch_batch(pending)
             pending = []
 
             if not in_flight and total_files_dispatched == 0:
                 return {
                     "message": "Crawl complete: no content collected.",
                     "pages_crawled": pages_crawled,
+                    "pages_skipped": pages_skipped,
+                    "files_skipped": files_skipped,
                     "files_ingested": 0,
                     "errors": errors,
                     "error_matrix": {
@@ -418,8 +522,9 @@ class SimpleWebCrawler:
                 }
 
             logger.info(
-                "Crawl BFS complete (%d pages).  Draining %d remaining in-flight batch(es)...",
-                pages_crawled, len(in_flight),
+                "Crawl BFS complete (%d pages, %d skipped-unchanged).  "
+                "Draining %d remaining in-flight batch(es)...",
+                pages_crawled, pages_skipped, len(in_flight),
             )
 
             # Poll until all in-flight futures complete (no timeout).
@@ -433,8 +538,10 @@ class SimpleWebCrawler:
                     os.unlink(tp)
                 except OSError:
                     pass
+            # Always persist the updated registry
+            self._save_registry(registry)
 
-        binary_files = total_files_dispatched - pages_crawled
+        binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
 
         # Build structured error matrix grouped by category
         error_matrix: dict[str, list[dict]] = {
@@ -461,10 +568,13 @@ class SimpleWebCrawler:
 
         return {
             "message": (
-                f"Crawl complete: {pages_crawled} HTML pages and "
-                f"{binary_files} linked files ingested."
+                f"Crawl complete: {pages_crawled - pages_skipped} HTML pages and "
+                f"{binary_files} linked files ingested "
+                f"({pages_skipped} pages and {files_skipped} files unchanged/skipped)."
             ),
             "pages_crawled": pages_crawled,
+            "pages_skipped": pages_skipped,
+            "files_skipped": files_skipped,
             "files_ingested": binary_files,
             "errors": errors,
             "error_matrix": error_matrix,
@@ -474,17 +584,67 @@ class SimpleWebCrawler:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _domain_slug(self) -> str:
+        """Return a filesystem-safe slug derived from the crawl domain.
+
+        Strips ``www.`` prefix, drops port, replaces ``.`` and ``-`` with ``_``.
+        Example: ``www.nvidia.com`` → ``nvidia_com``
+        """
+        netloc = self._netloc.split(":")[0]
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.replace(".", "_").replace("-", "_")
+
+    def _registry_path(self) -> str:
+        return os.path.join(self.registry_dir, f"{self._domain_slug()}_url_registry.json")
+
+    def _load_registry(self) -> dict[str, dict]:
+        """Load the URL registry from disk; return empty dict if absent or corrupt."""
+        path = self._registry_path()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                logger.info("Loaded URL registry from %s (%d entries)", path, len(data))
+                return data
+        except FileNotFoundError:
+            logger.info("No existing URL registry at %s — starting fresh", path)
+        except Exception as exc:
+            logger.warning("Could not load URL registry from %s: %s — starting fresh", path, exc)
+        return {}
+
+    def _save_registry(self, registry: dict[str, dict]) -> None:
+        """Atomically write the URL registry to disk."""
+        path = self._registry_path()
+        tmp_path = path + ".tmp"
+        try:
+            os.makedirs(self.registry_dir, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(registry, fh, indent=2)
+            os.replace(tmp_path, path)
+            logger.info("URL registry saved to %s (%d entries)", path, len(registry))
+        except Exception as exc:
+            logger.warning("Could not save URL registry to %s: %s", path, exc)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
     def _fetch_html(
         self, url: str
-    ) -> tuple[str | None, str, str, str, list[str], dict | None]:
+    ) -> tuple[str | None, str, str, str, list[str], dict | None, dict]:
         """
         Fetch *url*, parse it, and return
-        ``(html_text, title, meta_desc, h1, hrefs, fetch_error)``.
+        ``(html_text, title, meta_desc, h1, hrefs, fetch_error, response_meta)``.
 
-        ``fetch_error`` is ``None`` on success or a dict with keys
+        ``fetch_error`` is ``None`` on success, or a dict with keys
         ``error_type``, ``status_code``, and ``error`` on failure.
-        Returns ``(None, "", "", "", [], None)`` for non-HTML content (silently skipped).
+        Returns ``(None, ..., None, {})`` for non-HTML content (silently skipped).
+
+        ``response_meta`` contains ``last_modified``, ``etag``,
+        ``content_hash`` (SHA-256 of body), and ``status_code``.
         """
+        empty_meta: dict = {}
         try:
             from bs4 import BeautifulSoup  # lazy import
         except ImportError:
@@ -492,7 +652,7 @@ class SimpleWebCrawler:
             return None, "", "", "", [], {
                 "error_type": "broken_link", "status_code": None,
                 "error": "beautifulsoup4 not installed",
-            }
+            }, empty_meta
 
         try:
             resp = self._session.get(url, timeout=self.request_timeout)
@@ -500,21 +660,27 @@ class SimpleWebCrawler:
             content_type = resp.headers.get("Content-Type", "")
             if "text/html" not in content_type and "text/plain" not in content_type:
                 logger.debug("Skipping non-HTML URL %s (Content-Type: %s)", url, content_type)
-                return None, "", "", "", [], None  # Not an error — silently skip
+                return None, "", "", "", [], None, empty_meta  # silently skip
             html_text = resp.text
+            resp_meta: dict = {
+                "last_modified": resp.headers.get("Last-Modified"),
+                "etag": resp.headers.get("ETag"),
+                "content_hash": _sha256(html_text.encode("utf-8")),
+                "status_code": resp.status_code,
+            }
         except requests.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             logger.warning("HTTP error fetching %s: %s", url, exc)
             return None, "", "", "", [], {
                 "error_type": "broken_link", "status_code": status_code,
                 "error": str(exc),
-            }
+            }, empty_meta
         except Exception as exc:
             logger.warning("HTTP error fetching %s: %s", url, exc)
             return None, "", "", "", [], {
                 "error_type": "broken_link", "status_code": None,
                 "error": str(exc),
-            }
+            }, empty_meta
 
         try:
             soup = BeautifulSoup(html_text, "html.parser")
@@ -535,9 +701,9 @@ class SimpleWebCrawler:
             return html_text, "", "", "", [], {
                 "error_type": "broken_link", "status_code": None,
                 "error": f"parse error: {exc}",
-            }
+            }, resp_meta
 
-        return html_text, title, meta_desc, section_h1, hrefs, None
+        return html_text, title, meta_desc, section_h1, hrefs, None, resp_meta
 
     def _collect_binary_file(
         self,
@@ -545,19 +711,50 @@ class SimpleWebCrawler:
         depth: int,
         all_temp_files: list[str],
         errors: list[dict],
-    ) -> tuple[str, dict] | None:
+        if_none_match: str | None = None,
+        if_modified_since: str | None = None,
+    ) -> tuple[tuple[str, dict] | tuple | None, dict]:
         """
-        Download *url* to a temp file and return ``(tmp_path, metadata_entry)``
-        for inclusion in the next ingest batch, or ``None`` on failure.
+        Download *url* to a temp file and return ``(entry, response_meta)``.
 
+        ``entry`` is one of:
+        * ``(tmp_path, metadata_dict)`` — new or changed file, add to batch.
+        * ``_UNCHANGED`` (empty tuple sentinel) — server returned 304, skip.
+        * ``None`` — download or pre-processing failed, error logged.
+
+        ``response_meta`` carries ``last_modified``, ``etag``,
+        ``content_hash``, and ``status_code`` for registry updates.
         XML files are pre-processed to Markdown before collection.
         """
         suffix = Path(urlparse(url).path).suffix or ".bin"
+        empty_meta: dict = {}
+
+        # Build conditional-GET headers
+        headers: dict[str, str] = {}
+        if if_none_match:
+            headers["If-None-Match"] = if_none_match
+        elif if_modified_since:
+            headers["If-Modified-Since"] = if_modified_since
+
         try:
-            resp = self._session.get(url, stream=True, timeout=self.request_timeout)
+            resp = self._session.get(
+                url, stream=True, timeout=self.request_timeout, headers=headers
+            )
+            if resp.status_code == 304:
+                logger.debug("304 Not Modified (unchanged): %s", url)
+                return _UNCHANGED, empty_meta
             resp.raise_for_status()
             tmp_path = self._save_temp_stream(resp, suffix=suffix)
             all_temp_files.append(tmp_path)
+            # Compute hash from the downloaded file
+            with open(tmp_path, "rb") as fh:
+                content_hash = _sha256(fh.read())
+            file_meta: dict = {
+                "last_modified": resp.headers.get("Last-Modified"),
+                "etag": resp.headers.get("ETag"),
+                "content_hash": content_hash,
+                "status_code": resp.status_code,
+            }
         except requests.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
             logger.warning("Failed to download binary file %s: %s", url, exc)
@@ -567,7 +764,7 @@ class SimpleWebCrawler:
                 "status_code": status_code,
                 "error": str(exc),
             })
-            return None
+            return None, empty_meta
         except Exception as exc:
             logger.warning("Failed to download binary file %s: %s", url, exc)
             errors.append({
@@ -576,7 +773,7 @@ class SimpleWebCrawler:
                 "status_code": None,
                 "error": str(exc),
             })
-            return None
+            return None, empty_meta
 
         # XML files are not natively supported by nv-ingest -- pre-process to Markdown.
         if suffix.lower() == ".xml":
@@ -586,7 +783,7 @@ class SimpleWebCrawler:
                 markdown_text = xml_to_markdown(xml_bytes)
                 if not markdown_text.strip():
                     logger.warning("XML pre-processor produced no content for %s -- skipping", url)
-                    return None
+                    return None, empty_meta
                 md_path = self._save_temp(markdown_text.encode("utf-8"), suffix=".md")
                 all_temp_files.append(md_path)
                 tmp_path = md_path
@@ -599,9 +796,9 @@ class SimpleWebCrawler:
                     "status_code": None,
                     "error": f"XML pre-process failed: {exc}",
                 })
-                return None
+                return None, empty_meta
 
-        return (
+        entry = (
             tmp_path,
             {
                 "filename": os.path.basename(tmp_path),
@@ -612,27 +809,22 @@ class SimpleWebCrawler:
                 },
             },
         )
+        return entry, file_meta
 
     def _write_error_matrix_csv(
         self,
         error_matrix: dict[str, list[dict]],
-        output_dir: str = "/mnt/nvme2",
     ) -> None:
-        """Write the error matrix to ``<output_dir>/<domain>_error_matrix.csv``.
+        """Write the error matrix to ``<registry_dir>/<domain>_error_matrix.csv``.
 
         Columns: category, url, status_code, error
         One row per error entry across all categories.  Existing file is
         overwritten.  Silently skips if the output directory is not writable.
         """
-        # Strip www. prefix, remove port, replace . and - with _
-        netloc = self._netloc.split(":")[0]  # drop port
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-        domain = netloc.replace(".", "_").replace("-", "_")
-        csv_path = os.path.join(output_dir, f"{domain}_error_matrix.csv")
+        csv_path = os.path.join(self.registry_dir, f"{self._domain_slug()}_error_matrix.csv")
         total_errors = sum(len(v) for v in error_matrix.values())
         try:
-            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(self.registry_dir, exist_ok=True)
             with open(csv_path, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(
                     fh,

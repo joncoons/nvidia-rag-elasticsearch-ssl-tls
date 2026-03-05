@@ -665,6 +665,13 @@ class CrawlRequest(BaseModel):
             "Default is 3."
         ),
     )
+    force_recrawl: bool = Field(
+        default=False,
+        description=(
+            "When True, ignore the URL registry and re-ingest all content even if "
+            "unchanged since the last crawl.  Use this for a full clean re-index."
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -848,6 +855,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             extract_linked_files=payload.extract_linked_files,
             batch_ingest_size=payload.batch_ingest_size,
             max_concurrent_batches=payload.max_concurrent_batches,
+            force_recrawl=payload.force_recrawl,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
         )
