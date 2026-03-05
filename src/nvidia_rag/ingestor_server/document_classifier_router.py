@@ -17,28 +17,38 @@
 Document Classifier and Router for nemoretriever-parse VLM.
 
 Single-pass pipeline per PDF page using vLLM's OpenAI-compatible API with
-prompt-based inference.  No tool calls are required — the model outputs
-structured text with embedded bbox coordinates and class tags that are parsed
-to recover element types and content.
+prompt-based inference.  The model outputs structured text with embedded bbox
+coordinates and class tags that are parsed to recover element types and content.
 
 Model output format per element:
     <x_X1><y_Y1>TEXT CONTENT<x_X2><y_Y2><class_CLASSNAME>
 
-Complex element trigger classes (triggers VLM-quality markdown extraction):
-    table, picture
+Detected element classes (13 total):
+    Text, Title, Section-header, List-item, TOC, Bibliography, Footnote,
+    Page-header, Page-footer, Picture, Formula, Table, Caption
 
-Routing behaviour (document-level):
-    If ANY page contains a complex element the entire document text (extracted
-    by the VLM) is compiled into chunks and returned.  The caller substitutes
-    these files in the NV-Ingest file list.  If no complex elements are found
-    the caller proceeds with the standard NV-Ingest pipeline.
+Semantic chunking (no overlap):
+    Pages are processed in parallel.  After all pages complete, a cross-page
+    stitch pass merges elements that span page boundaries (e.g. a paragraph
+    whose last sentence wraps to the next page, or a table split across pages).
+    The stitched element list is then chunked by semantic class transitions:
 
-Implementation notes:
-    - A single API call per page gives both detection AND extraction.
-    - All pages are always processed so that context around complex elements
-      is preserved in the final output.
-    - Simple documents (no complex classes) return None; the inference cost
-      is low since plain-text pages produce short outputs.
+    * Title / Section-header  → always flush current chunk and start a new one.
+    * Table + following Caption → emitted as an atomic unit (never split apart).
+    * Formula                 → emitted as an atomic unit.
+    * Picture                 → skipped; following Caption becomes "[Image: ...]".
+    * Text, List-item, etc.   → accumulated under the current heading.
+    * Page-header/footer, TOC → stripped (noise).
+
+    When an accumulating section would exceed ``max_tokens`` the current chunk
+    is flushed and the section heading is carried forward as context — no token
+    overlap is needed because every split lands on a semantic boundary.
+
+Routing behaviour:
+    If ANY page contains a complex element (Table, Picture) the stitched content
+    is semantically chunked and returned as temp ``.md`` files.  If no complex
+    elements are found, ``None`` is returned so the caller uses the standard
+    NV-Ingest pipeline.  When ``force=True`` routing runs unconditionally.
 
 Usage::
 
@@ -49,11 +59,8 @@ Usage::
 
     config = NvidiaRAGConfig()
     router = DocumentClassifierRouter.from_config(config)
-
     replacements = router.route_documents(filepaths)
-    # replacements: {original_path: temp_md_path | None}
-    # temp_md_path is None  → use standard NV-Ingest pipeline
-    # temp_md_path is a str → replace with the markdown file, delete after ingest
+    # replacements: {original_path: [(temp_md_path, chunk_meta), ...] | None}
 """
 
 import base64
@@ -86,20 +93,22 @@ _EXTRACTION_PROMPT = (
 
 # Regex to parse one element from the model's structured output:
 #   <x_X1><y_Y1>CONTENT<x_X2><y_Y2><class_CLASSNAME>
-# Non-greedy so each finditer call yields exactly one element at a time.
 _RE_ELEMENT = re.compile(
     r"<x_[\d.]+><y_[\d.]+>(.*?)<x_[\d.]+><y_[\d.]+><class_([^>]+)>",
     re.DOTALL,
 )
 
-# Element classes from the model that signal complex data-presentation content
-# warranting VLM-quality markdown extraction.  These are the actual class names
-# the model emits (case-insensitive comparison applied on match).
+# Element classes that trigger VLM-quality routing (trigger route_document to
+# return chunked output instead of None).
 COMPLEX_ELEMENT_CLASSES: frozenset[str] = frozenset({"table", "picture"})
 
-# Element classes that produce no useful text and should be omitted from the
-# compiled markdown output.
-_SKIP_CLASSES: frozenset[str] = frozenset({"page-header", "page-footer", "picture"})
+# Semantic chunking taxonomy
+_SECTION_STARTERS: frozenset[str] = frozenset({"title", "section-header"})
+_ATOMIC_CLASSES: frozenset[str] = frozenset({"table", "formula"})
+_STITCHABLE_CLASSES: frozenset[str] = frozenset({"text", "list-item"})
+_TERMINAL_PUNCT: frozenset[str] = frozenset({".", "!", "?", ":", ";"})
+_SKIP_CLASSES: frozenset[str] = frozenset({"page-header", "page-footer", "toc"})
+_CAPTION_CLASS: str = "caption"
 
 
 # ---------------------------------------------------------------------------
@@ -109,26 +118,32 @@ _SKIP_CLASSES: frozenset[str] = frozenset({"page-header", "page-footer", "pictur
 
 class DocumentClassifierRouter:
     """
-    Classifies PDF pages with Nemotron-Parse and routes documents that contain
-    complex data elements (tables, figures) through VLM-quality extraction.
+    Classifies and semantically chunks PDF documents using Nemotron-Parse.
+
+    Pages are rasterised and processed in parallel.  Cross-page element
+    boundaries are stitched before semantic chunking.  Each chunk corresponds
+    to a complete semantic unit — no token overlap is required.
 
     Parameters
     ----------
     endpoint_url : str
-        Full URL of the nemoretriever-parse inference endpoint, e.g.
-        ``http://nemotron-parse-v12:8000/v1/chat/completions``.
+        Full URL of the nemoretriever-parse inference endpoint.
     model_name : str
-        Model identifier forwarded in the API payload.  For standalone vLLM
-        served from a local path, pass the full container path
-        (e.g. ``/hf-models/nvidia/NVIDIA-Nemotron-Parse-v1.2``).
+        Model identifier forwarded in the API payload.
     api_key : str
-        Bearer token for the inference endpoint (empty string → no auth header).
+        Bearer token (empty string → no auth header).
     parse_max_tokens : int
-        ``max_tokens`` cap for the extraction pass.  Must be less than the
-        model's ``max_sequence_length`` (9000) minus the prompt token count
-        (~6).  Default 8990 leaves a small safety margin.
+        ``max_tokens`` cap for the extraction pass.  Default 8990.
     dpi : int
-        DPI used when rasterising PDF pages (default 200).
+        DPI used when rasterising PDF pages (default 300, as recommended by
+        the Nemotron-Parse documentation).
+    max_tokens : int
+        Maximum tokens per semantic chunk.  Non-homogeneous: most chunks will
+        be smaller; this is only a ceiling.  Default 1024.
+    max_parallel_pages : int
+        ThreadPoolExecutor workers per document batch.  Default 8 (matches
+        4 replica pods × 4 max-num-seqs = 16 slots; 8 workers × 2 concurrent
+        batches = 16 in-flight requests).
     """
 
     def __init__(
@@ -137,8 +152,8 @@ class DocumentClassifierRouter:
         model_name: str = NEMO_PARSE_MODEL_DEFAULT,
         api_key: str = "",
         parse_max_tokens: int = 8990,
-        dpi: int = 200,
-        chunk_size: int = 512,
+        dpi: int = 300,
+        max_tokens: int = 1024,
         chunk_overlap: int = 150,
         max_parallel_pages: int = 8,
     ) -> None:
@@ -147,15 +162,13 @@ class DocumentClassifierRouter:
         self.parse_max_tokens = parse_max_tokens
         self.dpi = dpi
         self.max_parallel_pages = max(1, max_parallel_pages)
-        # Markdown pre-chunking: convert token counts to approximate char counts (4 chars/token)
-        self._chunk_max_chars = max(chunk_size * 4, 512)
-        self._chunk_overlap_chars = chunk_overlap * 4
+        self._max_tokens = max_tokens
+        self._chunk_overlap = chunk_overlap
 
-        # Thread-local sessions: requests.Session is not thread-safe for concurrent
-        # use.  Each worker thread gets its own Session on first access.
-        # Connection: close forces a new TCP connection per request so that the
-        # Kubernetes Service round-robins across all nemotron-parse replica pods
-        # at the connection level (kube-proxy/iptables).
+        # Thread-local sessions: requests.Session is not thread-safe for
+        # concurrent use.  Each worker thread gets its own Session on first
+        # access.  Connection: close forces a new TCP connection per request
+        # so the k8s Service round-robins across all nemotron-parse replicas.
         self._session_headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -185,7 +198,7 @@ class DocumentClassifierRouter:
             endpoint_url=config.nemo_parse.endpoint_url,
             model_name=config.nemo_parse.model_name,
             api_key=config.nemo_parse.api_key,
-            chunk_size=config.nv_ingest.chunk_size,
+            max_tokens=config.nv_ingest.chunk_size,
             chunk_overlap=config.nv_ingest.chunk_overlap,
         )
 
@@ -195,131 +208,102 @@ class DocumentClassifierRouter:
 
     def route_document(self, filepath: str, force: bool = False) -> list[tuple[str, dict]] | None:
         """
-        Classify and (if warranted) parse a single PDF file.
+        Classify and semantically chunk a single PDF file.
 
         Parameters
         ----------
         filepath : str
-            Path to the PDF file to process.
+            Path to the PDF file.
         force : bool
             When ``True``, skip complex-element detection and unconditionally
-            include all extracted VLM content in the output.  The
-            ``pipeline_type`` metadata field will be set to
-            ``"nemoretriever_parse_forced"`` instead of
-            ``"nemoretriever_parse"``.
+            return chunked output for every PDF.
 
         Returns
         -------
         list[tuple[str, dict]]
-            One or more ``(path, chunk_meta)`` pairs where ``path`` is a
-            temporary ``.md`` chunk file and ``chunk_meta`` is a dict of
-            per-chunk metadata.  **The caller is responsible for deleting all
-            returned files after they have been submitted to NV-Ingest.**
+            One or more ``(temp_md_path, chunk_meta)`` pairs.  The caller is
+            responsible for deleting all returned paths after ingest.
         None
-            The document contains no complex data elements; use the standard
-            NV-Ingest pipeline.
+            No complex elements detected; use the standard NV-Ingest pipeline.
         """
         if not filepath.lower().endswith(".pdf"):
-            logger.debug("Skipping non-PDF file for nemoretriever-parse routing: %s", filepath)
+            logger.debug("Skipping non-PDF: %s", filepath)
             return None
 
-        logger.info("Starting classifier pass for: %s", os.path.basename(filepath))
+        logger.info("Starting nemoretriever-parse pass for: %s", os.path.basename(filepath))
 
         try:
-            from pdf2image import convert_from_path  # lazy import — optional dep
+            from pdf2image import convert_from_path  # lazy import
 
             pages = convert_from_path(filepath, dpi=self.dpi)
             page_count = len(pages)
         except Exception as exc:
             logger.warning(
-                "Could not rasterise PDF '%s': %s — falling back to standard pipeline",
-                filepath,
-                exc,
+                "Could not rasterise '%s': %s — falling back to standard pipeline",
+                filepath, exc,
             )
             return None
 
-        # ----------------------------------------------------------------
-        # Single-pass extraction: pages are processed in parallel using a
-        # ThreadPoolExecutor (max_parallel_pages workers).  Each worker gets
-        # its own thread-local requests.Session so sessions are never shared.
-        # Connection: close on each session forces a new TCP connection per
-        # request, distributing load across all nemotron-parse replica pods
-        # via k8s Service round-robin.
-        #
-        # With 4 replica pods × 4 max-num-seqs each = 16 concurrent inference
-        # slots; max_parallel_pages=8 per batch × 2 concurrent batches = 16
-        # total in-flight requests → fully saturates available capacity.
-        # ----------------------------------------------------------------
-        all_detected_types: set[str] = set()
-        page_parts: list[str] = []
-
+        # ── Parallel single-pass extraction ─────────────────────────────
+        # 4 replica pods × 4 max-num-seqs = 16 concurrent inference slots.
+        # 8 workers × 2 concurrent document batches = 16 in-flight requests.
         logger.info(
             "Processing %d pages of '%s' with %d parallel workers",
             page_count, os.path.basename(filepath), self.max_parallel_pages,
         )
 
         with ThreadPoolExecutor(max_workers=self.max_parallel_pages) as executor:
-            page_results: list[tuple[int, set[str], str]] = list(
+            page_results: list[tuple[int, list[tuple[str, str]]]] = list(
                 executor.map(self._process_page, enumerate(pages))
             )
 
-        # Results from executor.map() preserve input order — iterate in page order.
-        for i, page_classes, page_markdown in page_results:
-            complex_on_page = page_classes & COMPLEX_ELEMENT_CLASSES
-            all_detected_types |= complex_on_page
+        # ── Cross-page stitch ────────────────────────────────────────────
+        page_element_lists = [elems for _, elems in page_results]
+        all_elements = self._stitch_page_boundaries(page_element_lists)
 
-            if complex_on_page:
+        # ── Routing decision ─────────────────────────────────────────────
+        if not force:
+            all_classes = {cls.lower() for cls, _ in all_elements}
+            if not (all_classes & COMPLEX_ELEMENT_CLASSES):
                 logger.info(
-                    "Complex element(s) detected on page %d of '%s': %s",
-                    i + 1,
+                    "No complex elements in '%s' — standard NV-Ingest pipeline will be used",
                     os.path.basename(filepath),
-                    complex_on_page,
                 )
+                return None
 
-            if page_markdown:
-                page_parts.append(f"<!-- Page {i + 1} -->\n\n{page_markdown}")
-
-        # ----------------------------------------------------------------
-        # Routing decision
-        # ----------------------------------------------------------------
-        if not force and not all_detected_types:
-            logger.info(
-                "No complex elements in '%s' — standard NV-Ingest pipeline will be used",
-                os.path.basename(filepath),
-            )
-            return None
-
-        if not page_parts:
+        if not all_elements:
             logger.warning(
-                "nemoretriever-parse returned no usable content for '%s' — "
-                "falling back to standard pipeline",
+                "nemoretriever-parse returned no content for '%s' — falling back",
                 filepath,
             )
             return None
 
+        # ── Semantic chunking ────────────────────────────────────────────
+        detected = {cls.lower() for cls, _ in all_elements} & COMPLEX_ELEMENT_CLASSES
         logger.info(
             "Routing '%s' through nemoretriever-parse "
-            "(detected: %s, %d pages processed)",
+            "(detected: %s, %d elements from %d pages)",
             os.path.basename(filepath),
-            all_detected_types or "forced",
+            detected or "forced",
+            len(all_elements),
             page_count,
         )
 
-        # ----------------------------------------------------------------
-        # Pre-chunk with markdown-aware splitter; write one temp file per chunk
-        # ----------------------------------------------------------------
-        stem = Path(filepath).stem
-        full_text = f"# {stem}\n\n" + "\n\n---\n\n".join(page_parts)
-        chunk_pairs = self._split_markdown(
-            full_text,
-            max_chars=self._chunk_max_chars,
-            overlap_chars=self._chunk_overlap_chars,
+        chunk_pairs = self._split_by_semantic_elements(
+            all_elements, self._max_tokens, self._chunk_overlap
         )
 
+        # ── Write temp markdown files ────────────────────────────────────
+        stem = Path(filepath).stem
+        pipeline = "nemoretriever_parse_forced" if force else "nemoretriever_parse"
         temp_pairs: list[tuple[str, dict]] = []
         try:
-            for idx, (chunk_text, section_path) in enumerate(chunk_pairs):
-                suffix = f"_{idx + 1:03d}.md" if len(chunk_pairs) > 1 else ".md"
+            total = sum(1 for ct, _ in chunk_pairs if ct.strip())
+            idx = 0
+            for chunk_text, section_path in chunk_pairs:
+                if not chunk_text.strip():
+                    continue
+                suffix = f"_{idx + 1:03d}.md" if total > 1 else ".md"
                 tmp_fd, tmp_path = tempfile.mkstemp(
                     suffix=suffix, prefix=f"{stem}_nemoparse_"
                 )
@@ -327,16 +311,16 @@ class DocumentClassifierRouter:
                     fh.write(chunk_text)
                 chunk_meta: dict = {
                     "chunk_index": idx,
-                    "total_chunks": len(chunk_pairs),
+                    "total_chunks": total,
                     "page_count": page_count,
+                    "pipeline_type": pipeline,
                 }
-                if force:
-                    chunk_meta["pipeline_type"] = "nemoretriever_parse_forced"
                 if section_path:
                     chunk_meta["section_path"] = section_path
-                if all_detected_types:
-                    chunk_meta["detected_element_types"] = sorted(all_detected_types)
+                if detected:
+                    chunk_meta["detected_element_types"] = sorted(detected)
                 temp_pairs.append((tmp_path, chunk_meta))
+                idx += 1
         except Exception:
             for tp, _ in temp_pairs:
                 try:
@@ -346,37 +330,16 @@ class DocumentClassifierRouter:
             raise
 
         logger.info(
-            "nemoretriever-parse output for '%s' written to %d chunk file(s)",
-            os.path.basename(filepath),
-            len(temp_pairs),
+            "nemoretriever-parse output for '%s' written to %d semantic chunk file(s)",
+            os.path.basename(filepath), len(temp_pairs),
         )
-        return temp_pairs
+        return temp_pairs if temp_pairs else None
 
     def route_documents(
         self, filepaths: list[str], force: bool = False
     ) -> dict[str, list[tuple[str, dict]] | None]:
-        """
-        Classify and route a batch of file paths.
-
-        Parameters
-        ----------
-        filepaths : list[str]
-            Paths to the files to process.
-        force : bool
-            When ``True``, skip Pass 1 for all PDFs and unconditionally run
-            Pass 2.  Forwarded to :meth:`route_document`.
-
-        Returns
-        -------
-        dict[str, list[tuple[str, dict]] | None]
-            Maps each original file path to either:
-              - A list of ``(path, chunk_meta)`` pairs (caller must delete all paths after ingest), or
-              - ``None`` (no complex elements; use standard NV-Ingest pipeline).
-        """
-        results: dict[str, list[tuple[str, dict]] | None] = {}
-        for fp in filepaths:
-            results[fp] = self.route_document(fp, force=force)
-        return results
+        """Classify and route a batch of file paths."""
+        return {fp: self.route_document(fp, force=force) for fp in filepaths}
 
     # ------------------------------------------------------------------
     # Private helpers — image conversion
@@ -391,16 +354,11 @@ class DocumentClassifierRouter:
         return b64, "image/png"
 
     # ------------------------------------------------------------------
-    # Private helpers — nemoretriever-parse API call
+    # Private helpers — nemoretriever-parse API
     # ------------------------------------------------------------------
 
     def _call_nemo_parse(self, b64: str, mime: str, max_tokens: int) -> str:
-        """
-        Issue a single nemoretriever-parse request via the vLLM OpenAI-compatible
-        chat completions endpoint.
-
-        Returns the raw model output text (may contain bbox/class tags).
-        """
+        """Issue one nemoretriever-parse request; return raw model output text."""
         payload = {
             "model": self.model_name,
             "messages": [
@@ -426,253 +384,337 @@ class DocumentClassifierRouter:
         r = resp.json()
         return r.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-    def _process_page(self, args: tuple[int, Any]) -> tuple[int, set[str], str]:
+    # ------------------------------------------------------------------
+    # Private helpers — page processing (ThreadPoolExecutor worker)
+    # ------------------------------------------------------------------
+
+    def _process_page(self, args: tuple[int, Any]) -> tuple[int, list[tuple[str, str]]]:
         """
         Worker target for parallel page processing.
 
         Parameters
         ----------
-        args : tuple[int, Any]
-            ``(page_index, PIL.Image)`` pair as produced by ``enumerate(pages)``.
+        args : tuple[int, PIL.Image]
+            ``(page_index, page_image)`` from ``enumerate(pages)``.
 
         Returns
         -------
-        tuple[int, set[str], str]
-            ``(page_index, detected_classes, markdown_text)`` so that results
-            from ``executor.map`` can be sorted and merged in page order.
+        tuple[int, list[tuple[str, str]]]
+            ``(page_index, elements)`` where each element is
+            ``(class_name, text)`` in reading order.
         """
         i, page_img = args
         b64, mime = self._pil_to_base64(page_img)
-        page_classes, page_markdown = self._extract_page(b64, mime)
-        return i, page_classes, page_markdown
-
-    def _extract_page(self, b64: str, mime: str) -> tuple[set[str], str]:
-        """
-        Single-pass extraction for one page image.
-
-        Calls the vLLM endpoint once with the structured extraction prompt,
-        then parses the model output to recover element classes and text.
-
-        Returns
-        -------
-        tuple[set[str], str]
-            ``(detected_classes, markdown_text)`` where ``detected_classes``
-            contains the lowercased class names found on the page and
-            ``markdown_text`` is the extracted content suitable for embedding.
-            On any API or parse error returns ``(set(), "")``.
-        """
         try:
             raw = self._call_nemo_parse(b64, mime, self.parse_max_tokens)
         except Exception as exc:
-            logger.warning("nemoretriever-parse call failed: %s", exc)
-            return set(), ""
-
-        return self._parse_model_output(raw)
+            logger.warning("nemoretriever-parse call failed on page %d: %s", i + 1, exc)
+            return i, []
+        elements = self._parse_model_output_elements(raw)
+        return i, elements
 
     # ------------------------------------------------------------------
     # Private helpers — model output parsing
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_model_output(raw: str) -> tuple[set[str], str]:
+    def _parse_model_output_elements(raw: str) -> list[tuple[str, str]]:
         """
-        Parse the structured model output into element classes and markdown text.
+        Parse structured model output into ``[(class_name, text), ...]``.
 
-        The model output format is::
-
-            <x_X1><y_Y1>TEXT<x_X2><y_Y2><class_CLASSNAME>\\n\\n...
-
-        Each ``finditer`` match yields exactly one element (non-greedy regex).
-
-        Parameters
-        ----------
-        raw : str
-            Raw text from the model response.
-
-        Returns
-        -------
-        tuple[set[str], str]
-            ``(detected_classes, markdown_text)``.
-            ``detected_classes`` contains the lowercased class name of every
-            element found.  ``markdown_text`` joins text content of elements
-            whose class is not in ``_SKIP_CLASSES``, separated by blank lines.
+        Noise classes (Page-header, Page-footer, TOC) are filtered out.
+        Atomic elements (Table, Formula) are included even when text is empty
+        so that downstream stitching and chunking can detect them.
         """
-        detected: set[str] = set()
-        parts: list[str] = []
-
+        elements: list[tuple[str, str]] = []
         for m in _RE_ELEMENT.finditer(raw):
-            text, cls = m.group(1).strip(), m.group(2)
+            text = m.group(1).strip()
+            cls = m.group(2)
             cls_lower = cls.lower()
-            detected.add(cls_lower)
-            if text and cls_lower not in _SKIP_CLASSES:
-                parts.append(text)
-
-        return detected, "\n\n".join(parts)
+            if cls_lower in _SKIP_CLASSES:
+                continue
+            if text or cls_lower in _ATOMIC_CLASSES:
+                elements.append((cls, text))
+        return elements
 
     # ------------------------------------------------------------------
-    # Private helpers — markdown-aware chunker (unchanged)
+    # Private helpers — cross-page element stitching
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _split_markdown(
-        text: str, max_chars: int = 2048, overlap_chars: int = 600
+    def _stitch_page_boundaries(
+        page_element_lists: list[list[tuple[str, str]]],
     ) -> list[tuple[str, str]]:
         """
-        Split markdown text into chunks that respect header, table, and
-        code-fence boundaries.
+        Merge elements that span a PDF page break.
 
         Rules
         -----
-        - Never split inside a fenced code block or a markdown table.
-        - Flush a chunk at every header (H1–H4) boundary.
-        - When a new chunk starts below a header, prepend the most recent
-          H1–H3 breadcrumb so the chunk retains navigational context.
-        - Fall back to paragraph boundaries when a non-atomic section
-          exceeds ``max_chars``.
+        Text / List-item
+            Stitch when the last element on page N has the same class as the
+            first element on page N+1 AND the last character of page N's text
+            is not terminal punctuation (``. ! ? : ;``).
 
-        Returns a list of ``(chunk_text, section_path)`` tuples; never empty.
-        ``section_path`` is a human-readable breadcrumb of the H1–H3 headers
-        active at the start of each chunk, e.g. ``"Introduction > Background"``.
-        Empty string if no headers precede the chunk.
+        Table / Formula
+            Always stitch same-class adjacency across a page break (partial
+            table rows or formula lines split at the page boundary).
+
+        Section-header / Title
+            Never stitch — a new heading always starts a fresh semantic unit.
         """
-        import re as _re  # already imported at module level; local alias for static
+        all_elements: list[tuple[str, str]] = []
+        for elements in page_element_lists:
+            if not elements:
+                continue
+            if all_elements:
+                prev_cls, prev_text = all_elements[-1]
+                next_cls, next_text = elements[0]
+                prev_l = prev_cls.lower()
+                next_l = next_cls.lower()
 
+                should_stitch = False
+                if prev_l in _STITCHABLE_CLASSES and prev_l == next_l:
+                    # Text / List-item: stitch only when clearly mid-sentence
+                    if prev_text and prev_text.rstrip()[-1] not in _TERMINAL_PUNCT:
+                        should_stitch = True
+                elif prev_l in _ATOMIC_CLASSES and prev_l == next_l:
+                    # Table / Formula continuation across page — always stitch
+                    should_stitch = True
+
+                if should_stitch:
+                    sep = " " if prev_l in _STITCHABLE_CLASSES else "\n"
+                    stitched = prev_text.rstrip() + sep + next_text.lstrip()
+                    all_elements[-1] = (prev_cls, stitched)
+                    elements = elements[1:]
+
+            all_elements.extend(elements)
+        return all_elements
+
+    # ------------------------------------------------------------------
+    # Private helpers — semantic chunker
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_oversized_text(text: str, max_chars: int, overlap_chars: int) -> list[str]:
+        """
+        Split *text* into sub-chunks when it exceeds *max_chars*.
+
+        Tries to split on sentence boundaries (``'. '``), then word boundaries,
+        falling back to a hard character split.  Each sub-chunk after the first
+        starts *overlap_chars* before the previous split point so that context
+        is not lost mid-thought.
+
+        This is the failsafe for individual elements that are themselves larger
+        than the semantic chunk ceiling — it is NOT applied to atomic structural
+        units (Table, Formula) whose content must not be broken mid-structure.
+        """
         if len(text) <= max_chars:
-            return [(text.strip(), "")] if text.strip() else [(text, "")]
+            return [text]
 
-        units = DocumentClassifierRouter._tokenise_markdown_units(text)
+        chunks: list[str] = []
+        start = 0
+        text_len = len(text)
+
+        while start < text_len:
+            end = start + max_chars
+            if end >= text_len:
+                tail = text[start:].strip()
+                if tail:
+                    chunks.append(tail)
+                break
+
+            # Prefer sentence boundary within the window
+            split_at = text.rfind(". ", start + overlap_chars, end)
+            if split_at > start:
+                split_at += 1  # include the period
+            else:
+                # Fall back to word boundary
+                split_at = text.rfind(" ", start + overlap_chars, end)
+                if split_at <= start:
+                    split_at = end  # hard split — no whitespace found
+
+            chunk = text[start:split_at].strip()
+            if chunk:
+                chunks.append(chunk)
+
+            # Step forward, keeping overlap_chars of context in the next chunk
+            start = max(start + 1, split_at - overlap_chars)
+
+        return [c for c in chunks if c.strip()]
+
+    @staticmethod
+    def _split_by_semantic_elements(
+        elements: list[tuple[str, str]],
+        max_tokens: int,
+        chunk_overlap: int = 150,
+    ) -> list[tuple[str, str]]:
+        """
+        Build non-homogeneous semantic chunks from classified elements.
+
+        No overlap.  Chunk boundaries are always semantic transitions:
+
+        * ``Title`` / ``Section-header`` → flush current chunk, start new.
+        * ``Table`` + following ``Caption`` → atomic unit.
+        * ``Formula`` → atomic unit; ``Caption`` bound if immediately following.
+        * ``Picture`` → skipped; following ``Caption`` becomes ``[Image: ...]``.
+        * ``Text``, ``List-item``, ``Footnote``, ``Bibliography`` → accumulated.
+        * ``Page-header``, ``Page-footer``, ``TOC`` → discarded.
+
+        When adding the next element would exceed ``max_tokens``, the current
+        chunk is flushed and the active section heading is carried forward as
+        context — no token overlap is required.
+
+        Parameters
+        ----------
+        elements : list[tuple[str, str]]
+            ``(class_name, text)`` pairs in reading order (post-stitch).
+        max_tokens : int
+            Ceiling on chunk size.  4 chars ≈ 1 token (rough approximation).
+
+        Returns
+        -------
+        list[tuple[str, str]]
+            ``(chunk_text, section_path)`` pairs.  At least one entry is
+            always returned; ``section_path`` may be an empty string.
+        """
+        max_chars = max_tokens * 4      # ~4 chars per token
+        overlap_chars = chunk_overlap * 4  # same approximation
+
         chunks: list[tuple[str, str]] = []
-        current_parts: list[str] = []
-        current_len = 0
-        last_headers: dict[int, str] = {}
-        current_section_path: str = ""
+        parts: list[str] = []
+        chars: int = 0
+        headers: dict[int, str] = {}
+        section_path: str = ""
 
         def flush() -> None:
-            nonlocal current_parts, current_len
-            body = "\n\n".join(p for p in current_parts if p).strip()
+            nonlocal parts, chars
+            body = "\n\n".join(p for p in parts if p.strip()).strip()
             if body:
-                chunks.append((body, current_section_path))
-            current_parts = []
-            current_len = 0
+                chunks.append((body, section_path))
+            parts = []
+            chars = 0
 
-        for unit_type, unit_text in units:
-            unit_len = len(unit_text)
+        def _add(unit: str) -> None:
+            """Append *unit* to current chunk, flushing with context carry if needed."""
+            nonlocal parts, chars
+            sep = 2 if parts else 0
+            if parts and chars + sep + len(unit) > max_chars:
+                flush()
+                ctx = DocumentClassifierRouter._build_header_context(headers)
+                if ctx:
+                    parts.append(ctx)
+                    chars = len(ctx)
+                    sep = 2
+                parts.append(unit)
+                chars += sep + len(unit)
+            else:
+                parts.append(unit)
+                chars += sep + len(unit)
 
-            if unit_type == "header":
-                m = _re.match(r"^(#+)", unit_text)
-                if m:
-                    level = len(m.group(1))
-                    last_headers[level] = unit_text.rstrip()
-                    for k in list(last_headers):
-                        if k > level:
-                            del last_headers[k]
-                if current_parts:
-                    flush()
-                current_section_path = DocumentClassifierRouter._section_path_string(last_headers)
-                current_parts = [unit_text]
-                current_len = unit_len
+        def _fmt(cls_l: str, text: str) -> str:
+            """Apply element-class-specific markdown formatting."""
+            if cls_l == "table":
+                return text  # already markdown from nemotron-parse
+            if cls_l == "formula":
+                if not text.startswith(("```", "$$")):
+                    return f"```\n{text}\n```"
+                return text
+            if cls_l == "list-item":
+                lines = [
+                    f"- {ln}" if not ln.startswith(("- ", "* ", "• ")) else ln
+                    for ln in text.splitlines()
+                    if ln.strip()
+                ]
+                return "\n".join(lines) if lines else f"- {text}"
+            if cls_l == "footnote":
+                return f"> {text}"
+            return text
+
+        i = 0
+        while i < len(elements):
+            cls, text = elements[i]
+            cls_l = cls.lower()
+            text = text.strip()
+            i += 1
+
+            if cls_l in _SKIP_CLASSES or (not text and cls_l not in _ATOMIC_CLASSES):
                 continue
 
-            needed = current_len + (2 if current_parts else 0) + unit_len
-            if needed <= max_chars or not current_parts:
-                current_parts.append(unit_text)
-                current_len += (2 if len(current_parts) > 1 else 0) + unit_len
-            else:
+            # ── Section boundary ──────────────────────────────────────────
+            if cls_l in _SECTION_STARTERS:
                 flush()
-                current_section_path = DocumentClassifierRouter._section_path_string(last_headers)
-                ctx = DocumentClassifierRouter._build_header_context(last_headers)
-                current_parts = ([ctx] if ctx else []) + [unit_text]
-                current_len = (len(ctx) + 2 if ctx else 0) + unit_len
+                level = 1 if cls_l == "title" else 2
+                headers[level] = text
+                for k in list(headers):
+                    if k > level:
+                        del headers[k]
+                section_path = DocumentClassifierRouter._section_path_string(headers)
+                header_md = "#" * level + " " + text
+                parts.append(header_md)
+                chars = len(header_md)
+                continue
+
+            # ── Picture: skip body, capture caption as alt-text ───────────
+            if cls_l == "picture":
+                if i < len(elements) and elements[i][0].lower() == _CAPTION_CLASS:
+                    cap = elements[i][1].strip()
+                    if cap:
+                        _add(f"[Image: {cap}]")
+                    i += 1
+                continue
+
+            # ── Atomic element (Table / Formula) with optional Caption ─────
+            if cls_l in _ATOMIC_CLASSES:
+                formatted = _fmt(cls_l, text)
+                atom_parts_list = [formatted]
+                atom_chars = len(formatted)
+                if i < len(elements) and elements[i][0].lower() == _CAPTION_CLASS:
+                    cap = elements[i][1].strip()
+                    if cap:
+                        cap_md = f"*{cap}*"
+                        atom_parts_list.append(cap_md)
+                        atom_chars += 2 + len(cap_md)
+                    i += 1
+                atom_block = "\n\n".join(atom_parts_list)
+                if atom_chars >= max_chars:
+                    # Oversized atom: emit standalone
+                    flush()
+                    chunks.append((atom_block, section_path))
+                else:
+                    _add(atom_block)
+                continue
+
+            # ── Regular content ───────────────────────────────────────────
+            unit = f"*{text}*" if cls_l == _CAPTION_CLASS else _fmt(cls_l, text)
+            if overlap_chars > 0 and len(unit) > max_chars:
+                # Failsafe: single element exceeds ceiling — split with overlap.
+                # Only text-like content reaches here (atomics use the path above).
+                for sub in DocumentClassifierRouter._split_oversized_text(
+                    unit, max_chars, overlap_chars
+                ):
+                    _add(sub)
+            else:
+                _add(unit)
 
         flush()
-        return chunks if chunks else [(text.strip(), "")]
+        return chunks if chunks else [("", "")]
+
+    # ------------------------------------------------------------------
+    # Private helpers — header breadcrumb utilities
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _tokenise_markdown_units(text: str) -> list[tuple[str, str]]:
-        """
-        Break markdown text into a list of (type, content) tuples.
-
-        Types: ``"header"``, ``"code_fence"``, ``"table"``, ``"paragraph"``
-
-        Atomic units (``"code_fence"`` and ``"table"``) are never split by
-        the caller.
-        """
-        import re as _re
-
-        units: list[tuple[str, str]] = []
-        lines = text.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-
-            # Fenced code block
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                marker = "```" if stripped.startswith("```") else "~~~"
-                block = [line]
-                i += 1
-                while i < len(lines):
-                    block.append(lines[i])
-                    if lines[i].strip().startswith(marker) and i > (len(block) - 2):
-                        i += 1
-                        break
-                    i += 1
-                units.append(("code_fence", "\n".join(block)))
-                continue
-
-            # Markdown table (contiguous pipe-prefixed rows)
-            if stripped.startswith("|") and "|" in stripped:
-                block = [line]
-                i += 1
-                while i < len(lines) and lines[i].strip().startswith("|") and "|" in lines[i]:
-                    block.append(lines[i])
-                    i += 1
-                units.append(("table", "\n".join(block)))
-                continue
-
-            # Header (H1–H6)
-            if _re.match(r"^#{1,6}\s", line):
-                units.append(("header", line))
-                i += 1
-                continue
-
-            # Blank line — skip (paragraph boundaries are implicit)
-            if not stripped:
-                i += 1
-                continue
-
-            # Paragraph — collect until a blank line or structural element
-            block = [line]
-            i += 1
-            while i < len(lines):
-                nxt = lines[i]
-                ns = nxt.strip()
-                if (
-                    not ns
-                    or _re.match(r"^#{1,6}\s", nxt)
-                    or ns.startswith("```")
-                    or ns.startswith("~~~")
-                    or (ns.startswith("|") and "|" in ns)
-                ):
-                    break
-                block.append(nxt)
-                i += 1
-            units.append(("paragraph", "\n".join(block)))
-
-        return units
-
-    @staticmethod
-    def _build_header_context(last_headers: dict[int, str]) -> str:
-        """Return a breadcrumb of the last H1–H3 headers for chunk context carry-forward."""
-        lines = [last_headers[lvl] for lvl in sorted(last_headers) if lvl <= 3]
+    def _build_header_context(headers: dict[int, str]) -> str:
+        """Return H1–H3 header lines as context prefix for overflow chunks."""
+        lines = [headers[lvl] for lvl in sorted(headers) if lvl <= 3]
         return "\n".join(lines)
 
     @staticmethod
-    def _section_path_string(last_headers: dict[int, str]) -> str:
-        """Return a human-readable section path for metadata, e.g. 'Introduction > Background'.
+    def _section_path_string(headers: dict[int, str]) -> str:
+        """Return human-readable section breadcrumb, e.g. 'Overview > Architecture'.
 
-        Strips leading ``#`` symbols so the value is suitable for storage as a
-        metadata field and natural-language filter generation.
+        Strips leading ``#`` markers so the value is suitable for metadata storage
+        and natural-language filter generation.
         """
-        parts = [last_headers[lvl].lstrip("#").strip() for lvl in sorted(last_headers) if lvl <= 3]
+        parts = [headers[lvl].lstrip("#").strip() for lvl in sorted(headers) if lvl <= 3]
         return " > ".join(p for p in parts if p)

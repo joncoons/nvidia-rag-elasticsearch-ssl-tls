@@ -388,6 +388,11 @@ class NvidiaRAGIngestor:
         # Apply server-side default from APP_NEMOPARSE_ENABLED
         use_nemoretriever_parse = use_nemoretriever_parse or self.config.nemo_parse.enabled
 
+        # APP_NEMOPARSE_FORCE_ALL: when enabled, unconditionally route every PDF
+        # through nemoretriever-parse without the two-pass complex-element pre-scan.
+        if self.config.nemo_parse.enabled and self.config.nemo_parse.force_all:
+            force_nemoretriever_parse = True
+
         # force implies use
         if force_nemoretriever_parse:
             use_nemoretriever_parse = True

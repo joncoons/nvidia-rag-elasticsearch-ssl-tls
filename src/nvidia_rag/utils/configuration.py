@@ -447,6 +447,14 @@ class NemoParseConfig(_ConfigBase):
         env="APP_NEMOPARSE_APIKEY",
         description="Bearer token for the nemoretriever-parse endpoint (empty = no auth header)",
     )
+    force_all: bool = Field(
+        default=True,
+        env="APP_NEMOPARSE_FORCE_ALL",
+        description=(
+            "When True, route ALL PDFs through nemoretriever-parse unconditionally "
+            "(skips the two-pass complex-element pre-scan). Requires enabled=True."
+        ),
+    )
 
 
 class ModelParametersConfig(_ConfigBase):

@@ -204,6 +204,7 @@ class SimpleWebCrawler:
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
         user_agent: str = "NVIDIA-RAG-Crawler/1.0",
+        html_chunk_max_tokens: int = 1024,
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.max_pages = max_pages
@@ -216,6 +217,7 @@ class SimpleWebCrawler:
         self.use_nemoretriever_parse = use_nemoretriever_parse
         self.force_nemoretriever_parse = force_nemoretriever_parse
         self.request_timeout = request_timeout
+        self._html_chunk_max_tokens = html_chunk_max_tokens
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
@@ -428,23 +430,43 @@ class SimpleWebCrawler:
                     # Update last_seen but do NOT update last_ingested
                     registry[url] = {**reg_entry, "last_seen": now_iso}
                 else:
-                    # New or changed — queue for ingest
-                    tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
-                    all_temp_files.append(tmp_path)
-                    pending.append((
-                        tmp_path,
-                        {
-                            "filename": os.path.basename(tmp_path),
-                            "metadata": {
-                                "source_url": url,
-                                "page_title": page_title,
-                                "crawl_depth": depth,
-                                "section_h1": section_h1,
-                                "meta_description": meta_desc,
-                                "source_system": "web_crawl",
-                            },
-                        },
-                    ))
+                    # New or changed — extract semantic elements, chunk, queue for ingest
+                    base_meta = {
+                        "source_url": url,
+                        "page_title": page_title,
+                        "crawl_depth": depth,
+                        "section_h1": section_h1,
+                        "meta_description": meta_desc,
+                        "source_system": "web_crawl",
+                    }
+                    html_elements = self._html_to_elements(html_content)
+                    if html_elements:
+                        from nvidia_rag.ingestor_server.document_classifier_router import (  # noqa: PLC0415
+                            DocumentClassifierRouter,
+                        )
+                        chunk_pairs = DocumentClassifierRouter._split_by_semantic_elements(
+                            html_elements, self._html_chunk_max_tokens, chunk_overlap=150,
+                        )
+                        for chunk_text, section_path in chunk_pairs:
+                            if not chunk_text.strip():
+                                continue
+                            tmp_path = self._save_temp(chunk_text.encode("utf-8"), suffix=".md")
+                            all_temp_files.append(tmp_path)
+                            meta = {**base_meta}
+                            if section_path:
+                                meta["section_path"] = section_path
+                            pending.append((
+                                tmp_path,
+                                {"filename": os.path.basename(tmp_path), "metadata": meta},
+                            ))
+                    else:
+                        # Fallback: no elements extracted — save raw HTML
+                        tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
+                        all_temp_files.append(tmp_path)
+                        pending.append((
+                            tmp_path,
+                            {"filename": os.path.basename(tmp_path), "metadata": base_meta},
+                        ))
                     # Update registry entry
                     registry[url] = {
                         "last_seen": now_iso,
@@ -917,3 +939,119 @@ class SimpleWebCrawler:
                 if chunk:
                     fh.write(chunk)
         return path
+
+    @staticmethod
+    def _html_table_to_markdown(table_tag: Any) -> str:
+        """Convert a BeautifulSoup ``<table>`` tag to GitHub-Flavored Markdown."""
+        rows: list[str] = []
+        for tr in table_tag.find_all("tr"):
+            cells = [
+                cell.get_text(separator=" ", strip=True).replace("|", "\\|")
+                for cell in tr.find_all(["th", "td"])
+            ]
+            if cells:
+                rows.append("| " + " | ".join(cells) + " |")
+        if not rows:
+            return ""
+        header = rows[0]
+        col_count = max(1, header.count("|") - 1)
+        separator = "| " + " | ".join(["---"] * col_count) + " |"
+        return "\n".join([header, separator] + rows[1:])
+
+    @staticmethod
+    def _html_to_elements(html_str: str) -> list[tuple[str, str]]:
+        """
+        Convert raw HTML to ``(class_name, text)`` element pairs using the same
+        taxonomy as nemoretriever-parse (Title, Section-header, Text, List-item,
+        Table, Formula, Caption).
+
+        Navigation containers (``nav``, ``header``, ``footer``, ``aside``,
+        ``script``, ``style``) are stripped before extraction.  The parser
+        walks the document tree recursively so nested elements are handled
+        naturally without double-counting.
+        """
+        try:
+            from bs4 import BeautifulSoup, Tag  # lazy import — always available
+        except ImportError:
+            logger.warning("beautifulsoup4 not available; HTML semantic chunking skipped")
+            return []
+
+        soup = BeautifulSoup(html_str, "html.parser")
+
+        # Strip noise containers before walking the tree
+        for noise_tag in soup.find_all(["nav", "header", "footer", "aside", "script", "style"]):
+            noise_tag.decompose()
+
+        # Prefer semantic main-content container; fall back to body / root
+        main: Any = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find("div", id="content")
+            or soup.find("body")
+            or soup
+        )
+
+        elements: list[tuple[str, str]] = []
+
+        def _walk(node: Any, in_list: bool = False) -> None:
+            for child in node.children:
+                if not isinstance(child, Tag):
+                    continue  # skip NavigableString / Comment
+                name = child.name
+
+                if name == "h1":
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("Title", t))
+
+                elif name in ("h2", "h3", "h4", "h5", "h6"):
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("Section-header", t))
+
+                elif name == "p":
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("Text", t))
+
+                elif name in ("ul", "ol"):
+                    _walk(child, in_list=True)
+
+                elif name == "li":
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("List-item", t))
+
+                elif name == "table":
+                    md = SimpleWebCrawler._html_table_to_markdown(child)
+                    if md:
+                        elements.append(("Table", md))
+
+                elif name == "pre":
+                    t = child.get_text(strip=True)
+                    if t:
+                        elements.append(("Formula", t))
+
+                elif name == "figcaption":
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("Caption", t))
+
+                elif name == "blockquote":
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        elements.append(("Text", t))
+
+                elif name in (
+                    "div", "section", "article", "main", "figure",
+                    "details", "summary", "form",
+                ):
+                    # Container — recurse without consuming
+                    _walk(child, in_list=in_list)
+
+                # Inline tags (span, a, strong, em, code, …) are intentionally
+                # skipped here; their text is already captured by the parent
+                # block tag's get_text() call.
+
+        _walk(main)
+        return elements
