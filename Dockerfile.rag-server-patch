@@ -7,6 +7,8 @@ RUN /tmp/uv pip install --python /workspace/.venv/bin/python \
       --no-cache tavily-python && rm /tmp/uv
 
 # Overlay changed source files onto the installed package
+COPY src/nvidia_rag/rag_server/server.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/server.py
 COPY src/nvidia_rag/rag_server/main.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/main.py
 COPY src/nvidia_rag/utils/configuration.py \

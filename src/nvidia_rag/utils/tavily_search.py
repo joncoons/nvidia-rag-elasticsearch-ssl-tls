@@ -6,10 +6,11 @@ context_to_show alongside the normal VDB-retrieved documents.
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+import certifi
+import httpx
 from langchain_core.documents import Document
 
 if TYPE_CHECKING:
@@ -17,27 +18,73 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TAVILY_URL = "https://api.tavily.com/search"
+
+
+async def _call_tavily(
+    api_key: str,
+    query: str,
+    max_results: int,
+    *,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+    timeout: float = 30.0,
+) -> list[dict]:
+    """Single Tavily API call returning raw result dicts.
+
+    Uses certifi's CA bundle explicitly via ``httpx.AsyncClient(verify=...)``
+    to bypass the ``SSL_CERT_FILE`` environment variable, which is set to the
+    ECK-internal CA cert for Elasticsearch TLS and would otherwise cause
+    certificate-verification failures for public HTTPS endpoints.
+    """
+    payload: dict = {
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "advanced",
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_images": False,
+    }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if exclude_domains:
+        payload["exclude_domains"] = exclude_domains
+
+    async with httpx.AsyncClient(
+        verify=certifi.where(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        timeout=timeout,
+    ) as client:
+        resp = await client.post(_TAVILY_URL, json=payload)
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+
 
 async def search_tavily(query: str, config: "TavilyConfig") -> list[Document]:
     """Search the web via Tavily and return results as LangChain Documents.
 
-    The API key is injected into the process environment before calling
-    TavilySearchResults (which reads TAVILY_API_KEY from env).  Results are
-    filtered by relevance score and converted to Documents with source
-    metadata so they can be cited normally by the LLM chain.
+    Calls the Tavily REST API directly with httpx (certifi CA bundle) so that
+    the ECK SSL_CERT_FILE override does not interfere.  Results are filtered by
+    relevance score and converted to Documents with source metadata so they can
+    be cited normally by the LLM chain.
 
     Returns an empty list on timeout or any other error — never raises.
     """
-    from langchain_community.tools import TavilySearchResults  # noqa: PLC0415
+    if not config.api_key:
+        logger.warning("Tavily search skipped: no API key configured")
+        return []
 
-    # Inject API key into env — TavilySearchResults reads it from there
-    if config.api_key:
-        os.environ["TAVILY_API_KEY"] = config.api_key.get_secret_value()
+    api_key = config.api_key.get_secret_value()
 
     # Parse comma-separated domain allowlist (empty string → unrestricted)
-    include_domains: list[str] = [
-        d.strip() for d in config.include_domains.split(",") if d.strip()
-    ] if config.include_domains else []
+    include_domains: list[str] = (
+        [d.strip() for d in config.include_domains.split(",") if d.strip()]
+        if config.include_domains
+        else []
+    )
 
     all_results: list[dict] = []
 
@@ -46,36 +93,28 @@ async def search_tavily(query: str, config: "TavilyConfig") -> list[Document]:
             # Query each chunk of ≤5 domains separately (Tavily limit)
             for i in range(0, len(include_domains), 5):
                 chunk = include_domains[i : i + 5]
-                tool = TavilySearchResults(
-                    max_results=config.max_results,
-                    search_depth="advanced",
-                    include_answer=True,
-                    include_raw_content=False,
-                    include_images=False,
-                    include_domains=chunk,
-                )
                 try:
-                    async with asyncio.timeout(30):
-                        all_results.extend(await tool.ainvoke({"query": query}))
+                    async with asyncio.timeout(35):
+                        all_results.extend(
+                            await _call_tavily(
+                                api_key, query, config.max_results,
+                                include_domains=chunk,
+                            )
+                        )
                 except asyncio.TimeoutError:
                     logger.warning("Tavily timeout for domains %s", chunk)
         else:
             # Two rounds with domain exclusion for result diversity
             seen_domains: list[str] = []
             for round_num in range(2):
-                tool = TavilySearchResults(
-                    max_results=config.max_results,
-                    search_depth="advanced",
-                    include_answer=True,
-                    include_raw_content=False,
-                    include_images=False,
-                    exclude_domains=seen_domains,
-                )
                 try:
-                    async with asyncio.timeout(30):
-                        round_results = await tool.ainvoke({"query": query})
-                        all_results.extend(round_results)
-                        for r in round_results:
+                    async with asyncio.timeout(35):
+                        results = await _call_tavily(
+                            api_key, query, config.max_results,
+                            exclude_domains=seen_domains or None,
+                        )
+                        all_results.extend(results)
+                        for r in results:
                             try:
                                 netloc = urlparse(r.get("url", "")).netloc
                                 if netloc:
@@ -88,6 +127,8 @@ async def search_tavily(query: str, config: "TavilyConfig") -> list[Document]:
         # Filter by relevance score and convert to Documents
         docs: list[Document] = []
         for r in all_results:
+            if not isinstance(r, dict):
+                continue
             content = r.get("content", "")
             url = r.get("url", "")
             raw_score = r.get("score")
