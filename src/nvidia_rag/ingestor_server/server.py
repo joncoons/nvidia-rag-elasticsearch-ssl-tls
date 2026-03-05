@@ -655,6 +655,16 @@ class CrawlRequest(BaseModel):
             "parallelism; larger values reduce per-batch overhead.  Default is 20."
         ),
     )
+    max_concurrent_batches: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "Maximum number of upload_documents() calls in-flight at once.  "
+            "Prevents nv-ingest from being overwhelmed on large crawls.  "
+            "Default is 3."
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -837,6 +847,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             max_pages=payload.max_pages,
             extract_linked_files=payload.extract_linked_files,
             batch_ingest_size=payload.batch_ingest_size,
+            max_concurrent_batches=payload.max_concurrent_batches,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
         )

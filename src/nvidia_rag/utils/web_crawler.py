@@ -18,22 +18,22 @@ Streaming-batch BFS web crawler for the NVIDIA RAG ingestor server.
 
 Crawling and ingestion are pipelined: as soon as ``batch_ingest_size``
 files have been collected the crawler dispatches an ingest batch
-asynchronously and immediately continues crawling.  Multiple ingest batches
-can be in-flight simultaneously while the BFS fetch loop keeps running,
-so fetch latency and ingest latency are fully overlapped.
-
-For a 100-page crawl this typically cuts total wall time by 30-50% compared
-to the old collect-everything-first approach.
+asynchronously and immediately continues crawling.  Back-pressure is
+applied via ``max_concurrent_batches`` so that at most N ingest batches
+are in-flight simultaneously, preventing nv-ingest from being overwhelmed.
+Completed futures are harvested eagerly (no per-batch timeout) so results
+are never lost due to a timeout firing before nv-ingest finishes.
 
 Phase 1 -- Crawl + rolling ingest dispatch:
     BFS-traverse the domain up to max_pages, fetching HTML pages and
     downloading linked binary files.  Every ``batch_ingest_size`` files a
-    non-blocking ingest batch is dispatched; the BFS loop continues without
-    waiting for it to finish.
+    non-blocking ingest batch is dispatched; if ``max_concurrent_batches``
+    slots are already full the dispatch point blocks (polling) until one
+    completes.  Completed futures are harvested opportunistically throughout.
 
 Phase 2 -- Drain: after the BFS loop ends the remaining files (if any) are
-    dispatched as a final batch.  All in-flight futures are awaited and their
-    results are aggregated before the method returns.
+    dispatched as a final batch, then the loop polls until all in-flight
+    futures complete and aggregates the results before returning.
 
 Supported linked-file types (requires extract_linked_files=True):
   Documents : PDF, DOCX, XLSX, PPTX, DOC, XLS
@@ -49,9 +49,10 @@ Usage::
 
     crawler = SimpleWebCrawler(
         start_url="https://docs.nvidia.com/cuda/",
-        max_pages=50,
+        max_pages=200,
         extract_linked_files=True,
         batch_ingest_size=20,
+        max_concurrent_batches=3,
     )
     result = await crawler.crawl(ingestor, collection_name="nvidia-docs")
 """
@@ -60,6 +61,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from pathlib import Path
@@ -111,13 +113,12 @@ def _same_domain(url: str, netloc: str) -> bool:
 
 class SimpleWebCrawler:
     """
-    Streaming-batch BFS web crawler: dispatch ingest batches while crawling.
+    Streaming-batch BFS web crawler with back-pressure.
 
-    As each batch of ``batch_ingest_size`` files is collected it is submitted
-    to ``upload_documents()`` immediately (non-blocking) so that nv-ingest is
-    processing earlier pages while the BFS fetch loop continues fetching later
-    ones.  All in-flight batches are awaited before the method returns so the
-    caller always receives a complete result.
+    Ingest batches are dispatched as files accumulate, but no more than
+    ``max_concurrent_batches`` are in-flight at once.  Completed futures are
+    harvested eagerly throughout (no per-batch timeout) so nv-ingest results
+    are never dropped due to a timeout.
 
     Parameters
     ----------
@@ -132,9 +133,11 @@ class SimpleWebCrawler:
         ingested in addition to HTML pages.  XML files are automatically
         pre-processed to Markdown via ``xml_preprocessor.xml_to_markdown``.
     batch_ingest_size : int
-        Number of files that triggers an ingest batch dispatch while crawling
-        continues.  Smaller values increase parallelism; larger values reduce
-        nv-ingest call overhead.  Default is 20.
+        Number of files that triggers an ingest batch dispatch.  Default 20.
+    max_concurrent_batches : int
+        Maximum number of ``upload_documents()`` calls in-flight at the same
+        time.  Keeps nv-ingest from being overwhelmed on large crawls.
+        Default 3.
     use_nemoretriever_parse : bool
         Forwarded to ``upload_documents()`` for every batch.
     force_nemoretriever_parse : bool
@@ -151,6 +154,7 @@ class SimpleWebCrawler:
         max_pages: int = 50,
         extract_linked_files: bool = False,
         batch_ingest_size: int = 20,
+        max_concurrent_batches: int = 3,
         use_nemoretriever_parse: bool = False,
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
@@ -160,6 +164,7 @@ class SimpleWebCrawler:
         self.max_pages = max_pages
         self.extract_linked_files = extract_linked_files
         self.batch_ingest_size = max(1, batch_ingest_size)
+        self.max_concurrent_batches = max(1, max_concurrent_batches)
         self.use_nemoretriever_parse = use_nemoretriever_parse
         self.force_nemoretriever_parse = force_nemoretriever_parse
         self.request_timeout = request_timeout
@@ -222,23 +227,27 @@ class SimpleWebCrawler:
         loop: asyncio.AbstractEventLoop,
     ) -> dict[str, Any]:
         """
-        Streaming-batch crawl:
-          Phase 1 -- BFS fetch; dispatch an ingest batch every
-                     ``batch_ingest_size`` files (non-blocking).
-          Phase 2 -- Flush the remaining files as a final batch, then await
-                     all in-flight futures and aggregate results.
+        Streaming-batch crawl with back-pressure and eager harvesting.
+
+        Phase 1 -- BFS fetch with rolling dispatch:
+            Every ``batch_ingest_size`` files, dispatch an ingest batch.
+            If ``max_concurrent_batches`` slots are full, block (poll/sleep)
+            until a batch completes before dispatching the next one.
+
+        Phase 2 -- Drain:
+            Submit the final partial batch, then poll until all in-flight
+            futures complete (no timeout -- waits as long as nv-ingest needs).
         """
         visited_html: set[str] = set()
         visited_files: set[str] = set()
         queue: deque[tuple[str, int]] = deque([(self.start_url, 0)])
 
-        # All temp file paths -- cleaned up in the finally block after all
-        # ingest futures have settled so files are not deleted while nv-ingest
-        # is still reading them.
+        # All temp file paths -- cleaned up in finally after all futures settle.
         all_temp_files: list[str] = []
         errors: list[dict] = []
         pages_crawled = 0
         total_files_dispatched = 0
+        files_ingested = 0
 
         # Current batch being accumulated before dispatch
         pending: list[tuple[str, dict]] = []
@@ -247,19 +256,50 @@ class SimpleWebCrawler:
         in_flight: list[tuple[ConcurrentFuture, int, int]] = []
         batch_num = 0
 
+        def _harvest_done() -> None:
+            """Move any completed futures out of in_flight, record results."""
+            nonlocal files_ingested
+            remaining: list[tuple[ConcurrentFuture, int, int]] = []
+            for f, bnum, fcount in in_flight:
+                if not f.done():
+                    remaining.append((f, bnum, fcount))
+                    continue
+                try:
+                    result = f.result()
+                    failed_docs = (
+                        result.get("failed_documents", [])
+                        if isinstance(result, dict) else []
+                    )
+                    for fd in failed_docs:
+                        errors.append({
+                            "url": fd.get("document_name", "unknown"),
+                            "error": fd.get("error", "ingest failed"),
+                        })
+                    files_ingested += fcount - len(failed_docs)
+                    logger.info(
+                        "Ingest batch %d complete (%d files, %d failed)",
+                        bnum, fcount, len(failed_docs),
+                    )
+                except Exception as exc:
+                    logger.error("Ingest batch %d failed: %r", bnum, exc)
+                    errors.append({"url": f"batch_{bnum}", "error": repr(exc)})
+            in_flight[:] = remaining
+
         def _dispatch_batch(batch: list[tuple[str, dict]]) -> None:
-            """Submit *batch* to upload_documents() without waiting."""
+            """Submit *batch* to upload_documents(), blocking if at capacity."""
             nonlocal batch_num, total_files_dispatched
             if not batch:
                 return
+            # Back-pressure: wait until a concurrent slot is free
+            while len(in_flight) >= self.max_concurrent_batches:
+                time.sleep(0.5)
+                _harvest_done()
             batch_num += 1
             filepaths = [p for p, _ in batch]
             custom_metadata = [m for _, m in batch]
-            per_file_timeout = 30
-            timeout = max(600, len(filepaths) * per_file_timeout)
             logger.info(
-                "Dispatching ingest batch %d: %d files (timeout=%ds)",
-                batch_num, len(filepaths), timeout,
+                "Dispatching ingest batch %d: %d files  [%d/%d slots used]",
+                batch_num, len(filepaths), len(in_flight), self.max_concurrent_batches,
             )
             future: ConcurrentFuture = asyncio.run_coroutine_threadsafe(
                 ingestor.upload_documents(
@@ -278,8 +318,10 @@ class SimpleWebCrawler:
             total_files_dispatched += len(filepaths)
 
         logger.info(
-            "Crawl starting at %s (max_pages=%d, batch_ingest_size=%d)",
-            self.start_url, self.max_pages, self.batch_ingest_size,
+            "Crawl starting at %s (max_pages=%d, batch_ingest_size=%d, "
+            "max_concurrent_batches=%d)",
+            self.start_url, self.max_pages,
+            self.batch_ingest_size, self.max_concurrent_batches,
         )
 
         try:
@@ -289,6 +331,9 @@ class SimpleWebCrawler:
                 if url in visited_html:
                     continue
                 visited_html.add(url)
+
+                # Opportunistically harvest completed futures while crawling
+                _harvest_done()
 
                 logger.info("Crawling [depth=%d] %s", depth, url)
                 html_content, page_title, meta_desc, section_h1, linked_urls = (
@@ -316,7 +361,7 @@ class SimpleWebCrawler:
                 ))
                 pages_crawled += 1
                 logger.info(
-                    "Collected page %d/%d: %s  [pending=%d, in_flight=%d batch(es)]",
+                    "Collected page %d/%d: %s  [pending=%d, in_flight=%d]",
                     pages_crawled, self.max_pages, url, len(pending), len(in_flight),
                 )
 
@@ -344,11 +389,11 @@ class SimpleWebCrawler:
                     _dispatch_batch(pending)
                     pending = []
 
-            # ── Phase 2: flush remainder and await all in-flight batches ─────
-            _dispatch_batch(pending)  # may be a short final batch
+            # ── Phase 2: flush remainder, then drain all in-flight batches ───
+            _dispatch_batch(pending)  # back-pressure applies here too
             pending = []
 
-            if not in_flight:
+            if not in_flight and total_files_dispatched == 0:
                 return {
                     "message": "Crawl complete: no content collected.",
                     "pages_crawled": pages_crawled,
@@ -357,31 +402,14 @@ class SimpleWebCrawler:
                 }
 
             logger.info(
-                "Crawl BFS complete (%d pages).  Awaiting %d in-flight ingest batch(es)...",
+                "Crawl BFS complete (%d pages).  Draining %d remaining in-flight batch(es)...",
                 pages_crawled, len(in_flight),
             )
 
-            files_ingested = 0
-            for future, bnum, fcount in in_flight:
-                timeout = max(600, fcount * 30)
-                try:
-                    result = future.result(timeout=timeout)
-                    failed_docs = (
-                        result.get("failed_documents", []) if isinstance(result, dict) else []
-                    )
-                    for f in failed_docs:
-                        errors.append({
-                            "url": f.get("document_name", "unknown"),
-                            "error": f.get("error", "ingest failed"),
-                        })
-                    files_ingested += fcount - len(failed_docs)
-                    logger.info(
-                        "Ingest batch %d complete (%d files, %d failed)",
-                        bnum, fcount, len(failed_docs),
-                    )
-                except Exception as exc:
-                    logger.error("Ingest batch %d failed: %s", bnum, exc)
-                    errors.append({"url": f"batch_{bnum}", "error": str(exc)})
+            # Poll until all in-flight futures complete (no timeout).
+            while in_flight:
+                time.sleep(2)
+                _harvest_done()
 
         finally:
             for tp in all_temp_files:
