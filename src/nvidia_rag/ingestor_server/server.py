@@ -645,6 +645,16 @@ class CrawlRequest(BaseModel):
         default=False,
         description="Download and ingest binary files (PDF, DOCX, XLSX, PPTX) found as hrefs.",
     )
+    batch_ingest_size: int = Field(
+        default=20,
+        ge=1,
+        le=500,
+        description=(
+            "Number of collected files that triggers an ingest batch dispatch while "
+            "crawling continues asynchronously.  Smaller values increase crawl/ingest "
+            "parallelism; larger values reduce per-batch overhead.  Default is 20."
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -826,6 +836,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             start_url=payload.start_url,
             max_pages=payload.max_pages,
             extract_linked_files=payload.extract_linked_files,
+            batch_ingest_size=payload.batch_ingest_size,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
         )
