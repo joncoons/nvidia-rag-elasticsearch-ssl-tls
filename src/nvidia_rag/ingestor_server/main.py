@@ -482,7 +482,7 @@ class NvidiaRAGIngestor:
                 base["pipeline_type"] = (
                     "nemoretriever_parse" if fp in chunk_to_original else "nv_ingest"
                 )
-            base["source_uri"] = original_name
+            base["source_uri"] = base.get("source_uri") or original_name
             base["upload_batch_id"] = upload_batch_id
             base["document_type"] = Path(original_fp).suffix.lstrip(".").lower() or "unknown"
             if source_system:

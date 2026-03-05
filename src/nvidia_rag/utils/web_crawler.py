@@ -434,7 +434,7 @@ class SimpleWebCrawler:
                 else:
                     # New or changed — extract semantic elements, chunk, queue for ingest
                     base_meta = {
-                        "source_url": url,
+                        "source_uri": url,
                         "page_title": page_title,
                         "crawl_depth": depth,
                         "section_h1": section_h1,
@@ -532,6 +532,10 @@ class SimpleWebCrawler:
                 if len(pending) >= self.batch_ingest_size:
                     _dispatch_batch(pending)
                     pending = []
+
+                # Periodically flush registry to disk so it's readable mid-crawl
+                if pages_crawled % 100 == 0:
+                    self._save_registry(registry)
 
             # ── Phase 2: flush remainder, then drain all in-flight batches ───
             _dispatch_batch(pending)
@@ -881,7 +885,7 @@ class SimpleWebCrawler:
             {
                 "filename": os.path.basename(tmp_path),
                 "metadata": {
-                    "source_url": url,
+                    "source_uri": url,
                     "crawl_depth": depth,
                     "source_system": "web_crawl",
                 },
