@@ -23,8 +23,10 @@ interface ChatState {
   messages: ChatMessage[];
   input: string;
   filters: Filter[];
+  extendSearchOnline: boolean;
   setInput: (value: string) => void;
   setFilters: (filters: Filter[]) => void;
+  setExtendSearchOnline: (value: boolean) => void;
   addMessage: (msg: ChatMessage) => void;
   updateMessage: (id: string, update: Partial<ChatMessage>) => void;
   clearMessages: () => void;
@@ -46,8 +48,10 @@ export const useChatStore = create<ChatState>((set) => ({
   messages: [],
   input: "",
   filters: [],
+  extendSearchOnline: false,
   setInput: (input) => set({ input }),
   setFilters: (filters) => set({ filters }),
+  setExtendSearchOnline: (extendSearchOnline) => set({ extendSearchOnline }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   updateMessage: (id, update) =>
     set((s) => ({

@@ -485,6 +485,10 @@ class Prompt(BaseModel):
         description="Enable or disable automatic filter expression generation from natural language.",
         default=CONFIG.filter_expression_generator.enable_filter_generator,
     )
+    enable_tavily_search: bool = Field(
+        description="Extend search online via Tavily web search and append results to RAG context.",
+        default=False,
+    )
     model: str = Field(
         description="Name of NIM LLM model to be used for inference.",
         default=CONFIG.llm.model_name.strip('"'),
@@ -1379,6 +1383,7 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
         "vlm_max_total_images": prompt.vlm_max_total_images,
         "filter_expr": prompt.filter_expr,
         "confidence_threshold": prompt.confidence_threshold,
+        "enable_tavily_search": prompt.enable_tavily_search,
     }
     logger.info(
         f"📥 Incoming request to /generate endpoint:\n{json.dumps(request_data, indent=2)}"
@@ -1461,6 +1466,7 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
             vlm_max_total_images=prompt.vlm_max_total_images,
             filter_expr=prompt.filter_expr,
             confidence_threshold=prompt.confidence_threshold,
+            enable_tavily_search=prompt.enable_tavily_search,
             rag_start_time_sec=generate_start_time,
             metrics=metrics,
         )

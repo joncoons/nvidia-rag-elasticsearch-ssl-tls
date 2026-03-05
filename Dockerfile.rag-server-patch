@@ -1,0 +1,15 @@
+FROM nvcr.io/nvidia/blueprint/rag-server:2.4.0
+
+# Install tavily-python — required by langchain_community TavilySearchResults.
+# langchain_community is already in the image; only the tavily client is missing.
+COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /tmp/uv
+RUN /tmp/uv pip install --python /workspace/.venv/bin/python \
+      --no-cache tavily-python && rm /tmp/uv
+
+# Overlay changed source files onto the installed package
+COPY src/nvidia_rag/rag_server/main.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/main.py
+COPY src/nvidia_rag/utils/configuration.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/configuration.py
+COPY src/nvidia_rag/utils/tavily_search.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/tavily_search.py

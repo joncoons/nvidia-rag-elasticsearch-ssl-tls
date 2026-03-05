@@ -19,7 +19,7 @@ import { useCollectionsStore } from "../../store/useCollectionsStore";
 import { CollectionChips } from "../collections/CollectionChips";
 import { MessageInputContainer } from "./MessageInputContainer";
 import SimpleFilterBar from "../filtering/SimpleFilterBar";
-import { Flex, Banner, Block } from "@kui/react";
+import { Flex, Banner, Block, Switch, Text } from "@kui/react";
 
 // Export all message input components for external use
 export { CollectionChips } from "../collections/CollectionChips";
@@ -28,13 +28,13 @@ export { MessageActions } from "./MessageActions";
 export { MessageInputContainer } from "./MessageInputContainer";
 
 export default function MessageInput() {
-  const { filters, setFilters } = useChatStore();
+  const { filters, setFilters, extendSearchOnline, setExtendSearchOnline } = useChatStore();
   const { selectedCollections } = useCollectionsStore();
 
   return (
     <Flex direction="col" padding="density-sm">
       <CollectionChips />
-      
+
       <>
         {selectedCollections.length === 1 && (
           <SimpleFilterBar filters={filters} setFilters={setFilters} />
@@ -47,6 +47,16 @@ export default function MessageInput() {
           </Block>
         )}
         <MessageInputContainer />
+        <Flex align="center" gap="density-sm" paddingX="density-xs" paddingY="density-xs">
+          <Switch
+            checked={extendSearchOnline}
+            onCheckedChange={setExtendSearchOnline}
+            data-testid="extend-search-toggle"
+          />
+          <Text kind="label/regular/sm" style={{ color: 'var(--text-color-subtle)' }}>
+            Extend Search Online
+          </Text>
+        </Flex>
       </>
     </Flex>
   );

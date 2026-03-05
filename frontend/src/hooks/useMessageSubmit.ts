@@ -80,7 +80,7 @@ function cleanRequestObject(obj: Partial<GenerateRequest>): GenerateRequest {
  * ```
  */
 export const useMessageSubmit = () => {
-  const { input, setInput, filters, addMessage, messages } = useChatStore();
+  const { input, setInput, filters, extendSearchOnline, addMessage, messages } = useChatStore();
   const { mutateAsync: sendMessage, resetStream } = useSendMessage();
   const { isStreaming } = useStreamingStore(); // Use centralized streaming state
   const { selectedCollections } = useCollectionsStore();
@@ -110,6 +110,7 @@ export const useMessageSubmit = () => {
       enable_citations: settings.includeCitations,
       enable_vlm_inference: settings.enableVlmInference,
       enable_filter_generator: settings.enableFilterGenerator,
+      enable_tavily_search: extendSearchOnline,
       model: settings.model,
       llm_endpoint: settings.llmEndpoint,
       embedding_model: settings.embeddingModel,

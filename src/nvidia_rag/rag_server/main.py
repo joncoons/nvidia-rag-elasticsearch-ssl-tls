@@ -96,6 +96,7 @@ from nvidia_rag.utils.llm import (
 )
 from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
 from nvidia_rag.utils.reranker import get_ranking_model
+from nvidia_rag.utils.tavily_search import search_tavily
 from nvidia_rag.utils.vdb import _get_vdb_op
 from nvidia_rag.utils.vdb.vdb_base import VDBRag
 
@@ -410,6 +411,7 @@ class NvidiaRAG:
         filter_expr: str | list[dict[str, Any]] = "",
         enable_query_decomposition: bool | None = None,
         confidence_threshold: float | None = None,
+        enable_tavily_search: bool = False,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
     ) -> AsyncGenerator[str, None]:
@@ -647,6 +649,7 @@ class NvidiaRAG:
                 vdb_op=vdb_op,
                 enable_query_decomposition=enable_query_decomposition,
                 confidence_threshold=confidence_threshold,
+                enable_tavily_search=enable_tavily_search,
                 rag_start_time_sec=rag_start_time_sec,
                 metrics=metrics,
             )
@@ -1926,6 +1929,7 @@ class NvidiaRAG:
         vdb_op: VDBRag | None = None,
         enable_query_decomposition: bool = False,
         confidence_threshold: float | None = None,
+        enable_tavily_search: bool = False,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
     ) -> tuple[AsyncGenerator[str, None], list[dict[str, Any]]]:
@@ -2425,6 +2429,9 @@ class NvidiaRAG:
                     f"Consider setting enable_reranker=True for effective filtering."
                 )
 
+            # Default: context is assumed relevant unless reflection says otherwise
+            is_relevant: bool = True
+
             # Get relevant documents with optional reflection
             if self.config.reflection.enable_reflection:
                 logger.info("=" * 80)
@@ -2665,6 +2672,28 @@ class NvidiaRAG:
                 
                 logger.info("Filtering Output:")
                 logger.info("  - Filtered Documents: %d", len(context_to_show))
+                logger.info("-" * 80)
+
+            # Tavily online search — user-controlled via the "Extend Search Online" toggle.
+            # When enabled, Tavily results are appended to context_to_show so the LLM
+            # synthesises from both local VDB documents and live web results.
+            if self.config.tavily.enabled and enable_tavily_search:
+                logger.info("=" * 80)
+                logger.info("STAGE: Tavily Online Search (user-requested)")
+                logger.info("=" * 80)
+                logger.info("  - Query: '%s'", processed_query[:200])
+                logger.info("  - Existing VDB context docs: %d", len(context_to_show))
+                logger.info("-" * 80)
+                tavily_docs = await search_tavily(processed_query, self.config.tavily)
+                if tavily_docs:
+                    context_to_show = list(context_to_show) + tavily_docs
+                    logger.info(
+                        "Tavily appended %d web documents — total context: %d",
+                        len(tavily_docs),
+                        len(context_to_show),
+                    )
+                else:
+                    logger.info("Tavily returned no results — continuing with VDB context only")
                 logger.info("-" * 80)
 
             if enable_vlm_inference or is_image_query:

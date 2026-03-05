@@ -41,6 +41,7 @@ export interface GenerateRequest {
   enable_reranker?: boolean;
   enable_vlm_inference?: boolean;
   enable_filter_generator?: boolean;
+  enable_tavily_search?: boolean;
   
   // Optional models and endpoints
   model?: string;

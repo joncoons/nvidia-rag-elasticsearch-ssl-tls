@@ -40,6 +40,15 @@ ngcApiSecret:
   create: false
   name: "ngc-api"
 
+# ---------------------------------------------------------------------------
+# RAG Server — patched local image adds tavily-python + Tavily fallback wiring.
+# Rebuild: cd /home/joncoons/claude/rag && docker build -f Dockerfile.rag-server-patch -t rag-server-local:latest .
+# Import:  docker save rag-server-local:latest | sudo k3s ctr images import -
+# ---------------------------------------------------------------------------
+image:
+  repository: rag-server-local
+  tag: "latest"
+  pullPolicy: Never
 
 # ---------------------------------------------------------------------------
 # RAG Server — Elasticsearch over HTTPS with ECK-managed elastic user auth
@@ -80,6 +89,13 @@ envVars:
   # Default 0 means all history is stripped before the LLM call; set > 0 to
   # enable multi-turn conversation.  Also required for query rewriting to work.
   CONVERSATION_HISTORY: "10"
+  # ---------------------------------------------------------------------------
+  # Tavily web-search fallback — triggered when RAG context is empty or
+  # reflection marks the retrieved context as not relevant.
+  # TAVILY_API_KEY is injected from the k8s secret 'tavily-api-key' (see
+  # deployment.yaml extraSecretEnv block below).
+  # ---------------------------------------------------------------------------
+  APP_TAVILY_ENABLED: "true"
 
 # ECK CA cert volume — mounts into the nvidia-blueprint-rag container
 # ConfigMap eck-es-ca-cert must be pre-created (not managed by this chart):

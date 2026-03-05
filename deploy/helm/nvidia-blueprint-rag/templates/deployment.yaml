@@ -56,6 +56,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.ngcApiSecret.name }}
                   key: NVIDIA_API_KEY
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tavily-api-key
+                  key: TAVILY_API_KEY
+                  optional: true
           {{- $apiKeysSecretName := include "apiKeysSecretName" . }}
           {{- $hasAnyKey := or .Values.apiKeysSecret.llmApiKey .Values.apiKeysSecret.embeddingsApiKey .Values.apiKeysSecret.rankingApiKey .Values.apiKeysSecret.queryRewriterApiKey .Values.apiKeysSecret.filterExpressionGeneratorApiKey .Values.apiKeysSecret.vlmApiKey .Values.apiKeysSecret.summaryLlmApiKey .Values.apiKeysSecret.reflectionLlmApiKey }}
           {{- $shouldCreateSecret := and .Values.apiKeysSecret.create (not .Values.apiKeysSecret.existingSecret) $hasAnyKey }}

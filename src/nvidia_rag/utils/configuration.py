@@ -1063,6 +1063,36 @@ class ReflectionConfig(_ConfigBase):
         return v
 
 
+class TavilyConfig(_ConfigBase):
+    """Tavily web search fallback configuration."""
+
+    enabled: bool = Field(
+        default=False,
+        env="APP_TAVILY_ENABLED",
+        description="Enable Tavily web search fallback when RAG context is insufficient",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="TAVILY_API_KEY",
+        description="Tavily API key (injected from k8s secret tavily-api-key)",
+    )
+    max_results: int = Field(
+        default=5,
+        env="TAVILY_MAX_RESULTS",
+        description="Maximum results per Tavily search round",
+    )
+    include_domains: str = Field(
+        default="",
+        env="TAVILY_INCLUDE_DOMAINS",
+        description="Comma-separated domain allowlist (empty = unrestricted)",
+    )
+    score_threshold: float = Field(
+        default=0.6,
+        env="TAVILY_SCORE_THRESHOLD",
+        description="Minimum Tavily relevance score to include a result (0–1)",
+    )
+
+
 class NvidiaRAGConfig(_ConfigBase):
     """Main NVIDIA RAG configuration.
 
@@ -1099,6 +1129,7 @@ class NvidiaRAGConfig(_ConfigBase):
         default_factory=QueryDecompositionConfig
     )
     reflection: ReflectionConfig = PydanticField(default_factory=ReflectionConfig)
+    tavily: TavilyConfig = PydanticField(default_factory=TavilyConfig)
 
     # Top-level flags
     enable_guardrails: bool = Field(
