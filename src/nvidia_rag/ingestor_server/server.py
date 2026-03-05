@@ -856,6 +856,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             batch_ingest_size=payload.batch_ingest_size,
             max_concurrent_batches=payload.max_concurrent_batches,
             force_recrawl=payload.force_recrawl,
+            collection_name=payload.collection_name,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
         )
@@ -1471,7 +1472,23 @@ async def delete_collections(
             vdb_endpoint=vdb_endpoint,
             vdb_auth_token=vdb_auth_token,
         )
-        return CollectionsResponse(**response)
+        result = CollectionsResponse(**response)
+
+        # Clean up URL registry and error-matrix CSV files for every
+        # successfully deleted collection so that subsequent crawls start fresh.
+        if result.successful:
+            from nvidia_rag.utils.web_crawler import SimpleWebCrawler
+
+            registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/mnt/nvme2")
+            for name in result.successful:
+                removed = SimpleWebCrawler.cleanup_crawl_artifacts(name, registry_dir)
+                if removed:
+                    logger.info(
+                        "Deleted %d crawl artifact(s) for collection '%s': %s",
+                        len(removed), name, removed,
+                    )
+
+        return result
 
     except asyncio.CancelledError as e:
         logger.warning(f"Request cancelled while fetching collections. {str(e)}")

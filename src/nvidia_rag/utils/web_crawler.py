@@ -174,6 +174,12 @@ class SimpleWebCrawler:
     registry_dir : str
         Directory where the URL registry JSON and error-matrix CSV are written.
         Default ``/mnt/nvme2``.
+    collection_name : str
+        Vector-store collection being populated.  When set, it is prepended to
+        the domain slug in all artifact filenames so that ``cleanup_crawl_artifacts``
+        can find every registry / CSV belonging to that collection regardless of
+        which domain(s) were crawled.  E.g. collection ``nvidia`` + domain
+        ``nvidia.com`` → ``nvidia_nvidia_com_url_registry.json``.
     use_nemoretriever_parse : bool
         Forwarded to ``upload_documents()`` for every batch.
     force_nemoretriever_parse : bool
@@ -193,6 +199,7 @@ class SimpleWebCrawler:
         max_concurrent_batches: int = 3,
         force_recrawl: bool = False,
         registry_dir: str = "/mnt/nvme2",
+        collection_name: str = "",
         use_nemoretriever_parse: bool = False,
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
@@ -205,6 +212,7 @@ class SimpleWebCrawler:
         self.max_concurrent_batches = max(1, max_concurrent_batches)
         self.force_recrawl = force_recrawl
         self.registry_dir = registry_dir
+        self.collection_name = collection_name
         self.use_nemoretriever_parse = use_nemoretriever_parse
         self.force_nemoretriever_parse = force_nemoretriever_parse
         self.request_timeout = request_timeout
@@ -585,18 +593,63 @@ class SimpleWebCrawler:
     # ------------------------------------------------------------------
 
     def _domain_slug(self) -> str:
-        """Return a filesystem-safe slug derived from the crawl domain.
+        """Return a filesystem-safe slug prefixed by collection name (when set).
 
-        Strips ``www.`` prefix, drops port, replaces ``.`` and ``-`` with ``_``.
-        Example: ``www.nvidia.com`` → ``nvidia_com``
+        Format: ``{collection_name}_{domain}`` or just ``{domain}`` if no
+        collection name was given.  Domain processing: strips ``www.`` prefix,
+        drops port, replaces ``.`` and ``-`` with ``_``.
+
+        Examples:
+            collection=``nvidia``, domain=``www.nvidia.com`` → ``nvidia_nvidia_com``
+            collection=`""``,      domain=``www.nvidia.com`` → ``nvidia_com``
         """
         netloc = self._netloc.split(":")[0]
         if netloc.startswith("www."):
             netloc = netloc[4:]
-        return netloc.replace(".", "_").replace("-", "_")
+        domain = netloc.replace(".", "_").replace("-", "_")
+        if self.collection_name:
+            coll = self.collection_name.replace(".", "_").replace("-", "_")
+            return f"{coll}_{domain}"
+        return domain
 
     def _registry_path(self) -> str:
         return os.path.join(self.registry_dir, f"{self._domain_slug()}_url_registry.json")
+
+    @staticmethod
+    def cleanup_crawl_artifacts(
+        collection_name: str,
+        registry_dir: str = "/mnt/nvme2",
+    ) -> list[str]:
+        """Remove URL registry and error-matrix CSV files for a collection.
+
+        Globs ``<registry_dir>/<collection_name>_*_url_registry.json`` and
+        ``<registry_dir>/<collection_name>_*_error_matrix.csv`` and deletes
+        every match.  Silently skips files that cannot be removed.
+
+        Returns the list of paths that were successfully deleted.
+        """
+        import glob as _glob
+
+        coll = collection_name.replace(".", "_").replace("-", "_")
+        patterns = [
+            os.path.join(registry_dir, f"{coll}_*_url_registry.json"),
+            os.path.join(registry_dir, f"{coll}_*_error_matrix.csv"),
+        ]
+        removed: list[str] = []
+        for pattern in patterns:
+            for path in _glob.glob(pattern):
+                try:
+                    os.unlink(path)
+                    removed.append(path)
+                    logger.info("Removed crawl artifact: %s", path)
+                except OSError as exc:
+                    logger.warning("Could not remove crawl artifact %s: %s", path, exc)
+        if not removed:
+            logger.info(
+                "No crawl artifacts found for collection '%s' in %s",
+                collection_name, registry_dir,
+            )
+        return removed
 
     def _load_registry(self) -> dict[str, dict]:
         """Load the URL registry from disk; return empty dict if absent or corrupt."""
