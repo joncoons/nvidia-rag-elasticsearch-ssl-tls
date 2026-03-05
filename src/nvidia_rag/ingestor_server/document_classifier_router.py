@@ -142,8 +142,8 @@ class DocumentClassifierRouter:
         be smaller; this is only a ceiling.  Default 1024.
     max_parallel_pages : int
         ThreadPoolExecutor workers per document batch.  Default 8 (matches
-        4 replica pods × 4 max-num-seqs = 16 slots; 8 workers × 2 concurrent
-        batches = 16 in-flight requests).
+        3 replica pods × 4 max-num-seqs = 12 slots; 8 workers saturates the
+        pool with 2 concurrent document batches = 16 in-flight requests).
     """
 
     def __init__(

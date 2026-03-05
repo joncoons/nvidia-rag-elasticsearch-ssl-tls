@@ -75,7 +75,7 @@ metadata:
   labels:
     app: nemotron-parse-v12
 spec:
-  replicas: 4
+  replicas: 3
   selector:
     matchLabels:
       app: nemotron-parse-v12
@@ -199,3 +199,56 @@ spec:
       targetPort: 8000
       protocol: TCP
   type: ClusterIP
+
+---
+# gpu0-placeholder: permanently occupies the 3 remaining GPU0 virtual slots on
+# ubuntu-local-dev after nim-llm (which holds slot 0).  With GPU0 fully claimed,
+# the device-plugin first-fit algorithm assigns every new nemotron-parse pod to
+# GPU1 instead of GPU0 where nim-llm leaves only ~2 GB free VRAM.
+#
+# These pods are pure sleep processes — they allocate zero VRAM and impose no
+# compute load.  They exist solely to hold device-plugin slots.
+#
+# Slot accounting (ubuntu-local-dev, time-slicing replicas: 4 per GPU):
+#   GPU0 (4 slots): nim-llm(1) + gpu0-placeholder(3)              = 4/4 — FULL
+#   GPU1 (4 slots): nim-vlm(1) + nemotron-parse-v12(3)            = 4/4 — FULL
+#
+# VRAM budget on GPU1 (96 GB):
+#   nim-vlm         40% × 96 GB = ~38.8 GB
+#   nemotron ×3     20% × 96 GB = ~57.6 GB each → 57.6 GB total
+#   Total                        = ~96.4 GB  ← at capacity; 4th nemotron does not fit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu0-placeholder
+  namespace: rag
+  labels:
+    app: gpu0-placeholder
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gpu0-placeholder
+  template:
+    metadata:
+      labels:
+        app: gpu0-placeholder
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu-local-dev
+      priorityClassName: ""
+      containers:
+        - name: placeholder
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          # No GPU compute — CUDA is never initialised.  This env var prevents
+          # the NVIDIA container runtime from injecting CUDA libraries, keeping
+          # the container startup instant and the VRAM footprint at zero.
+          env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility"
