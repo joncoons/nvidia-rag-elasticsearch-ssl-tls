@@ -62,7 +62,10 @@ import logging
 import os
 import re
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import requests
 from PIL import Image as PILImage
@@ -137,29 +140,39 @@ class DocumentClassifierRouter:
         dpi: int = 200,
         chunk_size: int = 512,
         chunk_overlap: int = 150,
+        max_parallel_pages: int = 4,
     ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         self.model_name = model_name
         self.parse_max_tokens = parse_max_tokens
         self.dpi = dpi
+        self.max_parallel_pages = max(1, max_parallel_pages)
         # Markdown pre-chunking: convert token counts to approximate char counts (4 chars/token)
         self._chunk_max_chars = max(chunk_size * 4, 512)
         self._chunk_overlap_chars = chunk_overlap * 4
 
-        self._session = requests.Session()
-        self._session.headers.update(
-            {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                # Disable keep-alive so each inference request opens a new TCP
-                # connection.  The Kubernetes Service round-robins at the
-                # connection level (kube-proxy/iptables), so this distributes
-                # requests evenly across all nemotron-parse replica pods.
-                "Connection": "close",
-            }
-        )
+        # Thread-local sessions: requests.Session is not thread-safe for concurrent
+        # use.  Each worker thread gets its own Session on first access.
+        # Connection: close forces a new TCP connection per request so that the
+        # Kubernetes Service round-robins across all nemotron-parse replica pods
+        # at the connection level (kube-proxy/iptables).
+        self._session_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connection": "close",
+        }
         if api_key:
-            self._session.headers["Authorization"] = f"Bearer {api_key}"
+            self._session_headers["Authorization"] = f"Bearer {api_key}"
+        self._tls = threading.local()
+
+    @property
+    def _session(self) -> requests.Session:
+        """Return a thread-local requests.Session, creating it on first access."""
+        if not hasattr(self._tls, "session"):
+            s = requests.Session()
+            s.headers.update(self._session_headers)
+            self._tls.session = s
+        return self._tls.session
 
     # ------------------------------------------------------------------
     # Factory
@@ -226,18 +239,32 @@ class DocumentClassifierRouter:
             return None
 
         # ----------------------------------------------------------------
-        # Single-pass extraction: each page is processed once with the full
-        # extraction prompt.  The model output contains both element class
-        # labels (for detection) and text content (for extraction), so no
-        # separate detection API call is needed.
+        # Single-pass extraction: pages are processed in parallel using a
+        # ThreadPoolExecutor (max_parallel_pages workers).  Each worker gets
+        # its own thread-local requests.Session so sessions are never shared.
+        # Connection: close on each session forces a new TCP connection per
+        # request, distributing load across all nemotron-parse replica pods
+        # via k8s Service round-robin.
+        #
+        # With 2 replica pods × 4 max-num-seqs each = 8 concurrent inference
+        # slots; max_parallel_pages=4 per batch × 2 concurrent batches = 8
+        # total in-flight requests → fully saturates available capacity.
         # ----------------------------------------------------------------
         all_detected_types: set[str] = set()
         page_parts: list[str] = []
 
-        for i, page_img in enumerate(pages):
-            b64, mime = self._pil_to_base64(page_img)
-            page_classes, page_markdown = self._extract_page(b64, mime)
+        logger.info(
+            "Processing %d pages of '%s' with %d parallel workers",
+            page_count, os.path.basename(filepath), self.max_parallel_pages,
+        )
 
+        with ThreadPoolExecutor(max_workers=self.max_parallel_pages) as executor:
+            page_results: list[tuple[int, set[str], str]] = list(
+                executor.map(self._process_page, enumerate(pages))
+            )
+
+        # Results from executor.map() preserve input order — iterate in page order.
+        for i, page_classes, page_markdown in page_results:
             complex_on_page = page_classes & COMPLEX_ELEMENT_CLASSES
             all_detected_types |= complex_on_page
 
@@ -398,6 +425,26 @@ class DocumentClassifierRouter:
         resp.raise_for_status()
         r = resp.json()
         return r.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    def _process_page(self, args: tuple[int, Any]) -> tuple[int, set[str], str]:
+        """
+        Worker target for parallel page processing.
+
+        Parameters
+        ----------
+        args : tuple[int, Any]
+            ``(page_index, PIL.Image)`` pair as produced by ``enumerate(pages)``.
+
+        Returns
+        -------
+        tuple[int, set[str], str]
+            ``(page_index, detected_classes, markdown_text)`` so that results
+            from ``executor.map`` can be sorted and merged in page order.
+        """
+        i, page_img = args
+        b64, mime = self._pil_to_base64(page_img)
+        page_classes, page_markdown = self._extract_page(b64, mime)
+        return i, page_classes, page_markdown
 
     def _extract_page(self, b64: str, mime: str) -> tuple[set[str], str]:
         """
