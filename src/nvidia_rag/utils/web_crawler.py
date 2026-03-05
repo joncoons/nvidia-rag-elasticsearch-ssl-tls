@@ -58,6 +58,7 @@ Usage::
 """
 
 import asyncio
+import csv
 import logging
 import os
 import tempfile
@@ -273,6 +274,8 @@ class SimpleWebCrawler:
                     for fd in failed_docs:
                         errors.append({
                             "url": fd.get("document_name", "unknown"),
+                            "error_type": "ingest_failure",
+                            "status_code": None,
                             "error": fd.get("error", "ingest failed"),
                         })
                     files_ingested += fcount - len(failed_docs)
@@ -282,7 +285,12 @@ class SimpleWebCrawler:
                     )
                 except Exception as exc:
                     logger.error("Ingest batch %d failed: %r", bnum, exc)
-                    errors.append({"url": f"batch_{bnum}", "error": repr(exc)})
+                    errors.append({
+                        "url": f"batch_{bnum}",
+                        "error_type": "batch_error",
+                        "status_code": None,
+                        "error": repr(exc),
+                    })
             in_flight[:] = remaining
 
         def _dispatch_batch(batch: list[tuple[str, dict]]) -> None:
@@ -337,11 +345,12 @@ class SimpleWebCrawler:
                 _harvest_done()
 
                 logger.info("Crawling [depth=%d] %s", depth, url)
-                html_content, page_title, meta_desc, section_h1, linked_urls = (
+                html_content, page_title, meta_desc, section_h1, linked_urls, fetch_error = (
                     self._fetch_html(url)
                 )
                 if html_content is None:
-                    errors.append({"url": url, "error": "fetch failed"})
+                    if fetch_error:
+                        errors.append({"url": url, **fetch_error})
                     continue
 
                 tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
@@ -400,6 +409,12 @@ class SimpleWebCrawler:
                     "pages_crawled": pages_crawled,
                     "files_ingested": 0,
                     "errors": errors,
+                    "error_matrix": {
+                        "broken_links": [],
+                        "missing_files": [],
+                        "ingest_failures": [],
+                        "batch_errors": [],
+                    },
                 }
 
             logger.info(
@@ -420,6 +435,30 @@ class SimpleWebCrawler:
                     pass
 
         binary_files = total_files_dispatched - pages_crawled
+
+        # Build structured error matrix grouped by category
+        error_matrix: dict[str, list[dict]] = {
+            "broken_links": [],
+            "missing_files": [],
+            "ingest_failures": [],
+            "batch_errors": [],
+        }
+        for e in errors:
+            etype = e.get("error_type", "other")
+            entry = {k: v for k, v in e.items() if k != "error_type"}
+            if etype == "broken_link":
+                error_matrix["broken_links"].append(entry)
+            elif etype == "missing_file":
+                error_matrix["missing_files"].append(entry)
+            elif etype == "ingest_failure":
+                error_matrix["ingest_failures"].append(entry)
+            elif etype == "batch_error":
+                error_matrix["batch_errors"].append(entry)
+            else:
+                error_matrix.setdefault("other", []).append(entry)
+
+        self._write_error_matrix_csv(error_matrix)
+
         return {
             "message": (
                 f"Crawl complete: {pages_crawled} HTML pages and "
@@ -428,6 +467,7 @@ class SimpleWebCrawler:
             "pages_crawled": pages_crawled,
             "files_ingested": binary_files,
             "errors": errors,
+            "error_matrix": error_matrix,
         }
 
     # ------------------------------------------------------------------
@@ -436,18 +476,23 @@ class SimpleWebCrawler:
 
     def _fetch_html(
         self, url: str
-    ) -> tuple[str | None, str, str, str, list[str]]:
+    ) -> tuple[str | None, str, str, str, list[str], dict | None]:
         """
         Fetch *url*, parse it, and return
-        ``(html_text, title, meta_desc, h1, hrefs)``.
+        ``(html_text, title, meta_desc, h1, hrefs, fetch_error)``.
 
-        Returns ``(None, "", "", "", [])`` on error.
+        ``fetch_error`` is ``None`` on success or a dict with keys
+        ``error_type``, ``status_code``, and ``error`` on failure.
+        Returns ``(None, "", "", "", [], None)`` for non-HTML content (silently skipped).
         """
         try:
             from bs4 import BeautifulSoup  # lazy import
         except ImportError:
             logger.error("beautifulsoup4 is not installed; cannot crawl HTML pages")
-            return None, "", "", "", []
+            return None, "", "", "", [], {
+                "error_type": "broken_link", "status_code": None,
+                "error": "beautifulsoup4 not installed",
+            }
 
         try:
             resp = self._session.get(url, timeout=self.request_timeout)
@@ -455,11 +500,21 @@ class SimpleWebCrawler:
             content_type = resp.headers.get("Content-Type", "")
             if "text/html" not in content_type and "text/plain" not in content_type:
                 logger.debug("Skipping non-HTML URL %s (Content-Type: %s)", url, content_type)
-                return None, "", "", "", []
+                return None, "", "", "", [], None  # Not an error — silently skip
             html_text = resp.text
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            logger.warning("HTTP error fetching %s: %s", url, exc)
+            return None, "", "", "", [], {
+                "error_type": "broken_link", "status_code": status_code,
+                "error": str(exc),
+            }
         except Exception as exc:
             logger.warning("HTTP error fetching %s: %s", url, exc)
-            return None, "", "", "", []
+            return None, "", "", "", [], {
+                "error_type": "broken_link", "status_code": None,
+                "error": str(exc),
+            }
 
         try:
             soup = BeautifulSoup(html_text, "html.parser")
@@ -477,9 +532,12 @@ class SimpleWebCrawler:
             ]
         except Exception as exc:
             logger.warning("Parse error for %s: %s", url, exc)
-            return html_text, "", "", "", []
+            return html_text, "", "", "", [], {
+                "error_type": "broken_link", "status_code": None,
+                "error": f"parse error: {exc}",
+            }
 
-        return html_text, title, meta_desc, section_h1, hrefs
+        return html_text, title, meta_desc, section_h1, hrefs, None
 
     def _collect_binary_file(
         self,
@@ -500,9 +558,24 @@ class SimpleWebCrawler:
             resp.raise_for_status()
             tmp_path = self._save_temp_stream(resp, suffix=suffix)
             all_temp_files.append(tmp_path)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            logger.warning("Failed to download binary file %s: %s", url, exc)
+            errors.append({
+                "url": url,
+                "error_type": "missing_file",
+                "status_code": status_code,
+                "error": str(exc),
+            })
+            return None
         except Exception as exc:
             logger.warning("Failed to download binary file %s: %s", url, exc)
-            errors.append({"url": url, "error": str(exc)})
+            errors.append({
+                "url": url,
+                "error_type": "missing_file",
+                "status_code": None,
+                "error": str(exc),
+            })
             return None
 
         # XML files are not natively supported by nv-ingest -- pre-process to Markdown.
@@ -520,7 +593,12 @@ class SimpleWebCrawler:
                 logger.info("XML pre-processed to Markdown (%d chars): %s", len(markdown_text), url)
             except Exception as exc:
                 logger.warning("Failed to pre-process XML %s: %s", url, exc)
-                errors.append({"url": url, "error": str(exc)})
+                errors.append({
+                    "url": url,
+                    "error_type": "missing_file",
+                    "status_code": None,
+                    "error": f"XML pre-process failed: {exc}",
+                })
                 return None
 
         return (
@@ -534,6 +612,48 @@ class SimpleWebCrawler:
                 },
             },
         )
+
+    def _write_error_matrix_csv(
+        self,
+        error_matrix: dict[str, list[dict]],
+        output_dir: str = "/mnt/nvme2",
+    ) -> None:
+        """Write the error matrix to ``<output_dir>/<domain>_error_matrix.csv``.
+
+        Columns: category, url, status_code, error
+        One row per error entry across all categories.  Existing file is
+        overwritten.  Silently skips if the output directory is not writable.
+        """
+        # Strip www. prefix, remove port, replace . and - with _
+        netloc = self._netloc.split(":")[0]  # drop port
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        domain = netloc.replace(".", "_").replace("-", "_")
+        csv_path = os.path.join(output_dir, f"{domain}_error_matrix.csv")
+        total_errors = sum(len(v) for v in error_matrix.values())
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=["category", "url", "status_code", "error"],
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                for category, entries in error_matrix.items():
+                    for entry in entries:
+                        writer.writerow({
+                            "category": category,
+                            "url": entry.get("url", ""),
+                            "status_code": entry.get("status_code", ""),
+                            "error": entry.get("error", ""),
+                        })
+            logger.info(
+                "Error matrix written to %s (%d entries)",
+                csv_path, total_errors,
+            )
+        except Exception as exc:
+            logger.warning("Could not write error matrix CSV to %s: %s", csv_path, exc)
 
     @staticmethod
     def _save_temp(data: bytes, suffix: str = ".html") -> str:
