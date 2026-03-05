@@ -124,9 +124,9 @@ class SimpleWebCrawler:
     ----------
     start_url : str
         URL to begin crawling from.
-    max_pages : int
+    max_pages : int or None
         Maximum number of HTML pages to crawl (binary file downloads are not
-        counted against this limit).
+        counted against this limit).  ``None`` means unlimited.
     extract_linked_files : bool
         When True, ``<a href>`` links pointing to supported binary files
         (documents, images, audio, XML, markdown) are downloaded and
@@ -151,7 +151,7 @@ class SimpleWebCrawler:
     def __init__(
         self,
         start_url: str,
-        max_pages: int = 50,
+        max_pages: int | None = 50,
         extract_linked_files: bool = False,
         batch_ingest_size: int = 20,
         max_concurrent_batches: int = 3,
@@ -317,16 +317,17 @@ class SimpleWebCrawler:
             in_flight.append((future, batch_num, len(filepaths)))
             total_files_dispatched += len(filepaths)
 
+        max_pages_display = self.max_pages if self.max_pages is not None else "unlimited"
         logger.info(
-            "Crawl starting at %s (max_pages=%d, batch_ingest_size=%d, "
+            "Crawl starting at %s (max_pages=%s, batch_ingest_size=%d, "
             "max_concurrent_batches=%d)",
-            self.start_url, self.max_pages,
+            self.start_url, max_pages_display,
             self.batch_ingest_size, self.max_concurrent_batches,
         )
 
         try:
             # ── Phase 1: BFS crawl with rolling batch dispatch ───────────────
-            while queue and pages_crawled < self.max_pages:
+            while queue and (self.max_pages is None or pages_crawled < self.max_pages):
                 url, depth = queue.popleft()
                 if url in visited_html:
                     continue
@@ -361,8 +362,8 @@ class SimpleWebCrawler:
                 ))
                 pages_crawled += 1
                 logger.info(
-                    "Collected page %d/%d: %s  [pending=%d, in_flight=%d]",
-                    pages_crawled, self.max_pages, url, len(pending), len(in_flight),
+                    "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
+                    pages_crawled, max_pages_display, url, len(pending), len(in_flight),
                 )
 
                 # Collect any linked binary files
@@ -380,7 +381,7 @@ class SimpleWebCrawler:
                         not _is_binary_url(abs_href)
                         and _same_domain(abs_href, self._netloc)
                         and abs_href not in visited_html
-                        and pages_crawled < self.max_pages
+                        and (self.max_pages is None or pages_crawled < self.max_pages)
                     ):
                         queue.append((abs_href, depth + 1))
 

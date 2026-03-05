@@ -627,8 +627,8 @@ class CrawlRequest(BaseModel):
     collection_name: str = Field(
         "multimodal_data", description="Name of the collection in the vector database."
     )
-    max_pages: int = Field(
-        50, ge=1, le=500, description="Maximum number of HTML pages to crawl."
+    max_pages: int | None = Field(
+        50, ge=1, description="Maximum number of HTML pages to crawl. Omit or set to null for unlimited."
     )
     use_nemoretriever_parse: bool = Field(
         default=False,
