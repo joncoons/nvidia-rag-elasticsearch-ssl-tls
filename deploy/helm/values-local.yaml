@@ -185,6 +185,11 @@ ingestor-server:
     # ---------------------------------------------------------------------------
     APP_CRAWLER_REGISTRY_DIR: "/tmp"
     APP_CRAWLER_EXPORT_DIR: "/crawl-exports"
+    # ---------------------------------------------------------------------------
+    # Chunking — max tokens per semantic chunk (HTML + PDF/nemoparse paths).
+    # Must be <= NIM_TRITON_MAX_SEQ_LENGTH on embedding + reranking NIMs (2048).
+    # ---------------------------------------------------------------------------
+    APP_NVINGEST_CHUNKSIZE: "2048"
   extraVolumes:
     - name: eck-ca
       configMap:

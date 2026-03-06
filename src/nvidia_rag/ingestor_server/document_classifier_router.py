@@ -153,7 +153,7 @@ class DocumentClassifierRouter:
         api_key: str = "",
         parse_max_tokens: int = 8990,
         dpi: int = 300,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
         chunk_overlap: int = 150,
         max_parallel_pages: int = 8,
     ) -> None:

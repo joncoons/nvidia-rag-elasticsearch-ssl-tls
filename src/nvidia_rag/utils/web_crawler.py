@@ -204,7 +204,7 @@ class SimpleWebCrawler:
         force_nemoretriever_parse: bool = False,
         request_timeout: int = 30,
         user_agent: str = "NVIDIA-RAG-Crawler/1.0",
-        html_chunk_max_tokens: int = 1024,
+        html_chunk_max_tokens: int = 2048,
         export_dir: str = "",
     ) -> None:
         self.start_url = start_url.rstrip("/")
