@@ -299,6 +299,12 @@ class SimpleWebCrawler:
         # All temp file paths -- cleaned up in finally after all futures settle.
         all_temp_files: list[str] = []
         errors: list[dict] = []
+        error_matrix: dict[str, list[dict]] = {
+            "broken_links": [],
+            "missing_files": [],
+            "ingest_failures": [],
+            "batch_errors": [],
+        }
         pages_crawled = 0
         pages_skipped = 0   # unchanged HTML pages (hash match)
         files_skipped = 0   # unchanged binary files (304)
@@ -576,32 +582,24 @@ class SimpleWebCrawler:
                     pass
             # Always persist the updated registry
             self._save_registry(registry)
+            # Always build error matrix and export artifacts — even on interrupt/SIGTERM
+            for e in errors:
+                etype = e.get("error_type", "other")
+                entry = {k: v for k, v in e.items() if k != "error_type"}
+                if etype == "broken_link":
+                    error_matrix["broken_links"].append(entry)
+                elif etype == "missing_file":
+                    error_matrix["missing_files"].append(entry)
+                elif etype == "ingest_failure":
+                    error_matrix["ingest_failures"].append(entry)
+                elif etype == "batch_error":
+                    error_matrix["batch_errors"].append(entry)
+                else:
+                    error_matrix.setdefault("other", []).append(entry)
+            self._write_error_matrix_csv(error_matrix)
+            self._export_crawl_artifacts()
 
         binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
-
-        # Build structured error matrix grouped by category
-        error_matrix: dict[str, list[dict]] = {
-            "broken_links": [],
-            "missing_files": [],
-            "ingest_failures": [],
-            "batch_errors": [],
-        }
-        for e in errors:
-            etype = e.get("error_type", "other")
-            entry = {k: v for k, v in e.items() if k != "error_type"}
-            if etype == "broken_link":
-                error_matrix["broken_links"].append(entry)
-            elif etype == "missing_file":
-                error_matrix["missing_files"].append(entry)
-            elif etype == "ingest_failure":
-                error_matrix["ingest_failures"].append(entry)
-            elif etype == "batch_error":
-                error_matrix["batch_errors"].append(entry)
-            else:
-                error_matrix.setdefault("other", []).append(entry)
-
-        self._write_error_matrix_csv(error_matrix)
-        self._export_crawl_artifacts()
 
         return {
             "message": (
