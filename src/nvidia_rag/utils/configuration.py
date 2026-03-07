@@ -469,6 +469,15 @@ class NemoParseConfig(_ConfigBase):
         env="APP_NEMOPARSE_FIGURE_DESCRIBE_MODEL",
         description="Model name forwarded to the figure description VLM endpoint.",
     )
+    max_parallel_docs: int = Field(
+        default=4,
+        env="APP_NEMOPARSE_MAX_PARALLEL_DOCS",
+        description=(
+            "Number of PDF documents to process in parallel through nemoretriever-parse. "
+            "Each document uses max_parallel_pages workers internally. "
+            "Set to match nemotron-parse replica count x max-num-seqs / max_parallel_pages."
+        ),
+    )
 
 
 class ModelParametersConfig(_ConfigBase):

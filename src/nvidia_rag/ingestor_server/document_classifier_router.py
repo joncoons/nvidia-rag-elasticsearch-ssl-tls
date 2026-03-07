@@ -160,9 +160,13 @@ class DocumentClassifierRouter:
         Maximum tokens per semantic chunk.  Non-homogeneous: most chunks will
         be smaller; this is only a ceiling.  Default 1024.
     max_parallel_pages : int
-        ThreadPoolExecutor workers per document batch.  Default 8 (matches
-        3 replica pods × 4 max-num-seqs = 12 slots; 8 workers saturates the
-        pool with 2 concurrent document batches = 16 in-flight requests).
+        ThreadPoolExecutor workers per document (pages in parallel).  Default 8.
+    max_parallel_docs : int
+        Number of documents processed concurrently.  Default 4.
+        Each document spawns max_parallel_pages workers, so total in-flight
+        requests = max_parallel_docs × max_parallel_pages.  Size to match
+        nemotron-parse replica count × max-num-seqs (e.g. 7 replicas × 4 = 28
+        slots → max_parallel_docs=4 × max_parallel_pages=8 = 32 ≈ saturated).
     """
 
     def __init__(
@@ -175,6 +179,7 @@ class DocumentClassifierRouter:
         max_tokens: int = 2048,
         chunk_overlap: int = 150,
         max_parallel_pages: int = 8,
+        max_parallel_docs: int = 4,
         vlm_endpoint_url: str = "",
         vlm_model_name: str = VLM_DESCRIBE_MODEL_DEFAULT,
     ) -> None:
@@ -183,6 +188,7 @@ class DocumentClassifierRouter:
         self.parse_max_tokens = parse_max_tokens
         self.dpi = dpi
         self.max_parallel_pages = max(1, max_parallel_pages)
+        self.max_parallel_docs = max(1, max_parallel_docs)
         self._max_tokens = max_tokens
         self._chunk_overlap = chunk_overlap
         self.vlm_endpoint_url = vlm_endpoint_url.rstrip("/") if vlm_endpoint_url else ""
@@ -223,6 +229,7 @@ class DocumentClassifierRouter:
             api_key=config.nemo_parse.api_key,
             max_tokens=config.nv_ingest.chunk_size,
             chunk_overlap=config.nv_ingest.chunk_overlap,
+            max_parallel_docs=config.nemo_parse.max_parallel_docs,
             vlm_endpoint_url=config.nemo_parse.figure_describe_endpoint,
             vlm_model_name=config.nemo_parse.figure_describe_model,
         )
@@ -363,8 +370,31 @@ class DocumentClassifierRouter:
     def route_documents(
         self, filepaths: list[str], force: bool = False
     ) -> dict[str, list[tuple[str, dict]] | None]:
-        """Classify and route a batch of file paths."""
-        return {fp: self.route_document(fp, force=force) for fp in filepaths}
+        """Classify and route a batch of file paths in parallel across documents.
+
+        Uses a two-level thread pool:
+          Outer (this method): max_parallel_docs PDFs concurrently.
+          Inner (route_document): max_parallel_pages pages per PDF concurrently.
+
+        Total in-flight nemotron-parse requests ≈ max_parallel_docs × max_parallel_pages.
+        """
+        if len(filepaths) <= 1:
+            return {fp: self.route_document(fp, force=force) for fp in filepaths}
+
+        results: dict[str, list[tuple[str, dict]] | None] = {}
+        with ThreadPoolExecutor(max_workers=self.max_parallel_docs) as executor:
+            future_to_fp = {
+                executor.submit(self.route_document, fp, force): fp
+                for fp in filepaths
+            }
+            for future in future_to_fp:
+                fp = future_to_fp[future]
+                try:
+                    results[fp] = future.result()
+                except Exception as exc:
+                    logger.warning("route_document failed for '%s': %s", fp, exc)
+                    results[fp] = None
+        return results
 
     # ------------------------------------------------------------------
     # Private helpers — image conversion
@@ -372,11 +402,15 @@ class DocumentClassifierRouter:
 
     @staticmethod
     def _pil_to_base64(img: PILImage.Image) -> tuple[str, str]:
-        """Encode a PIL image as base64 PNG; return (b64_string, mime_type)."""
+        """Encode a PIL image as base64 JPEG; return (b64_string, mime_type).
+
+        JPEG at quality=95 is 3-5x smaller and faster to encode than lossless
+        PNG with no meaningful loss for document text at 300 DPI.
+        """
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG")
+        img.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        return b64, "image/png"
+        return b64, "image/jpeg"
 
     # ------------------------------------------------------------------
     # Private helpers — nemoretriever-parse API
