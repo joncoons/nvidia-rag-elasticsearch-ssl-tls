@@ -863,6 +863,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
+            pdf_repo_dir=CONFIG.pdf_repo_dir,
         )
 
         async def _crawl_task():
@@ -1556,11 +1557,15 @@ async def process_file_paths(filepaths: list[UploadFile], collection_name: str):
 
         processed_filenames.add(upload_file)
 
-        # Create a unique directory for each file
-        unique_dir = base_upload_folder  # / str(uuid4())
-        unique_dir.mkdir(parents=True, exist_ok=True)
+        # PDFs go to the persistent repo dir (if configured); everything else to temp.
+        pdf_repo = CONFIG.pdf_repo_dir
+        if pdf_repo and upload_file.lower().endswith(".pdf"):
+            dest_dir = Path(pdf_repo) / collection_name
+        else:
+            dest_dir = base_upload_folder
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
-        file_path = unique_dir / upload_file
+        file_path = dest_dir / upload_file
         all_file_paths.append(str(file_path))
 
         # Copy uploaded file to upload_dir directory and pass that file path to

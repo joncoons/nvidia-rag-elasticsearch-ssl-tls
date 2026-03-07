@@ -842,8 +842,12 @@ class NvidiaRAGIngestor:
             # docker workflow
             clean_up_files_start_time = time.time()
             if self.mode == Mode.SERVER:
+                pdf_repo = self.config.pdf_repo_dir
                 logger.info(f"Cleaning up files count: {len(filepaths)}")
                 for file in filepaths:
+                    if pdf_repo and file.startswith(str(pdf_repo)):
+                        logger.debug(f"Keeping persistent PDF in repo: {file}")
+                        continue
                     try:
                         os.remove(file)
                         logger.debug(f"Deleted temporary file: {file}")

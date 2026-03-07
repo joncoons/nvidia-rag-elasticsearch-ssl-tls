@@ -84,6 +84,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 NEMO_PARSE_MODEL_DEFAULT = "nvidia/NVIDIA-Nemotron-Parse-v1.2"
+VLM_DESCRIBE_MODEL_DEFAULT = "nvidia/nemotron-nano-12b-v2-vl"
 
 # Prompt tokens that instruct the model to produce structured markdown output.
 # <predict_no_text_in_pic> suppresses transcription of text inside Picture elements.
@@ -91,11 +92,29 @@ _EXTRACTION_PROMPT = (
     "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
 )
 
+# Prompt sent to the figure-description VLM for each cropped Picture region.
+_FIGURE_DESCRIBE_PROMPT = (
+    "Describe this figure in detail for a retrieval-augmented generation system. "
+    "Include all visible text, labels, axis titles and values, data trends, "
+    "legend entries, and any key observations. Be specific and thorough."
+)
+
+# Minimum fraction of page area a Picture region must occupy to be described.
+# Filters out tiny decorative elements (logos, icons, horizontal rules).
+_MIN_PICTURE_AREA_FRACTION = 0.015
+
 # Regex to parse one element from the model's structured output:
 #   <x_X1><y_Y1>CONTENT<x_X2><y_Y2><class_CLASSNAME>
 _RE_ELEMENT = re.compile(
     r"<x_[\d.]+><y_[\d.]+>(.*?)<x_[\d.]+><y_[\d.]+><class_([^>]+)>",
     re.DOTALL,
+)
+
+# Regex to extract (x1, y1, x2, y2) for Picture-class elements specifically.
+# Handles empty content between the two coordinate pairs.
+_RE_PICTURE_BBOX = re.compile(
+    r"<x_([\d.]+)><y_([\d.]+)>[^<]*?<x_([\d.]+)><y_([\d.]+)><class_Picture>",
+    re.DOTALL | re.IGNORECASE,
 )
 
 # Element classes that trigger VLM-quality routing (trigger route_document to
@@ -156,6 +175,8 @@ class DocumentClassifierRouter:
         max_tokens: int = 2048,
         chunk_overlap: int = 150,
         max_parallel_pages: int = 8,
+        vlm_endpoint_url: str = "",
+        vlm_model_name: str = VLM_DESCRIBE_MODEL_DEFAULT,
     ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         self.model_name = model_name
@@ -164,6 +185,8 @@ class DocumentClassifierRouter:
         self.max_parallel_pages = max(1, max_parallel_pages)
         self._max_tokens = max_tokens
         self._chunk_overlap = chunk_overlap
+        self.vlm_endpoint_url = vlm_endpoint_url.rstrip("/") if vlm_endpoint_url else ""
+        self.vlm_model_name = vlm_model_name
 
         # Thread-local sessions: requests.Session is not thread-safe for
         # concurrent use.  Each worker thread gets its own Session on first
@@ -200,6 +223,8 @@ class DocumentClassifierRouter:
             api_key=config.nemo_parse.api_key,
             max_tokens=config.nv_ingest.chunk_size,
             chunk_overlap=config.nv_ingest.chunk_overlap,
+            vlm_endpoint_url=config.nemo_parse.figure_describe_endpoint,
+            vlm_model_name=config.nemo_parse.figure_describe_model,
         )
 
     # ------------------------------------------------------------------
@@ -384,6 +409,29 @@ class DocumentClassifierRouter:
         r = resp.json()
         return r.get("choices", [{}])[0].get("message", {}).get("content", "")
 
+    def _call_vlm_describe(self, b64: str, mime: str) -> str:
+        """Call the figure-description VLM on a cropped Picture region."""
+        payload = {
+            "model": self.vlm_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        },
+                        {"type": "text", "text": _FIGURE_DESCRIBE_PROMPT},
+                    ],
+                }
+            ],
+            "max_tokens": 512,
+            "temperature": 0.2,
+        }
+        resp = self._session.post(self.vlm_endpoint_url, json=payload, timeout=60)
+        resp.raise_for_status()
+        return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
     # ------------------------------------------------------------------
     # Private helpers — page processing (ThreadPoolExecutor worker)
     # ------------------------------------------------------------------
@@ -411,7 +459,91 @@ class DocumentClassifierRouter:
             logger.warning("nemoretriever-parse call failed on page %d: %s", i + 1, exc)
             return i, []
         elements = self._parse_model_output_elements(raw)
+        if self.vlm_endpoint_url:
+            elements = self._describe_pictures(raw, page_img, elements, i + 1)
         return i, elements
+
+    def _describe_pictures(
+        self,
+        raw: str,
+        page_img: "PILImage.Image",
+        elements: list[tuple[str, str]],
+        page_num: int,
+    ) -> list[tuple[str, str]]:
+        """
+        Replace empty Picture elements with nim-vlm figure descriptions.
+
+        Finds each Picture bounding box in the raw nemoretriever-parse output,
+        crops the corresponding region from *page_img*, sends it to the VLM,
+        and substitutes the description as the element text so the downstream
+        chunker can emit it as searchable content.
+        """
+        bboxes = self._parse_picture_bboxes(raw)
+        if not bboxes:
+            return elements
+
+        W, H = page_img.size
+        page_area = W * H
+        bbox_iter = iter(bboxes)
+        result: list[tuple[str, str]] = []
+
+        for cls, text in elements:
+            if cls.lower() != "picture":
+                result.append((cls, text))
+                continue
+
+            bbox = next(bbox_iter, None)
+            if bbox is None:
+                result.append((cls, text))
+                continue
+
+            x1f, y1f, x2f, y2f = bbox
+            # Normalise so x1 < x2, y1 < y2
+            x1f, x2f = min(x1f, x2f), max(x1f, x2f)
+            y1f, y2f = min(y1f, y2f), max(y1f, y2f)
+
+            # Skip regions that are too small to be meaningful figures
+            crop_area = (x2f - x1f) * W * (y2f - y1f) * H
+            if crop_area < _MIN_PICTURE_AREA_FRACTION * page_area:
+                logger.debug(
+                    "Page %d: skipping tiny Picture region (%.1f%% of page)",
+                    page_num, 100 * crop_area / page_area,
+                )
+                result.append((cls, text))
+                continue
+
+            # Crop with a small margin and clamp to image bounds
+            margin_x = int(0.005 * W)
+            margin_y = int(0.005 * H)
+            left   = max(0, int(x1f * W) - margin_x)
+            upper  = max(0, int(y1f * H) - margin_y)
+            right  = min(W, int(x2f * W) + margin_x)
+            lower  = min(H, int(y2f * H) + margin_y)
+
+            try:
+                crop = page_img.crop((left, upper, right, lower))
+                cb64, cmime = self._pil_to_base64(crop)
+                description = self._call_vlm_describe(cb64, cmime)
+                logger.debug(
+                    "Page %d: VLM described Picture (%.0f×%.0f px) → %d chars",
+                    page_num, right - left, lower - upper, len(description),
+                )
+                result.append((cls, description))
+            except Exception as exc:
+                logger.warning(
+                    "Page %d: VLM figure description failed: %s", page_num, exc
+                )
+                result.append((cls, text))
+
+        return result
+
+    @staticmethod
+    def _parse_picture_bboxes(raw: str) -> list[tuple[float, float, float, float]]:
+        """Return (x1, y1, x2, y2) normalised coords for every Picture element."""
+        return [
+            (float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)))
+            for m in _RE_PICTURE_BBOX.finditer(raw)
+        ]
 
     # ------------------------------------------------------------------
     # Private helpers — model output parsing
@@ -425,6 +557,8 @@ class DocumentClassifierRouter:
         Noise classes (Page-header, Page-footer, TOC) are filtered out.
         Atomic elements (Table, Formula) are included even when text is empty
         so that downstream stitching and chunking can detect them.
+        Picture elements are always preserved (text is empty; descriptions are
+        filled in later by ``_describe_pictures`` when VLM captioning is active).
         """
         elements: list[tuple[str, str]] = []
         for m in _RE_ELEMENT.finditer(raw):
@@ -433,7 +567,7 @@ class DocumentClassifierRouter:
             cls_lower = cls.lower()
             if cls_lower in _SKIP_CLASSES:
                 continue
-            if text or cls_lower in _ATOMIC_CLASSES:
+            if text or cls_lower in _ATOMIC_CLASSES or cls_lower == "picture":
                 elements.append((cls, text))
         return elements
 
@@ -654,13 +788,21 @@ class DocumentClassifierRouter:
                 chars = len(header_md)
                 continue
 
-            # ── Picture: skip body, capture caption as alt-text ───────────
+            # ── Picture: emit VLM description (if available) + caption ───
             if cls_l == "picture":
+                cap = ""
                 if i < len(elements) and elements[i][0].lower() == _CAPTION_CLASS:
                     cap = elements[i][1].strip()
-                    if cap:
-                        _add(f"[Image: {cap}]")
                     i += 1
+                if text:
+                    # VLM description was generated for this region
+                    parts_list = []
+                    if cap:
+                        parts_list.append(f"**[Figure]** *{cap}*")
+                    parts_list.append(text)
+                    _add("\n\n".join(parts_list))
+                elif cap:
+                    _add(f"[Image: {cap}]")
                 continue
 
             # ── Atomic element (Table / Formula) with optional Caption ─────

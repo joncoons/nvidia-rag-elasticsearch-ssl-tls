@@ -214,9 +214,9 @@ spec:
 #   GPU1 (4 slots): nim-vlm(1) + nemotron-parse-v12(3)            = 4/4 — FULL
 #
 # VRAM budget on GPU1 (96 GB):
-#   nim-vlm         40% × 96 GB = ~38.8 GB
-#   nemotron ×3     20% × 96 GB = ~57.6 GB each → 57.6 GB total
-#   Total                        = ~96.4 GB  ← at capacity; 4th nemotron does not fit
+#   nim-vlm         35% × 96 GB = ~33.6 GB (model 31.85 GB + 1.75 GB KV cache)
+#   nemotron ×3     20% × 96 GB = ~19.2 GB each → 57.6 GB total
+#   Total                        = ~91.2 GB  ← fits with ~5 GB headroom
 apiVersion: apps/v1
 kind: Deployment
 metadata:

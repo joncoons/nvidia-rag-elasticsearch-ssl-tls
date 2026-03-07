@@ -170,6 +170,11 @@ ingestor-server:
     # Add --served-model-name to vllm serve (nemotron-parse-v12.yaml) to use the canonical short name.
     APP_NEMOPARSE_MODELNAME: "nvidia/NVIDIA-Nemotron-Parse-v1.2"
     APP_NEMOPARSE_APIKEY: ""   # inject via --set if NGC API key required
+    # Figure description: for each Picture region detected by nemoretriever-parse,
+    # crop the region and send to nim-vlm for a natural-language description.
+    # The description is embedded in the chunk text, making figures RAG-queryable.
+    APP_NEMOPARSE_FIGURE_DESCRIBE_ENDPOINT: "http://nim-vlm:8000/v1/chat/completions"
+    APP_NEMOPARSE_FIGURE_DESCRIBE_MODEL: "nvidia/nemotron-nano-12b-v2-vl"
     # ---------------------------------------------------------------------------
     # Image extraction — enable VLM captioning for standalone images and images
     # embedded in PDFs; use multimodal VLM embeddings (nemoretriever-vlm-embedding-ms)
@@ -186,6 +191,12 @@ ingestor-server:
     APP_CRAWLER_REGISTRY_DIR: "/tmp"
     APP_CRAWLER_EXPORT_DIR: "/crawl-exports"
     # ---------------------------------------------------------------------------
+    # PDF repository — uploaded and crawled PDFs are stored here after ingest
+    # instead of being deleted. Subdirectory = collection name.
+    # Host path: /mnt/nvme2/pdf-repo/<collection_name>/<filename>
+    # ---------------------------------------------------------------------------
+    APP_PDF_REPO_DIR: "/pdf-repo"
+    # ---------------------------------------------------------------------------
     # Chunking — max tokens per semantic chunk (HTML + PDF/nemoparse paths).
     # Must be <= NIM_TRITON_MAX_SEQ_LENGTH on embedding + reranking NIMs (2048).
     # ---------------------------------------------------------------------------
@@ -198,12 +209,18 @@ ingestor-server:
       hostPath:
         path: /home/joncoons/crawl-exports
         type: DirectoryOrCreate
+    - name: pdf-repo
+      hostPath:
+        path: /mnt/nvme2/pdf-repo
+        type: DirectoryOrCreate
   extraVolumeMounts:
     - name: eck-ca
       mountPath: /etc/ssl/eck
       readOnly: true
     - name: crawl-exports
       mountPath: /crawl-exports
+    - name: pdf-repo
+      mountPath: /pdf-repo
 
 # ---------------------------------------------------------------------------
 # ECK Elasticsearch — HTTPS with ECK self-signed cert + elastic user auth
@@ -373,19 +390,22 @@ nimOperator:
         nvidia.com/gpu: "1"
 
   # VLM NIM — Nemotron Nano 12B Vision-Language Model on ubuntu-local-dev GPU1 (RTX PRO 6000 Blackwell, 96 GB)
-  # Model uses BF16 execution (NIM profile: BF16 TP1 + ModelOpt fp8 checkpoint storage)
+  # Image: nvcr.io/nim/nvidia/nemotron-nano-12b-v2-vl:1.5.0
+  # Model uses FP8 execution (NIM profile: vllm-rtx-pro-6k-bwe-fp8-tp1-pp1)
   # vLLM profiling footprint: ~31.85 GB (weights ~24 GB + CUDA + 4 GB mm_processor_cache)
-  # NIM_KVCACHE_PERCENT=0.40: 0.40×97=38.8 GB budget − 31.85 GB model = 7 GB KV cache
-  # Minimum viable: 0.34 (~1 GB KV cache). 20% impossible (model alone > 20% of 96 GB).
-  # VRAM barrier: GPU0 has only 6 GB free (nim-llm ~91 GB) → vLLM startup check fails on GPU0
-  # (38.8 GB needed > 6 GB free), passes on GPU1. Pod must be deleted+rescheduled off GPU0.
+  # NIM_KVCACHE_PERCENT=0.37: 0.37×96=35.5 GB budget − 31.85 GB model = 3.67 GB KV cache
+  #   3.67 GB KV cache > 3.09 GB needed for full 131K context ✓
+  # GPU1 VRAM budget: nim-vlm(35.5 GB) + nemotron-parse×3(3×19.2 GB=57.6 GB) = 93.1 GB / 96 GB
+  # VRAM barrier: GPU0 has only ~7 GB free (nim-llm ~89 GB) → vLLM startup check fails on GPU0
+  # (35.5 GB needed > 7 GB free), passes on GPU1 (38.4 GB free, 2.9 GB margin for CUDA overhead).
+  # Pod must be deleted+rescheduled off GPU0 if it lands there (scale placeholder to 0→3 first).
   nim-vlm:
     enabled: true
     nodeSelector:
       kubernetes.io/hostname: ubuntu-local-dev
     env:
       - name: NIM_KVCACHE_PERCENT
-        value: "0.40"
+        value: "0.37"
     resources:
       limits:
         nvidia.com/gpu: "1"

@@ -206,6 +206,7 @@ class SimpleWebCrawler:
         user_agent: str = "NVIDIA-RAG-Crawler/1.0",
         html_chunk_max_tokens: int = 2048,
         export_dir: str = "",
+        pdf_repo_dir: str = "",
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.max_pages = max_pages
@@ -220,6 +221,7 @@ class SimpleWebCrawler:
         self.request_timeout = request_timeout
         self._html_chunk_max_tokens = html_chunk_max_tokens
         self.export_dir = export_dir
+        self.pdf_repo_dir = pdf_repo_dir
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
@@ -824,8 +826,21 @@ class SimpleWebCrawler:
                 logger.debug("304 Not Modified (unchanged): %s", url)
                 return _UNCHANGED, empty_meta
             resp.raise_for_status()
-            tmp_path = self._save_temp_stream(resp, suffix=suffix)
-            all_temp_files.append(tmp_path)
+            # PDFs go to the persistent repo dir (if configured) so they are
+            # retained after ingest and accessible on the host filesystem.
+            if self.pdf_repo_dir and suffix.lower() == ".pdf":
+                dest_dir = Path(self.pdf_repo_dir) / self.collection_name
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                filename = Path(urlparse(url).path).name or f"download{suffix}"
+                tmp_path = str(dest_dir / filename)
+                with open(tmp_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            fh.write(chunk)
+                logger.debug("Downloaded PDF to persistent repo: %s", tmp_path)
+            else:
+                tmp_path = self._save_temp_stream(resp, suffix=suffix)
+                all_temp_files.append(tmp_path)
             # Compute hash from the downloaded file
             with open(tmp_path, "rb") as fh:
                 content_hash = _sha256(fh.read())

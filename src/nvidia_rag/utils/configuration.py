@@ -455,6 +455,20 @@ class NemoParseConfig(_ConfigBase):
             "(skips the two-pass complex-element pre-scan). Requires enabled=True."
         ),
     )
+    figure_describe_endpoint: str = Field(
+        default="",
+        env="APP_NEMOPARSE_FIGURE_DESCRIBE_ENDPOINT",
+        description=(
+            "VLM endpoint for generating descriptions of Picture regions detected by "
+            "nemoretriever-parse (e.g. http://nim-vlm:8000/v1/chat/completions). "
+            "Empty string disables figure description."
+        ),
+    )
+    figure_describe_model: str = Field(
+        default="nvidia/nemotron-nano-12b-v2-vl",
+        env="APP_NEMOPARSE_FIGURE_DESCRIBE_MODEL",
+        description="Model name forwarded to the figure description VLM endpoint.",
+    )
 
 
 class ModelParametersConfig(_ConfigBase):
@@ -1173,6 +1187,15 @@ class NvidiaRAGConfig(_ConfigBase):
         default="./tmp-data",
         env="TEMP_DIR",
         description="Temporary directory for file processing and storage",
+    )
+    pdf_repo_dir: str = Field(
+        default="",
+        env="APP_PDF_REPO_DIR",
+        description=(
+            "Persistent directory for storing uploaded PDFs after ingestion. "
+            "PDFs are stored under <pdf_repo_dir>/<collection_name>/<filename> "
+            "and are NOT deleted after ingest. Empty string disables persistence."
+        ),
     )
 
     @field_validator("default_confidence_threshold")
