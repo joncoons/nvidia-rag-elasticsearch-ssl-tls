@@ -541,9 +541,12 @@ class SimpleWebCrawler:
                     _dispatch_batch(pending)
                     pending = []
 
-                # Periodically flush registry to disk so it's readable mid-crawl
+                # Periodically flush registry + error CSV to disk and export
+                # to the host-mounted dir so artifacts are visible mid-crawl.
                 if pages_crawled % 100 == 0:
                     self._save_registry(registry)
+                    self._flush_errors_to_csv(errors, error_matrix)
+                    self._export_crawl_artifacts()
 
             # ── Phase 2: flush remainder, then drain all in-flight batches ───
             _dispatch_batch(pending)
@@ -582,23 +585,10 @@ class SimpleWebCrawler:
                     os.unlink(tp)
                 except OSError:
                     pass
-            # Always persist the updated registry
+            # Always persist the updated registry + error CSV and export
+            # artifacts — even on interrupt/SIGTERM.
             self._save_registry(registry)
-            # Always build error matrix and export artifacts — even on interrupt/SIGTERM
-            for e in errors:
-                etype = e.get("error_type", "other")
-                entry = {k: v for k, v in e.items() if k != "error_type"}
-                if etype == "broken_link":
-                    error_matrix["broken_links"].append(entry)
-                elif etype == "missing_file":
-                    error_matrix["missing_files"].append(entry)
-                elif etype == "ingest_failure":
-                    error_matrix["ingest_failures"].append(entry)
-                elif etype == "batch_error":
-                    error_matrix["batch_errors"].append(entry)
-                else:
-                    error_matrix.setdefault("other", []).append(entry)
-            self._write_error_matrix_csv(error_matrix)
+            self._flush_errors_to_csv(errors, error_matrix)
             self._export_crawl_artifacts()
 
         binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
@@ -905,6 +895,35 @@ class SimpleWebCrawler:
             },
         )
         return entry, file_meta
+
+    def _flush_errors_to_csv(
+        self,
+        errors: list[dict],
+        error_matrix: dict[str, list[dict]],
+    ) -> None:
+        """Rebuild error_matrix from errors and write the CSV.
+
+        Called both mid-crawl (every 100 pages) and in the finally block so
+        the host-exported CSV is always up to date.  error_matrix is mutated
+        in-place so the finally block can use it without reprocessing.
+        """
+        # Clear and rebuild so we don't accumulate duplicates across calls.
+        for key in ("broken_links", "missing_files", "ingest_failures", "batch_errors"):
+            error_matrix[key] = []
+        for e in errors:
+            etype = e.get("error_type", "other")
+            entry = {k: v for k, v in e.items() if k != "error_type"}
+            if etype == "broken_link":
+                error_matrix["broken_links"].append(entry)
+            elif etype == "missing_file":
+                error_matrix["missing_files"].append(entry)
+            elif etype == "ingest_failure":
+                error_matrix["ingest_failures"].append(entry)
+            elif etype == "batch_error":
+                error_matrix["batch_errors"].append(entry)
+            else:
+                error_matrix.setdefault("other", []).append(entry)
+        self._write_error_matrix_csv(error_matrix)
 
     def _write_error_matrix_csv(
         self,
