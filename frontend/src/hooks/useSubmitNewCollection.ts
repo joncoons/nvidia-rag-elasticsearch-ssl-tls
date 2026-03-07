@@ -34,6 +34,7 @@ export function useSubmitNewCollection() {
     selectedFiles,
     catalogMetadata,
     collectionConfig,
+    crawlConfig,
     setIsLoading,
     setUploadComplete,
     setError,
@@ -231,12 +232,47 @@ export function useSubmitNewCollection() {
         }
       }
 
+      // Start web crawl if a URL was specified
+      if (crawlConfig.startUrl) {
+        try {
+          const crawlRes = await fetch("/api/crawl", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              start_url: crawlConfig.startUrl,
+              collection_name: collectionName,
+              max_pages: crawlConfig.maxPages,
+              use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
+              force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
+              extract_linked_files: crawlConfig.extractLinkedFiles,
+            }),
+          });
+          if (crawlRes.ok) {
+            const crawlData = await crawlRes.json();
+            if (crawlData?.task_id) {
+              addTaskNotification({
+                id: crawlData.task_id,
+                collection_name: collectionName,
+                documents: [`Web crawl: ${crawlConfig.startUrl}`],
+                state: "PENDING",
+                created_at: new Date().toISOString(),
+              });
+              console.log("🌐 Web crawl started:", crawlData.task_id);
+            }
+          } else {
+            console.error("Web crawl request failed:", crawlRes.status);
+          }
+        } catch (crawlErr) {
+          console.error("Web crawl start failed:", crawlErr);
+        }
+      }
+
       console.log("🎉 Collection submission completed successfully");
       setUploadComplete(true);
-      
+
       console.log("🔄 Resetting collection store state");
-      reset(); 
-      
+      reset();
+
       navigate("/");
     } catch (err: unknown) {
       console.error("💥 Collection submission failed:", err);

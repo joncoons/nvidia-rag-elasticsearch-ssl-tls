@@ -19,8 +19,8 @@ import MetadataSchemaEditor from "../components/schema/MetadataSchemaEditor";
 import NewCollectionButtons from "../components/collections/NewCollectionButtons";
 import { CollectionConfigurationPanel } from "../components/collections/CollectionConfigurationPanel";
 import { useNewCollectionStore } from "../store/useNewCollectionStore";
-import { Block, FormField, Grid, GridItem, PageHeader, Panel, Stack, TextInput, Select, Text, Tag, Flex } from "@kui/react";
-import { X, ChevronDown, BookOpen } from "lucide-react";
+import { Block, FormField, Grid, GridItem, PageHeader, Panel, Stack, TextInput, Select, Text, Tag, Flex, Switch } from "@kui/react";
+import { X, ChevronDown, BookOpen, Globe } from "lucide-react";
 
 /**
  * New Collection page component for creating collections.
@@ -184,6 +184,123 @@ function CatalogMetadataSection({
   );
 }
 
+// Web Crawl Panel Component
+function WebCrawlPanel() {
+  const { crawlConfig, setCrawlConfig } = useNewCollectionStore();
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [urlError, setUrlError] = useState('');
+
+  const validateUrl = (url: string): boolean => {
+    try { new URL(url); return true; } catch { return false; }
+  };
+
+  return (
+    <Panel
+      slotHeading={
+        <Flex
+          align="center"
+          justify="between"
+          style={{ width: '100%', cursor: 'pointer' }}
+          onClick={() => setIsExpanded(!isExpanded)}
+        >
+          <span>Web Crawl</span>
+          <ChevronDown
+            size={16}
+            style={{
+              transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+              transition: 'transform 0.2s ease',
+            }}
+          />
+        </Flex>
+      }
+      slotIcon={<Globe size={20} />}
+    >
+      <Text kind="body/bold/md">
+        Optionally seed this collection by crawling a website after creation.
+      </Text>
+
+      {isExpanded && (
+        <Stack gap="density-md" style={{ marginTop: 'var(--spacing-density-lg)' }}>
+          <FormField
+            slotLabel="Start URL"
+            slotHelp="Root page to begin crawling from."
+          >
+            <TextInput
+              value={crawlConfig.startUrl}
+              onValueChange={(val: string) => {
+                setCrawlConfig({ startUrl: val });
+                setUrlError(val && !validateUrl(val) ? 'Please enter a valid URL (e.g. https://docs.example.com/)' : '');
+              }}
+              placeholder="https://docs.example.com/"
+            />
+            {urlError && (
+              <Text kind="body/regular/xs" style={{ color: 'var(--color-danger)' }}>
+                {urlError}
+              </Text>
+            )}
+          </FormField>
+
+          <FormField
+            slotLabel="Max pages (1–500)"
+            slotHelp="Maximum number of HTML pages to crawl."
+          >
+            <TextInput
+              type="number"
+              value={String(crawlConfig.maxPages)}
+              onValueChange={(val: string) =>
+                setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(val) || 50)) })
+              }
+              style={{ width: '120px' }}
+            />
+          </FormField>
+
+          <Stack gap="density-xs">
+            <Switch
+              checked={crawlConfig.extractLinkedFiles}
+              onCheckedChange={(checked: boolean) => setCrawlConfig({ extractLinkedFiles: checked })}
+              size="medium"
+              slotLabel="Extract linked files (PDF / DOCX / XLSX)"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Download and ingest binary documents found as href links on crawled pages.
+            </Text>
+
+            <Switch
+              checked={crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse}
+              onCheckedChange={(checked: boolean) =>
+                setCrawlConfig({
+                  useCrawlNemotronParse: checked,
+                  forceCrawlNemotronParse: checked ? crawlConfig.forceCrawlNemotronParse : false,
+                })
+              }
+              size="medium"
+              slotLabel="Nemotron Parse (complex data elements)"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Route PDFs with tables/charts through nemoretriever-parse VLM.
+            </Text>
+
+            <Switch
+              checked={crawlConfig.forceCrawlNemotronParse}
+              onCheckedChange={(checked: boolean) =>
+                setCrawlConfig({
+                  forceCrawlNemotronParse: checked,
+                  useCrawlNemotronParse: checked ? true : crawlConfig.useCrawlNemotronParse,
+                })
+              }
+              size="medium"
+              slotLabel="Nemotron Parse (all pages)"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Skip classification and run all PDF pages through VLM.
+            </Text>
+          </Stack>
+        </Stack>
+      )}
+    </Panel>
+  );
+}
+
 export default function NewCollection() {
   const { 
     collectionName, 
@@ -269,21 +386,24 @@ export default function NewCollection() {
         </Panel>
       </GridItem>
       <GridItem cols={6}>
-        <Panel>
-          <Stack 
-            gap="density-xl"
-            style={{ 
-              borderTop: '1px solid var(--border-color-subtle)',
-            }}
-          >
-            <NvidiaUpload 
-              onFilesChange={handleFilesChange}
-              onValidationChange={handleValidationChange}
-              acceptedTypes={['.bmp', '.docx', '.html', '.jpeg', '.json', '.md', '.pdf', '.png', '.pptx', '.sh', '.tiff', '.txt', '.mp3', '.wav', '.mp4', '.mov', '.avi', '.mkv']}
-              maxFileSize={400}
-            />
-          </Stack>
-        </Panel>
+        <Stack gap="density-lg">
+          <Panel>
+            <Stack
+              gap="density-xl"
+              style={{
+                borderTop: '1px solid var(--border-color-subtle)',
+              }}
+            >
+              <NvidiaUpload
+                onFilesChange={handleFilesChange}
+                onValidationChange={handleValidationChange}
+                acceptedTypes={['.bmp', '.docx', '.html', '.jpeg', '.json', '.md', '.pdf', '.png', '.pptx', '.sh', '.tiff', '.txt', '.mp3', '.wav', '.mp4', '.mov', '.avi', '.mkv']}
+                maxFileSize={400}
+              />
+            </Stack>
+          </Panel>
+          <WebCrawlPanel />
+        </Stack>
       </GridItem>
       <GridItem cols={12}>
         <NewCollectionButtons />
