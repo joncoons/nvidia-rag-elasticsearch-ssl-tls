@@ -89,6 +89,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from nvidia_rag.utils.k8s_scaler import disable_crawl_mode, enable_crawl_mode
 from nvidia_rag.utils.xml_preprocessor import xml_to_markdown
 
 if TYPE_CHECKING:
@@ -408,6 +409,9 @@ class SimpleWebCrawler:
         except Exception as exc:
             logger.warning("create_collection('%s') raised: %r — proceeding anyway", collection_name, exc)
 
+        # Switch to crawl-optimised GPU layout (nim-llm off, max nemotron-parse replicas).
+        enable_crawl_mode()
+
         try:
             # ── Phase 1: BFS crawl with rolling batch dispatch ───────────────
             while queue and (self.max_pages is None or pages_crawled < self.max_pages):
@@ -597,6 +601,9 @@ class SimpleWebCrawler:
             self._save_registry(registry)
             self._flush_errors_to_csv(errors, error_matrix)
             self._export_crawl_artifacts()
+
+            # Restore inference GPU layout in a background thread (non-blocking).
+            disable_crawl_mode()
 
         binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
 

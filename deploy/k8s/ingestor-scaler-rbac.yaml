@@ -1,0 +1,43 @@
+# RBAC resources for ingestor-server crawl-mode GPU scaling.
+#
+# Grants the ingestor pod permission to get/patch Deployments in the rag
+# namespace so that web_crawler.py can automatically switch between crawl
+# mode (max nemotron-parse replicas) and inference mode (nim-llm enabled).
+#
+# Apply once:
+#   kubectl apply -f deploy/k8s/ingestor-scaler-rbac.yaml
+#
+# Then patch the ingestor Deployment to use this ServiceAccount:
+#   kubectl patch deployment ingestor-server -n rag \
+#     --type=json \
+#     -p='[{"op":"add","path":"/spec/template/spec/serviceAccountName","value":"ingestor-scaler"}]'
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingestor-scaler
+  namespace: rag
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-scaler
+  namespace: rag
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ingestor-scaler
+  namespace: rag
+subjects:
+  - kind: ServiceAccount
+    name: ingestor-scaler
+    namespace: rag
+roleRef:
+  kind: Role
+  name: deployment-scaler
+  apiGroup: rbac.authorization.k8s.io
