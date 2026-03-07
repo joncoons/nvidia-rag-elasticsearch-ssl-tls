@@ -401,6 +401,13 @@ class SimpleWebCrawler:
             self.force_recrawl, len(registry),
         )
 
+        # Ensure the collection exists before dispatching any ingest batches.
+        try:
+            result = ingestor.create_collection(collection_name=collection_name)
+            logger.info("Collection '%s': %s", collection_name, result.get("message", result))
+        except Exception as exc:
+            logger.warning("create_collection('%s') raised: %r — proceeding anyway", collection_name, exc)
+
         try:
             # ── Phase 1: BFS crawl with rolling batch dispatch ───────────────
             while queue and (self.max_pages is None or pages_crawled < self.max_pages):
