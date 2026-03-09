@@ -293,6 +293,7 @@ export function useCollectionActions() {
       max_pages: crawlConfig.maxPages,
       max_depth: crawlConfig.maxDepth,
       batch_ingest_size: crawlConfig.batchIngestSize,
+      use_sitemap: crawlConfig.useSitemap,
       allowed_url_prefixes: buildAllowedPrefixes(crawlConfig.startUrl, crawlConfig.allowedUrlPrefixes),
       use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
       force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,

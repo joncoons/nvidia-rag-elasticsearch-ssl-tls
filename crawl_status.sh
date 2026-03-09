@@ -6,7 +6,7 @@ kubectl run es-count --rm -i --restart=Never --image=curlimages/curl:8.7.1 -n ra
 
 python3 - <<'EOF'
 import json, os, datetime
-path = '/home/joncoons/crawl-exports/nvidia_url_registry.json'
+path = '/home/joncoons/crawl-exports/nvidia_docs_url_registry.json'
 if not os.path.exists(path):
     print('Registry not yet flushed')
 else:

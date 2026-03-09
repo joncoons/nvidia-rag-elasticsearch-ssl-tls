@@ -240,6 +240,18 @@ function WebCrawlPanel() {
             )}
           </FormField>
 
+          <Stack gap="density-xs">
+            <Switch
+              checked={crawlConfig.useSitemap}
+              onCheckedChange={(checked: boolean) => setCrawlConfig({ useSitemap: checked })}
+              size="medium"
+              slotLabel="Sitemap seeding"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Discover all pages via robots.txt sitemaps before crawling. Recommended for sites with JavaScript-rendered navigation.
+            </Text>
+          </Stack>
+
           <FormField
             slotLabel="Max pages"
             slotHelp="Maximum number of HTML pages to crawl. Toggle Unlimited to crawl the entire site."

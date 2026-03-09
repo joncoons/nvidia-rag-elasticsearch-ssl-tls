@@ -80,6 +80,7 @@ import logging
 import os
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from datetime import datetime, timezone
@@ -254,6 +255,7 @@ class SimpleWebCrawler:
         selenium_wait_timeout: int = 15,
         max_depth: int | None = None,
         blocked_url_patterns: list[str] | None = None,
+        use_sitemap: bool = False,
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.max_pages = max_pages
@@ -273,6 +275,7 @@ class SimpleWebCrawler:
         self.max_depth = max_depth
         # Strip trailing slashes so e.g. "/pull/" also blocks "/pulls" (listing pages).
         self.blocked_url_patterns = [p.rstrip("/") for p in (blocked_url_patterns or [])]
+        self.use_sitemap = use_sitemap
         self.use_selenium = use_selenium
         self._selenium_content_threshold = selenium_content_threshold
         self._selenium_screenshot_fallback = selenium_screenshot_fallback
@@ -357,6 +360,20 @@ class SimpleWebCrawler:
         visited_html: set[str] = set()
         visited_files: set[str] = set()
         queue: deque[tuple[str, int]] = deque([(self.start_url, 0)])
+
+        # ── Sitemap seeding ───────────────────────────────────────────────
+        # If enabled, pre-populate the BFS queue with all URLs from the
+        # domain's sitemaps.  This guarantees full-tree coverage for sites
+        # that render navigation via JavaScript (where BFS link discovery
+        # alone would miss large parts of the site).
+        if self.use_sitemap:
+            seed_urls = self._fetch_sitemap_seeds()
+            already_queued = {self.start_url}
+            for seed_url in seed_urls:
+                if seed_url not in already_queued:
+                    queue.append((seed_url, 0))
+                    already_queued.add(seed_url)
+            logger.info("sitemap: seeded BFS queue with %d URLs (total queue=%d)", len(seed_urls), len(queue))
 
         # All temp file paths -- cleaned up in finally after all futures settle.
         all_temp_files: list[str] = []
@@ -911,6 +928,91 @@ class SimpleWebCrawler:
                     or url.startswith(prefix + "?") or url.startswith(prefix + "#"):
                 return True
         return False
+
+    def _fetch_sitemap_seeds(self) -> list[str]:
+        """Fetch all page URLs from the domain's sitemaps for BFS seeding.
+
+        Reads robots.txt to discover sitemap URLs, recursively expands
+        sitemap indexes, and returns all page URLs that pass the domain,
+        allowed-prefix, and blocked-pattern filters.  URLs already in the
+        queue (e.g. start_url) are de-duplicated by the caller.
+
+        Returns an empty list if no sitemaps are found or on any error.
+        """
+        parsed = urlparse(self.start_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {"User-Agent": self._user_agent if hasattr(self, "_user_agent") else "NVIDIA-RAG-Crawler/1.0"}
+        # Use certifi's public CA bundle so public HTTPS sites verify correctly
+        # regardless of any custom CA injected via SSL_CERT_FILE (e.g. ECK certs).
+        try:
+            import certifi
+            _verify: str | bool = certifi.where()
+        except ImportError:
+            _verify = True
+
+        # ── Discover sitemap URLs from robots.txt ─────────────────────────
+        sitemap_urls: list[str] = []
+        try:
+            resp = requests.get(f"{base}/robots.txt", headers=headers, timeout=15, verify=_verify)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.strip().lower().startswith("sitemap:"):
+                        sm_url = line.split(":", 1)[1].strip()
+                        sitemap_urls.append(sm_url)
+        except Exception as exc:
+            logger.warning("sitemap: could not fetch robots.txt: %r", exc)
+
+        if not sitemap_urls:
+            logger.info("sitemap: no Sitemap: entries found in robots.txt — skipping sitemap seeding")
+            return []
+
+        logger.info("sitemap: found %d sitemap(s) in robots.txt", len(sitemap_urls))
+
+        # ── Recursively expand sitemaps → page URLs ────────────────────────
+        page_urls: list[str] = []
+        visited_sitemaps: set[str] = set()
+
+        def _expand(url: str, depth: int = 0) -> None:
+            if url in visited_sitemaps or depth > 5:
+                return
+            visited_sitemaps.add(url)
+            try:
+                r = requests.get(url, headers=headers, timeout=30, verify=_verify)
+                if r.status_code != 200:
+                    logger.debug("sitemap: %s → HTTP %s", url, r.status_code)
+                    return
+                root = ET.fromstring(r.content)
+                ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+                def tag(t: str) -> str:
+                    return f"{{{ns}}}{t}" if ns else t
+
+                # Sitemap index — recurse into sub-sitemaps
+                for loc in root.findall(f".//{tag('sitemap')}/{tag('loc')}"):
+                    _expand(loc.text.strip(), depth + 1)
+
+                # URL set — collect page URLs
+                for loc in root.findall(f".//{tag('url')}/{tag('loc')}"):
+                    u = loc.text.strip()
+                    if (
+                        _same_domain(u, self._netloc)
+                        and self._is_allowed_url(u)
+                        and not self._is_blocked_url(u)
+                        and not _is_binary_url(u)
+                    ):
+                        page_urls.append(u)
+            except ET.ParseError as exc:
+                logger.warning("sitemap: XML parse error in %s: %r", url, exc)
+            except Exception as exc:
+                logger.warning("sitemap: error fetching %s: %r", url, exc)
+
+        for sm_url in sitemap_urls:
+            _expand(sm_url)
+
+        logger.info(
+            "sitemap: discovered %d page URLs across %d sitemap(s)",
+            len(page_urls), len(visited_sitemaps),
+        )
+        return page_urls
 
     @staticmethod
     def cleanup_crawl_artifacts(

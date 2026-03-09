@@ -110,6 +110,21 @@ export const WebCrawlSection = () => {
         )}
       </Stack>
 
+      <Flex style={{ paddingTop: '4px' }}>
+        <Stack gap="density-xs">
+          <Switch
+            checked={crawlConfig.useSitemap}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({ useSitemap: checked })}
+            size="medium"
+            slotLabel="Sitemap seeding"
+            disabled={isCrawling}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Discover all pages via robots.txt sitemaps before crawling. Recommended for sites with JavaScript navigation.
+          </Text>
+        </Stack>
+      </Flex>
+
       <Stack gap="density-sm">
         <Text kind="body/regular/sm" style={{ color: 'white' }}>
           Max pages

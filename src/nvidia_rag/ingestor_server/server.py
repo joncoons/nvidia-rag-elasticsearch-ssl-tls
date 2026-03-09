@@ -733,6 +733,17 @@ class CrawlRequest(BaseModel):
             "both individual PRs (/pull/123) and the listing page (/pulls)."
         ),
     )
+    use_sitemap: bool = Field(
+        default=False,
+        description=(
+            "When True, fetch the domain's robots.txt to discover sitemap URLs, "
+            "expand all sitemap indexes recursively, and seed the BFS queue with "
+            "every discovered page URL.  This guarantees full-tree coverage for "
+            "sites that render navigation via JavaScript (where BFS link-following "
+            "alone would miss large sections).  Filtered by allowed_url_prefixes "
+            "and blocked_url_patterns.  Default False."
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -928,6 +939,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             selenium_screenshot_fallback=payload.selenium_screenshot_fallback,
             max_depth=payload.max_depth,
             blocked_url_patterns=payload.blocked_url_patterns,
+            use_sitemap=payload.use_sitemap,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
             pdf_repo_dir=CONFIG.pdf_repo_dir,

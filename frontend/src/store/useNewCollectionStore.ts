@@ -69,6 +69,7 @@ interface CrawlConfiguration {
   maxPages: number | null;       // null = unlimited
   maxDepth: number | null;       // null = unlimited BFS depth
   batchIngestSize: number;       // files per ingest batch (1–500, default 20)
+  useSitemap: boolean;           // seed BFS from robots.txt sitemaps
   allowedUrlPrefixes: string;    // comma-separated; auto-derived from startUrl path
   extractLinkedFiles: boolean;
   useCrawlNemotronParse: boolean;
@@ -305,6 +306,7 @@ const defaultCrawlConfig: CrawlConfiguration = {
   maxPages: 50,
   maxDepth: null,
   batchIngestSize: 20,
+  useSitemap: false,
   allowedUrlPrefixes: "",
   extractLinkedFiles: false,
   useCrawlNemotronParse: false,
