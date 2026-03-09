@@ -22,6 +22,8 @@ NAMESPACE="${K8S_NAMESPACE:-rag}"
 CRAWL_PARSE_REPLICAS="${K8S_CRAWL_NEMOTRON_REPLICAS:-7}"
 INFERENCE_PARSE_REPLICAS="${K8S_INFERENCE_NEMOTRON_REPLICAS:-1}"
 PLACEHOLDER_REPLICAS="${K8S_PLACEHOLDER_REPLICAS:-3}"
+# TP1 NVFP4 single-GPU profile for RTX PRO 6000 Blackwell (svx1 = single card).
+NIM_LLM_PROFILE="${NIM_LLM_PROFILE:-rtx6000-blackwell-svx1-throughput-nvfp4-xavjkqnlyg}"
 
 scale() {
     echo "  → scaling ${NAMESPACE}/${1} to ${2} replicas"
@@ -54,11 +56,15 @@ case "${1:-disable}" in
         # Step 1: free all GPU slots
         scale nemotron-parse-v12 0
         wait_down nemotron-parse-v12
-        # Step 2: nim-llm lands on GPU0 (first-fit, now empty)
+        # Step 2: ensure nim-llm uses the correct TP1 NVFP4 profile
+        echo "  → setting nim-llm profile to ${NIM_LLM_PROFILE}"
+        kubectl set env -n "${NAMESPACE}" deploy/nim-llm \
+            NIM_MODEL_PROFILE="${NIM_LLM_PROFILE}"
+        # Step 3: nim-llm lands on first available GPU (first-fit)
         scale nim-llm 1
-        # Step 3: fill remaining GPU0 slots so nemotron-parse is forced to GPU1
+        # Step 4: fill remaining GPU0 slots so nemotron-parse is forced to GPU1
         scale gpu0-placeholder "${PLACEHOLDER_REPLICAS}"
-        # Step 4: single nemotron-parse instance on GPU1
+        # Step 5: single nemotron-parse instance on GPU1
         scale nemotron-parse-v12 "${INFERENCE_PARSE_REPLICAS}"
         echo "Inference mode restored. nim-llm startup may take several minutes."
         ;;
