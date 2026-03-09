@@ -222,8 +222,12 @@ class SimpleWebCrawler:
         URL substrings that cause a link to be skipped entirely — neither
         fetched as HTML nor collected as a binary file.  Matching is a simple
         ``in`` check against the full URL string so partial path segments work.
-        Example for GitHub: ``["/stargazers", "/forks", "/commits/",
-        "/blame/", "/graphs/", "/actions", "/issues", "/pull/"]``
+        Example for GitHub: ``["/stargazers", "/forks", "/commits",
+        "/blame", "/graphs", "/actions", "/issues", "/pull",
+        "/archive", "/releases/tag", "/compare", "/network",
+        "/pulse", "/security", "/discussions"]``
+        Trailing slashes are stripped automatically, so ``"/pull/"`` and
+        ``"/pull"`` both block ``/pull/123`` and the ``/pulls`` listing page.
     """
 
     def __init__(
@@ -267,7 +271,8 @@ class SimpleWebCrawler:
         self.pdf_repo_dir = pdf_repo_dir
         self.allowed_url_prefixes = [p.rstrip("/") for p in allowed_url_prefixes] if allowed_url_prefixes else None
         self.max_depth = max_depth
-        self.blocked_url_patterns = blocked_url_patterns or []
+        # Strip trailing slashes so e.g. "/pull/" also blocks "/pulls" (listing pages).
+        self.blocked_url_patterns = [p.rstrip("/") for p in (blocked_url_patterns or [])]
         self.use_selenium = use_selenium
         self._selenium_content_threshold = selenium_content_threshold
         self._selenium_screenshot_fallback = selenium_screenshot_fallback

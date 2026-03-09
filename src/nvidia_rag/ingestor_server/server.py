@@ -725,10 +725,12 @@ class CrawlRequest(BaseModel):
         description=(
             "URL substrings that cause a link to be skipped entirely.  "
             "Simple substring match against the full URL.  "
-            "Example for GitHub: [\"/stargazers\", \"/forks\", \"/commits/\", "
-            "\"/blame/\", \"/graphs/\", \"/actions\", \"/issues\", \"/pull/\", "
-            "\"/archive/\", \"/releases/tag/\", \"/compare/\", \"/network/\", "
-            "\"/pulse\", \"/security\", \"/discussions\"]"
+            "Example for GitHub: [\"/stargazers\", \"/forks\", \"/commits\", "
+            "\"/blame\", \"/graphs\", \"/actions\", \"/issues\", \"/pull\", "
+            "\"/archive\", \"/releases/tag\", \"/compare\", \"/network\", "
+            "\"/pulse\", \"/security\", \"/discussions\"]. "
+            "Trailing slashes are stripped automatically so \"/pull\" blocks "
+            "both individual PRs (/pull/123) and the listing page (/pulls)."
         ),
     )
 
