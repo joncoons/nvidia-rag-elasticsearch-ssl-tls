@@ -23,7 +23,9 @@ CRAWL_PARSE_REPLICAS="${K8S_CRAWL_NEMOTRON_REPLICAS:-7}"
 INFERENCE_PARSE_REPLICAS="${K8S_INFERENCE_NEMOTRON_REPLICAS:-1}"
 PLACEHOLDER_REPLICAS="${K8S_PLACEHOLDER_REPLICAS:-3}"
 # TP1 NVFP4 single-GPU profile for RTX PRO 6000 Blackwell (svx1 = single card).
-NIM_LLM_PROFILE="${NIM_LLM_PROFILE:-rtx6000-blackwell-svx1-throughput-nvfp4-xavjkqnlyg}"
+# SHA256 hash of the TP1 NVFP4 vllm profile — confirmed via `docker run list-model-profiles`.
+# Use the hash (not the snapshot directory name) as NIM_MODEL_PROFILE value.
+NIM_LLM_PROFILE="${NIM_LLM_PROFILE:-e9cc0c5ea49283a493a0b18a05a97eb9b15a82a0d6acbb967e35609ddeb767fa}"
 
 scale() {
     echo "  → scaling ${NAMESPACE}/${1} to ${2} replicas"
