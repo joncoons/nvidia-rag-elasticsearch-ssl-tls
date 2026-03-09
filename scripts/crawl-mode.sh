@@ -62,6 +62,8 @@ case "${1:-disable}" in
         scale nim-llm 0
         scale gpu0-placeholder 0
         scale nemotron-parse-v12 "${CRAWL_PARSE_REPLICAS}"
+        # nim-vlm stays up in crawl mode (1 slot on GPU0; fits within 8-slot budget)
+        scale nim-vlm 1
         echo "Crawl mode active. nim-llm is offline; RAG chat unavailable."
         ;;
     disable|off)
@@ -85,7 +87,7 @@ case "${1:-disable}" in
         echo "Inference mode restored. nim-llm startup may take several minutes."
         ;;
     status)
-        kubectl get deploy -n "${NAMESPACE}" nim-llm gpu0-placeholder nemotron-parse-v12 \
+        kubectl get deploy -n "${NAMESPACE}" nim-llm nim-vlm gpu0-placeholder nemotron-parse-v12 \
             -o custom-columns='NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas'
         ;;
     *)

@@ -107,11 +107,13 @@ def enable_crawl_mode() -> None:
         return
 
     logger.info(
-        "k8s: enabling crawl mode — nim-llm=0, nemotron-parse=%d", _CRAWL_REPLICAS
+        "k8s: enabling crawl mode — nim-llm=0, nemotron-parse=%d, nim-vlm=1", _CRAWL_REPLICAS
     )
     _patch_replicas(apps_v1, "nim-llm", 0)
     _patch_replicas(apps_v1, "gpu0-placeholder", 0)
     _patch_replicas(apps_v1, "nemotron-parse-v12", _CRAWL_REPLICAS)
+    # nim-vlm stays up — 1 slot on GPU0 fits within the 8-slot budget (7 parse + 1 vlm)
+    _patch_replicas(apps_v1, "nim-vlm", 1)
 
 
 def _restore_inference_blocking() -> None:
