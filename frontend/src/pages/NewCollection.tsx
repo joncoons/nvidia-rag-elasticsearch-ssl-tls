@@ -241,17 +241,31 @@ function WebCrawlPanel() {
           </FormField>
 
           <FormField
-            slotLabel="Max pages (1–500)"
-            slotHelp="Maximum number of HTML pages to crawl."
+            slotLabel="Max pages"
+            slotHelp="Maximum number of HTML pages to crawl. Toggle Unlimited to crawl the entire site."
           >
-            <TextInput
-              type="number"
-              value={String(crawlConfig.maxPages)}
-              onValueChange={(val: string) =>
-                setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(val) || 50)) })
-              }
-              style={{ width: '120px' }}
-            />
+            <Flex align="center" gap="density-md">
+              <TextInput
+                type="number"
+                value={crawlConfig.maxPages === null ? "" : String(crawlConfig.maxPages)}
+                onValueChange={(val: string) => {
+                  if (crawlConfig.maxPages !== null) {
+                    setCrawlConfig({ maxPages: Math.max(1, Number(val) || 50) });
+                  }
+                }}
+                disabled={crawlConfig.maxPages === null}
+                style={{ width: '120px' }}
+                placeholder="50"
+              />
+              <Switch
+                checked={crawlConfig.maxPages === null}
+                onCheckedChange={(checked: boolean) =>
+                  setCrawlConfig({ maxPages: checked ? null : 50 })
+                }
+                size="medium"
+                slotLabel="Unlimited"
+              />
+            </Flex>
           </FormField>
 
           <Stack gap="density-xs">

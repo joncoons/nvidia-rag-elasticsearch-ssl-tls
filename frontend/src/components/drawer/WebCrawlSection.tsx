@@ -112,15 +112,31 @@ export const WebCrawlSection = () => {
 
       <Stack gap="density-sm">
         <Text kind="body/regular/sm" style={{ color: 'white' }}>
-          Max pages (1–500)
+          Max pages
         </Text>
-        <TextInput
-          type="number"
-          value={String(crawlConfig.maxPages)}
-          onValueChange={(val: string) => setCrawlConfig({ maxPages: Math.max(1, Math.min(500, Number(val) || 50)) })}
-          disabled={isCrawling}
-          style={{ width: '120px' }}
-        />
+        <Flex align="center" gap="density-md">
+          <TextInput
+            type="number"
+            value={crawlConfig.maxPages === null ? "" : String(crawlConfig.maxPages)}
+            onValueChange={(val: string) => {
+              if (crawlConfig.maxPages !== null) {
+                setCrawlConfig({ maxPages: Math.max(1, Number(val) || 50) });
+              }
+            }}
+            disabled={isCrawling || crawlConfig.maxPages === null}
+            style={{ width: '120px' }}
+            placeholder="50"
+          />
+          <Switch
+            checked={crawlConfig.maxPages === null}
+            onCheckedChange={(checked: boolean) =>
+              setCrawlConfig({ maxPages: checked ? null : 50 })
+            }
+            size="medium"
+            slotLabel="Unlimited"
+            disabled={isCrawling}
+          />
+        </Flex>
       </Stack>
 
       <Flex style={{ paddingTop: '4px' }}>

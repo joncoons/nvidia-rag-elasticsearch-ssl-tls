@@ -66,7 +66,7 @@ interface CollectionConfiguration {
  */
 interface CrawlConfiguration {
   startUrl: string;
-  maxPages: number;
+  maxPages: number | null;  // null = unlimited
   extractLinkedFiles: boolean;
   useCrawlNemotronParse: boolean;
   forceCrawlNemotronParse: boolean;
