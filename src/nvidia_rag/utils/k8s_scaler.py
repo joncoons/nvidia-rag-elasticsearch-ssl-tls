@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 _NAMESPACE = os.environ.get("K8S_SCALER_NAMESPACE", "rag")
 _CRAWL_REPLICAS = int(os.environ.get("K8S_CRAWL_NEMOTRON_REPLICAS", "7"))
-_INFERENCE_REPLICAS = int(os.environ.get("K8S_INFERENCE_NEMOTRON_REPLICAS", "3"))
+_INFERENCE_REPLICAS = int(os.environ.get("K8S_INFERENCE_NEMOTRON_REPLICAS", "1"))
 _PLACEHOLDER_REPLICAS = int(os.environ.get("K8S_PLACEHOLDER_REPLICAS", "3"))
 
 
