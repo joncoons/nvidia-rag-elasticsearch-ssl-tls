@@ -23,6 +23,27 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { APIMetadataField } from "../types/collections";
 import type { CreateCollectionPayload } from "../types/api";
 
+/**
+ * Build the allowed_url_prefixes array for the crawl API.
+ * - If the user typed explicit prefixes, use those.
+ * - Otherwise, if the start URL has a non-trivial path (not just "/"), auto-derive
+ *   the prefix from the start URL so path-scoped crawls stay within their subtree.
+ * - If neither, return null (entire domain is allowed).
+ */
+function buildAllowedPrefixes(startUrl: string, overrides: string): string[] | null {
+  const trimmed = overrides.trim();
+  if (trimmed) {
+    return trimmed.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  try {
+    const { pathname } = new URL(startUrl);
+    if (pathname && pathname !== "/") {
+      return [startUrl.replace(/\/$/, "")];
+    }
+  } catch { /* invalid URL — ignore */ }
+  return null;
+}
+
 export function useSubmitNewCollection() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -242,6 +263,8 @@ export function useSubmitNewCollection() {
               start_url: crawlConfig.startUrl,
               collection_name: collectionName,
               max_pages: crawlConfig.maxPages,
+              max_depth: crawlConfig.maxDepth,
+              allowed_url_prefixes: buildAllowedPrefixes(crawlConfig.startUrl, crawlConfig.allowedUrlPrefixes),
               use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
               force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
               extract_linked_files: crawlConfig.extractLinkedFiles,

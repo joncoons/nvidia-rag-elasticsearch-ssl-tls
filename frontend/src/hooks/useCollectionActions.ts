@@ -24,6 +24,20 @@ import { useNewCollectionStore } from "../store/useNewCollectionStore";
 import { useCollectionDrawerStore } from "../store/useCollectionDrawerStore";
 import { openNotificationPanel } from "../components/notifications/NotificationBell";
 
+function buildAllowedPrefixes(startUrl: string, overrides: string): string[] | null {
+  const trimmed = overrides.trim();
+  if (trimmed) {
+    return trimmed.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  try {
+    const { pathname } = new URL(startUrl);
+    if (pathname && pathname !== "/") {
+      return [startUrl.replace(/\/$/, "")];
+    }
+  } catch { /* invalid URL — ignore */ }
+  return null;
+}
+
 /**
  * Custom hook for managing collection-related actions and operations.
  * 
@@ -277,6 +291,8 @@ export function useCollectionActions() {
       start_url: crawlConfig.startUrl,
       collection_name: activeCollection.collection_name,
       max_pages: crawlConfig.maxPages,
+      max_depth: crawlConfig.maxDepth,
+      allowed_url_prefixes: buildAllowedPrefixes(crawlConfig.startUrl, crawlConfig.allowedUrlPrefixes),
       use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
       force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
       extract_linked_files: crawlConfig.extractLinkedFiles,

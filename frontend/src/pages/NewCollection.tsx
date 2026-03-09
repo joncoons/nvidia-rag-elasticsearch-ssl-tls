@@ -268,6 +268,46 @@ function WebCrawlPanel() {
             </Flex>
           </FormField>
 
+          <FormField
+            slotLabel="Max depth"
+            slotHelp="BFS hops from the start URL. Depth 0 = start page only; 1 = directly linked pages. Toggle Unlimited for no depth cap."
+          >
+            <Flex align="center" gap="density-md">
+              <TextInput
+                type="number"
+                value={crawlConfig.maxDepth === null ? "" : String(crawlConfig.maxDepth)}
+                onValueChange={(val: string) => {
+                  if (crawlConfig.maxDepth !== null) {
+                    setCrawlConfig({ maxDepth: Math.max(0, Number(val) || 0) });
+                  }
+                }}
+                disabled={crawlConfig.maxDepth === null}
+                style={{ width: '120px' }}
+                placeholder="unlimited"
+              />
+              <Switch
+                checked={crawlConfig.maxDepth === null}
+                onCheckedChange={(checked: boolean) =>
+                  setCrawlConfig({ maxDepth: checked ? null : 3 })
+                }
+                size="medium"
+                slotLabel="Unlimited"
+              />
+            </Flex>
+          </FormField>
+
+          <FormField
+            slotLabel="URL prefix filter"
+            slotHelp="Restrict crawl to URLs starting with these prefixes (comma-separated). Leave blank to auto-derive from start URL path, or allow the full domain if the start URL has no path."
+          >
+            <TextInput
+              value={crawlConfig.allowedUrlPrefixes}
+              onValueChange={(val: string) => setCrawlConfig({ allowedUrlPrefixes: val })}
+              placeholder="Auto-derived from start URL path"
+              style={{ width: '100%' }}
+            />
+          </FormField>
+
           <Stack gap="density-xs">
             <Switch
               checked={crawlConfig.extractLinkedFiles}

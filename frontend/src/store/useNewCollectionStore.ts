@@ -66,7 +66,9 @@ interface CollectionConfiguration {
  */
 interface CrawlConfiguration {
   startUrl: string;
-  maxPages: number | null;  // null = unlimited
+  maxPages: number | null;       // null = unlimited
+  maxDepth: number | null;       // null = unlimited BFS depth
+  allowedUrlPrefixes: string;    // comma-separated; auto-derived from startUrl path
   extractLinkedFiles: boolean;
   useCrawlNemotronParse: boolean;
   forceCrawlNemotronParse: boolean;
@@ -300,6 +302,8 @@ const defaultCollectionConfig: CollectionConfiguration = {
 const defaultCrawlConfig: CrawlConfiguration = {
   startUrl: "",
   maxPages: 50,
+  maxDepth: null,
+  allowedUrlPrefixes: "",
   extractLinkedFiles: false,
   useCrawlNemotronParse: false,
   forceCrawlNemotronParse: false,
