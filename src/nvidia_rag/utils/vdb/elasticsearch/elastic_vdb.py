@@ -305,15 +305,38 @@ class ElasticVDB(VDBRagIngest):
             meta_fields=self.meta_fields,
         )
 
+        # Build source_name → source_uri lookup from meta_dataframe (if available).
+        # The add_metadata() path in the Milvus utility was designed for Milvus and
+        # silently fails in the ES path.  We inject source_uri directly here into
+        # content_metadata.content_url (already mapped as keyword in ES) so it is
+        # reliably queryable for upsert delete-by-query operations.
+        #
+        # NOTE: NV-Ingest stores source_name as os.path.basename(file_path) (e.g.
+        # "webcrawl_xyz.md"), while the CSV "source" column has the full path
+        # "/tmp/webcrawl_xyz.md".  Index both so the lookup always resolves.
+        source_uri_lookup: dict[str, str] = {}
+        if meta_dataframe is not None and "source_uri" in meta_dataframe.columns and self.meta_source_field:
+            for _, row in meta_dataframe.iterrows():
+                sname = str(row.get(self.meta_source_field, ""))
+                suri = str(row.get("source_uri", ""))
+                if sname and suri and suri != "nan":
+                    source_uri_lookup[sname] = suri
+                    # Also index by basename — NV-Ingest sets source_name to basename only
+                    source_uri_lookup[os.path.basename(sname)] = suri
+
         # Prepare texts, embeddings, and metadatas from cleaned records
         texts, embeddings, metadatas = [], [], []
         for cleaned_record in cleaned_records:
             texts.append(cleaned_record.get("text"))
             embeddings.append(cleaned_record.get("vector"))
+            content_meta = dict(cleaned_record.get("content_metadata") or {})
+            source_name = (cleaned_record.get("source") or {}).get("source_name", "")
+            if source_name in source_uri_lookup:
+                content_meta["content_url"] = source_uri_lookup[source_name]
             metadatas.append(
                 {
                     "source": cleaned_record.get("source"),
-                    "content_metadata": cleaned_record.get("content_metadata"),
+                    "content_metadata": content_meta,
                 }
             )
 
@@ -655,6 +678,35 @@ class ElasticVDB(VDBRagIngest):
 
         self._es_connection.indices.refresh(index=collection_name)
         return True
+
+    def delete_by_content_url(self, collection_name: str, source_uris: list[str]) -> int:
+        """Delete all vector chunks whose content_url matches any of the given source URIs.
+
+        Used by the web crawler to purge stale chunks before re-ingesting a changed URL.
+        Returns the total number of deleted documents.
+        """
+        if not source_uris:
+            return 0
+        query = {
+            "query": {
+                "terms": {
+                    "metadata.content_metadata.content_url.keyword": source_uris,
+                }
+            }
+        }
+        try:
+            response = self._es_connection.delete_by_query(index=collection_name, body=query)
+            deleted = response.get("deleted", 0)
+            if deleted:
+                logger.info(
+                    "delete_by_content_url: removed %d stale chunks for %d URLs in '%s'",
+                    deleted, len(source_uris), collection_name,
+                )
+                self._es_connection.indices.refresh(index=collection_name)
+            return deleted
+        except Exception as exc:
+            logger.warning("delete_by_content_url failed for %s: %s", collection_name, exc)
+            return 0
 
     def create_metadata_schema_collection(
         self,

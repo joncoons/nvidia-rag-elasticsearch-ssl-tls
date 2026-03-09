@@ -36,7 +36,19 @@ from uuid import uuid4
 import bleach
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field, validator
-from pymilvus.exceptions import MilvusException, MilvusUnavailableException
+try:
+    from pymilvus.exceptions import MilvusException, MilvusUnavailableException
+except ImportError:
+    # pymilvus not installed (e.g. Elasticsearch-only deployment)
+    MilvusException = Exception  # type: ignore[assignment,misc]
+    MilvusUnavailableException = Exception  # type: ignore[assignment,misc]
+
+try:
+    from elasticsearch import ApiError as ESApiError
+    from elastic_transport import ConnectionError as ESConnectionError
+    _ES_EXCEPTIONS: tuple = (ESApiError, ESConnectionError)
+except ImportError:
+    _ES_EXCEPTIONS = ()
 
 from nvidia_rag.utils.minio_operator import (
     get_minio_operator,
@@ -553,13 +565,13 @@ def generate_answer(
             chain_response = ChainResponse()
             yield "data: " + str(chain_response.model_dump_json()) + "\n\n"
 
-    except (MilvusException, MilvusUnavailableException) as e:
+    except (MilvusException, MilvusUnavailableException) + _ES_EXCEPTIONS as e:
         exception_msg = (
-            "Error from milvus server. Please ensure you have ingested some documents. "
+            "Error from vector database. Please ensure you have ingested some documents. "
             "Please check rag-server logs for more details."
         )
         logger.error(
-            "Error from Milvus database endpoint. Please ensure you have ingested some documents. "
+            "Error from vector database endpoint. Please ensure you have ingested some documents. "
             + "Error details: %s",
             e,
             exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
@@ -719,13 +731,13 @@ async def generate_answer_async(
             chain_response = ChainResponse()
             yield "data: " + str(chain_response.model_dump_json()) + "\n\n"
 
-    except (MilvusException, MilvusUnavailableException) as e:
+    except (MilvusException, MilvusUnavailableException) + _ES_EXCEPTIONS as e:
         exception_msg = (
-            "Error from milvus server. Please ensure you have ingested some documents. "
+            "Error from vector database. Please ensure you have ingested some documents. "
             "Please check rag-server logs for more details."
         )
         logger.error(
-            "Error from Milvus database endpoint. Please ensure you have ingested some documents. "
+            "Error from vector database endpoint. Please ensure you have ingested some documents. "
             + "Error details: %s",
             e,
             exc_info=logger.getEffectiveLevel() <= logging.DEBUG,

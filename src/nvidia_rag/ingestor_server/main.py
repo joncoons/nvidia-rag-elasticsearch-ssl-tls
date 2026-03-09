@@ -53,8 +53,6 @@ from uuid import uuid4
 from nv_ingest_client.primitives.tasks.extract import _DEFAULT_EXTRACTOR_MAP
 from nv_ingest_client.util.file_processing.extract import EXTENSION_TO_DOCUMENT_TYPE
 from nv_ingest_client.util.vdb.adt_vdb import VDB
-from pymilvus import MilvusClient
-
 from nvidia_rag.ingestor_server.ingestion_state_manager import IngestionStateManager
 from nvidia_rag.ingestor_server.nvingest import (
     get_nv_ingest_client,
@@ -290,6 +288,8 @@ class NvidiaRAGIngestor:
         force_nemoretriever_parse: bool = False,
         upload_batch_id: str = "",
         source_system: str = "",
+        is_final_batch: bool = True,
+        source_uris_to_delete: list[str] | None = None,
     ) -> dict[str, Any]:
         """Upload documents to the vector store.
 
@@ -577,6 +577,8 @@ class NvidiaRAGIngestor:
                         state_manager=state_manager,
                         documents_catalog_metadata=documents_catalog_metadata,
                         vdb_auth_token=vdb_auth_token,
+                        is_final_batch=is_final_batch,
+                        source_uris_to_delete=source_uris_to_delete,
                     )
                 finally:
                     _cleanup_nemoparse_temps(_nemoparse_temp_files)
@@ -607,6 +609,8 @@ class NvidiaRAGIngestor:
         state_manager: IngestionStateManager | None = None,
         documents_catalog_metadata: list[dict[str, Any]] | None = None,
         vdb_auth_token: str = "",
+        is_final_batch: bool = True,
+        source_uris_to_delete: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Main function called by ingestor server to ingest
@@ -792,6 +796,13 @@ class NvidiaRAGIngestor:
             # Peform ingestion using nvingest for all files that have not failed
             # Check if the provided collection_name exists in vector-DB
 
+            # Pre-delete stale chunks for changed URLs (web crawl upsert).
+            # source_uris_to_delete contains URLs whose content hash changed since
+            # the last crawl; their old vector chunks must be removed before the
+            # new chunks are written so no stale content lingers in the index.
+            if source_uris_to_delete and hasattr(vdb_op, "delete_by_content_url"):
+                vdb_op.delete_by_content_url(collection_name, source_uris_to_delete)
+
             start_time = time.time()
             results, failures = await self.__run_nvingest_batched_ingestion(
                 filepaths=filepaths,
@@ -809,7 +820,7 @@ class NvidiaRAGIngestor:
                 failures=failures,
                 filepaths=filepaths,
                 state_manager=state_manager,
-                is_final_batch=True,
+                is_final_batch=is_final_batch,
                 vdb_op=vdb_op,
             )
             logger.info(
@@ -873,6 +884,36 @@ class NvidiaRAGIngestor:
                 exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
             )
             raise e
+
+    async def purge_deleted_urls(
+        self,
+        collection_name: str,
+        source_uris: list[str],
+        vdb_auth_token: str = "",
+    ) -> int:
+        """Delete all vector chunks for URLs that have been removed from the source site.
+
+        Called by the web crawler when a previously-ingested URL returns 404/410.
+        Deletes chunks from the vector index by content_url and returns the count deleted.
+        """
+        if not source_uris:
+            return 0
+        try:
+            vdb_op, _ = self.__prepare_vdb_op_and_collection_name(
+                collection_name=collection_name,
+                vdb_auth_token=vdb_auth_token,
+                bypass_validation=True,
+            )
+            if hasattr(vdb_op, "delete_by_content_url"):
+                deleted = vdb_op.delete_by_content_url(collection_name, source_uris)
+                logger.info(
+                    "purge_deleted_urls: removed %d chunks for %d deleted URL(s) from '%s'",
+                    deleted, len(source_uris), collection_name,
+                )
+                return deleted
+        except Exception as exc:
+            logger.warning("purge_deleted_urls failed: %s", exc)
+        return 0
 
     @trace_function("ingestor.main.build_ingestion_response", tracer=TRACER)
     async def __build_ingestion_response(
@@ -1906,6 +1947,7 @@ class NvidiaRAGIngestor:
                     vdb_op, "_delete_entities"
                 ):
                     # Milvus: Delete existing collection info, then insert recalculated value
+                    from pymilvus import MilvusClient  # noqa: PLC0415 — Milvus path only
                     vdb_op._delete_entities(
                         collection_name=DEFAULT_DOCUMENT_INFO_COLLECTION,
                         filter=f"info_type == 'collection' and collection_name == '{collection_name}' and document_name == 'NA'",

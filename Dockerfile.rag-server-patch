@@ -11,6 +11,10 @@ COPY src/nvidia_rag/rag_server/server.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/server.py
 COPY src/nvidia_rag/rag_server/main.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/main.py
+COPY src/nvidia_rag/rag_server/response_generator.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/response_generator.py
+COPY src/nvidia_rag/rag_server/health.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/rag_server/health.py
 COPY src/nvidia_rag/utils/configuration.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/configuration.py
 COPY src/nvidia_rag/utils/tavily_search.py \

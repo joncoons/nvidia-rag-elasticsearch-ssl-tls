@@ -333,7 +333,7 @@ class NvIngestConfig(_ConfigBase):
         description="Tokenizer model for text chunking",
     )
     chunk_size: int = Field(
-        default=1024,
+        default=2048,
         env="APP_NVINGEST_CHUNKSIZE",
         description="Maximum size of text chunks in tokens",
     )

@@ -672,6 +672,65 @@ class CrawlRequest(BaseModel):
             "unchanged since the last crawl.  Use this for a full clean re-index."
         ),
     )
+    allowed_url_prefixes: list[str] | None = Field(
+        default=None,
+        description=(
+            "When set, BFS only follows links whose URL starts with one of these "
+            "prefixes.  The start_url is always visited.  Use this to limit a crawl "
+            "on a shared domain (e.g. github.com) to specific org/repo paths.  "
+            "Example: [\"https://github.com/NVIDIA-AI-Blueprints\", "
+            "\"https://github.com/NVIDIA-NeMo/NeMo\"]"
+        ),
+    )
+    use_selenium: bool = Field(
+        default=False,
+        description=(
+            "When True, pages whose static HTML yields fewer than "
+            "``selenium_content_threshold`` visible characters are re-fetched via "
+            "headless Chromium so JavaScript-rendered content is captured before "
+            "ingestion.  Requires Selenium and Chromium in the container."
+        ),
+    )
+    selenium_content_threshold: int = Field(
+        default=300,
+        ge=50,
+        le=10000,
+        description=(
+            "Minimum visible-text characters extracted from static HTML before "
+            "Selenium rendering is triggered.  Only used when use_selenium=True.  "
+            "Default 300."
+        ),
+    )
+    selenium_screenshot_fallback: bool = Field(
+        default=False,
+        description=(
+            "When True and use_selenium=True, pages still sparse after Selenium "
+            "rendering are captured as full-page JPEG screenshots and added to the "
+            "ingest batch (routed through Nemotron-Parse when "
+            "use_nemoretriever_parse=True).  Default False."
+        ),
+    )
+    max_depth: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Maximum BFS depth from the start URL.  Depth 0 = start page only, "
+            "depth 1 = pages directly linked from start, etc.  Null = unlimited.  "
+            "Recommended: 2 for GitHub (org → repo → top-level files), "
+            "5-10 for documentation sites."
+        ),
+    )
+    blocked_url_patterns: list[str] | None = Field(
+        default=None,
+        description=(
+            "URL substrings that cause a link to be skipped entirely.  "
+            "Simple substring match against the full URL.  "
+            "Example for GitHub: [\"/stargazers\", \"/forks\", \"/commits/\", "
+            "\"/blame/\", \"/graphs/\", \"/actions\", \"/issues\", \"/pull/\", "
+            "\"/archive/\", \"/releases/tag/\", \"/compare/\", \"/network/\", "
+            "\"/pulse\", \"/security\", \"/discussions\"]"
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -861,6 +920,12 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             registry_dir=registry_dir,
             collection_name=payload.collection_name,
             use_nemoretriever_parse=payload.use_nemoretriever_parse,
+            allowed_url_prefixes=payload.allowed_url_prefixes,
+            use_selenium=payload.use_selenium,
+            selenium_content_threshold=payload.selenium_content_threshold,
+            selenium_screenshot_fallback=payload.selenium_screenshot_fallback,
+            max_depth=payload.max_depth,
+            blocked_url_patterns=payload.blocked_url_patterns,
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
             pdf_repo_dir=CONFIG.pdf_repo_dir,

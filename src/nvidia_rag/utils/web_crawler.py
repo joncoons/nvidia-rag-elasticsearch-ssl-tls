@@ -189,6 +189,41 @@ class SimpleWebCrawler:
         HTTP request timeout in seconds for each fetch (default 30).
     user_agent : str
         User-Agent header sent with every request.
+    allowed_url_prefixes : list[str] or None
+        When set, BFS only follows links whose URL starts with one of these
+        prefixes.  The start_url is always visited regardless.  Use this to
+        restrict a crawl on a shared domain (e.g. github.com) to specific
+        organisation/repository paths without crawling the whole site.
+        Example: ``["https://github.com/NVIDIA-AI-Blueprints",
+                    "https://github.com/NVIDIA-NeMo/NeMo"]``
+    use_selenium : bool
+        When True, pages whose static HTML yields fewer than
+        ``selenium_content_threshold`` visible characters are re-fetched via a
+        headless Chromium browser so that JavaScript-rendered content is
+        captured.  Requires ``selenium`` and a system ``chromium`` / Chrome
+        installation (provided by the ingestor container).  Default False.
+    selenium_content_threshold : int
+        Minimum number of visible text characters that must be extracted from
+        the static HTML before Selenium rendering is triggered.  Default 300.
+    selenium_screenshot_fallback : bool
+        When True *and* ``use_selenium=True``, pages that are still sparse
+        after Selenium rendering are captured as a full-page JPEG screenshot
+        and added to the ingest batch (so they can be routed through
+        Nemotron-Parse when ``use_nemoretriever_parse=True``).  Default False.
+    selenium_wait_timeout : int
+        Seconds Selenium waits for a page to become non-empty after navigation.
+        Default 15.
+    max_depth : int or None
+        Maximum BFS depth from the start URL.  Depth 0 is the start page,
+        depth 1 is pages linked from it, and so on.  ``None`` means unlimited.
+        Recommended values: 2 for GitHub (org → repo → top-level files),
+        5–10 for standard documentation sites.  Default ``None``.
+    blocked_url_patterns : list[str] or None
+        URL substrings that cause a link to be skipped entirely — neither
+        fetched as HTML nor collected as a binary file.  Matching is a simple
+        ``in`` check against the full URL string so partial path segments work.
+        Example for GitHub: ``["/stargazers", "/forks", "/commits/",
+        "/blame/", "/graphs/", "/actions", "/issues", "/pull/"]``
     """
 
     def __init__(
@@ -208,6 +243,13 @@ class SimpleWebCrawler:
         html_chunk_max_tokens: int = 2048,
         export_dir: str = "",
         pdf_repo_dir: str = "",
+        allowed_url_prefixes: list[str] | None = None,
+        use_selenium: bool = False,
+        selenium_content_threshold: int = 300,
+        selenium_screenshot_fallback: bool = False,
+        selenium_wait_timeout: int = 15,
+        max_depth: int | None = None,
+        blocked_url_patterns: list[str] | None = None,
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.max_pages = max_pages
@@ -223,6 +265,18 @@ class SimpleWebCrawler:
         self._html_chunk_max_tokens = html_chunk_max_tokens
         self.export_dir = export_dir
         self.pdf_repo_dir = pdf_repo_dir
+        self.allowed_url_prefixes = [p.rstrip("/") for p in allowed_url_prefixes] if allowed_url_prefixes else None
+        self.max_depth = max_depth
+        self.blocked_url_patterns = blocked_url_patterns or []
+        self.use_selenium = use_selenium
+        self._selenium_content_threshold = selenium_content_threshold
+        self._selenium_screenshot_fallback = selenium_screenshot_fallback
+        self._selenium_wait_timeout = selenium_wait_timeout
+        self._user_agent = user_agent
+        # Shared Selenium driver — created once per crawl in _crawl_sync if
+        # use_selenium=True, then reused for every JS page to avoid per-page
+        # Chrome startup cost (~5-10 s).  Quit in the crawl finally block.
+        self._selenium_driver: Any = None
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
@@ -317,21 +371,37 @@ class SimpleWebCrawler:
         # Current batch being accumulated before dispatch
         pending: list[tuple[str, dict]] = []
 
-        # In-flight ingest futures: (future, batch_number, file_count)
-        in_flight: list[tuple[ConcurrentFuture, int, int]] = []
+        # In-flight ingest futures:
+        #   (future, batch_number, file_count, urls_to_mark_ingested, uri_to_chunk_names)
+        # urls_to_mark_ingested: source_uris whose last_ingested should be set on success
+        #   (changed URLs whose last_ingested was cleared before dispatch).
+        # uri_to_chunk_names: source_uri → [dispatched file basenames] for ALL URLs in
+        #   the batch, stored in the registry so backfill scripts can reverse-map chunks
+        #   to their source URLs without a re-crawl.
+        in_flight: list[tuple[ConcurrentFuture, int, int, set[str], dict[str, list[str]]]] = []
         batch_num = 0
 
         # URL registry: loaded once at start, saved in finally
         registry: dict[str, dict] = self._load_registry()
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        # Track URLs whose content changed since the last crawl so that stale
+        # vector chunks can be deleted from ES before new chunks are written.
+        # last_ingested is cleared for these URLs before dispatch and only restored
+        # after the batch completes successfully (atomic upsert semantics).
+        changed_urls: set[str] = set()
+
+        # Track previously-ingested URLs that returned 404/410 during this crawl.
+        # Their ES chunks and registry entries are purged in the finally block.
+        deleted_urls: set[str] = set()
+
         def _harvest_done() -> None:
             """Move any completed futures out of in_flight, record results."""
             nonlocal files_ingested
-            remaining: list[tuple[ConcurrentFuture, int, int]] = []
-            for f, bnum, fcount in in_flight:
+            remaining: list[tuple[ConcurrentFuture, int, int, set[str], dict[str, list[str]]]] = []
+            for f, bnum, fcount, urls_to_mark, uri_to_chunk_names in in_flight:
                 if not f.done():
-                    remaining.append((f, bnum, fcount))
+                    remaining.append((f, bnum, fcount, urls_to_mark, uri_to_chunk_names))
                     continue
                 try:
                     result = f.result()
@@ -347,9 +417,26 @@ class SimpleWebCrawler:
                             "error": fd.get("error", "ingest failed"),
                         })
                     files_ingested += fcount - len(failed_docs)
+                    completed_iso = datetime.now(timezone.utc).isoformat()
+                    # Store chunk_doc_names for ALL URLs in this batch so a backfill
+                    # script can reverse-map chunk filenames → source URLs without
+                    # needing a force re-crawl.
+                    for uri, chunk_names in uri_to_chunk_names.items():
+                        if uri in registry:
+                            registry[uri] = {**registry[uri], "chunk_doc_names": chunk_names}
+                    # Restore last_ingested for changed URLs now that new chunks
+                    # are confirmed written to ES.
+                    for uri in urls_to_mark:
+                        if uri in registry:
+                            registry[uri] = {**registry[uri], "last_ingested": completed_iso}
+                    if uri_to_chunk_names or urls_to_mark:
+                        self._save_registry(registry)
+                        self._export_crawl_artifacts()
                     logger.info(
-                        "Ingest batch %d complete (%d files, %d failed)",
+                        "Ingest batch %d complete (%d files, %d failed, "
+                        "%d URLs chunk_doc_names stored, %d URLs re-marked ingested)",
                         bnum, fcount, len(failed_docs),
+                        len(uri_to_chunk_names), len(urls_to_mark),
                     )
                 except Exception as exc:
                     logger.error("Ingest batch %d failed: %r", bnum, exc)
@@ -373,6 +460,40 @@ class SimpleWebCrawler:
             batch_num += 1
             filepaths = [p for p, _ in batch]
             custom_metadata = [m for _, m in batch]
+            # Build source_uri → [dispatched file basenames] for registry tracking.
+            # Stored in registry after batch success so backfill scripts can
+            # reverse-map chunk doc_names → source URLs without a force re-crawl.
+            uri_to_chunk_names: dict[str, list[str]] = {}
+            for fp, m in batch:
+                uri = m.get("metadata", {}).get("source_uri", "")
+                if uri:
+                    uri_to_chunk_names.setdefault(uri, []).append(os.path.basename(fp))
+            # Collect source URIs in this batch that had stale chunks in ES
+            # (content changed since last crawl) so the ingestor can delete them first.
+            uris_to_delete = list({
+                m["metadata"]["source_uri"]
+                for _, m in batch
+                if m.get("metadata", {}).get("source_uri") in changed_urls
+            })
+            if uris_to_delete:
+                # Atomic pre-delete: clear last_ingested from registry NOW (before ES
+                # delete + re-ingest) so registry and ES stay in sync.  If the re-ingest
+                # fails, both registry and ES show the URL as not-ingested and it will
+                # be retried on the next crawl.  last_ingested is restored in
+                # _harvest_done() once the batch future resolves successfully.
+                for uri in uris_to_delete:
+                    if uri in registry:
+                        entry = dict(registry[uri])
+                        entry.pop("last_ingested", None)
+                        registry[uri] = entry
+                self._save_registry(registry)
+                self._flush_errors_to_csv(errors, error_matrix)
+                self._export_crawl_artifacts()
+                logger.info(
+                    "Batch %d: cleared last_ingested for %d changed URL(s) — "
+                    "will pre-delete stale ES chunks and restore after success",
+                    batch_num, len(uris_to_delete),
+                )
             logger.info(
                 "Dispatching ingest batch %d: %d files  [%d/%d slots used]",
                 batch_num, len(filepaths), len(in_flight), self.max_concurrent_batches,
@@ -387,11 +508,18 @@ class SimpleWebCrawler:
                     use_nemoretriever_parse=self.use_nemoretriever_parse,
                     force_nemoretriever_parse=self.force_nemoretriever_parse,
                     source_system="web_crawl",
+                    is_final_batch=False,
+                    source_uris_to_delete=uris_to_delete or None,
                 ),
                 loop,
             )
-            in_flight.append((future, batch_num, len(filepaths)))
+            in_flight.append((future, batch_num, len(filepaths), set(uris_to_delete), uri_to_chunk_names))
             total_files_dispatched += len(filepaths)
+            # Flush registry + error CSV after every batch so artifacts are
+            # up-to-date on the host-mounted dir mid-crawl.
+            self._save_registry(registry)
+            self._flush_errors_to_csv(errors, error_matrix)
+            self._export_crawl_artifacts()
 
         max_pages_display = self.max_pages if self.max_pages is not None else "unlimited"
         logger.info(
@@ -412,6 +540,11 @@ class SimpleWebCrawler:
         # Switch to crawl-optimised GPU layout (nim-llm off, max nemotron-parse replicas).
         enable_crawl_mode()
 
+        # Initialise the shared Selenium driver once for the whole crawl so that
+        # JS-heavy pages don't each pay the ~5-10 s Chrome startup cost.
+        if self.use_selenium:
+            self._selenium_driver = self._create_selenium_driver()
+
         try:
             # ── Phase 1: BFS crawl with rolling batch dispatch ───────────────
             while queue and (self.max_pages is None or pages_crawled < self.max_pages):
@@ -431,6 +564,17 @@ class SimpleWebCrawler:
                 if html_content is None:
                     if fetch_error:
                         errors.append({"url": url, **fetch_error})
+                        # Detect deleted pages: 404/410 on a previously-ingested URL.
+                        # Queue for ES chunk purge + registry removal in finally block.
+                        if fetch_error.get("status_code") in (404, 410):
+                            reg_entry = registry.get(url, {})
+                            if reg_entry.get("last_ingested"):
+                                deleted_urls.add(url)
+                                logger.info(
+                                    "Deleted URL detected (HTTP %s): %s — "
+                                    "will purge ES chunks and remove from registry",
+                                    fetch_error["status_code"], url,
+                                )
                     # Still process any links if we got a non-HTML content type
                     # (fetch_error is None for silent skips like wrong content type)
                     continue
@@ -451,6 +595,11 @@ class SimpleWebCrawler:
                     # Update last_seen but do NOT update last_ingested
                     registry[url] = {**reg_entry, "last_seen": now_iso}
                 else:
+                    # Track changed (not new) URLs so stale ES chunks can be deleted
+                    # before the new chunks are written (upsert semantics).
+                    is_changed = bool(reg_entry.get("last_ingested") and stored_hash and stored_hash != new_hash)
+                    if is_changed:
+                        changed_urls.add(url)
                     # New or changed — extract semantic elements, chunk, queue for ingest
                     base_meta = {
                         "source_uri": url,
@@ -481,22 +630,45 @@ class SimpleWebCrawler:
                                 {"filename": os.path.basename(tmp_path), "metadata": meta},
                             ))
                     else:
-                        # Fallback: no elements extracted — save raw HTML
-                        tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
-                        all_temp_files.append(tmp_path)
-                        pending.append((
-                            tmp_path,
-                            {"filename": os.path.basename(tmp_path), "metadata": base_meta},
-                        ))
-                    # Update registry entry
-                    registry[url] = {
+                        # No semantic elements extracted — try screenshot before raw HTML.
+                        # If Selenium screenshot fallback is enabled and Selenium is active,
+                        # capture a full-page JPEG so Nemotron-Parse can read visual content.
+                        screenshot_added = False
+                        if self.use_selenium and self._selenium_screenshot_fallback:
+                            ss_dir = tempfile.gettempdir()
+                            ss_path = self._capture_screenshot(url, ss_dir)
+                            if ss_path:
+                                all_temp_files.append(ss_path)
+                                pending.append((
+                                    ss_path,
+                                    {"filename": os.path.basename(ss_path), "metadata": base_meta},
+                                ))
+                                logger.info(
+                                    "Screenshot added to batch for JS-sparse page: %s", url
+                                )
+                                screenshot_added = True
+                        if not screenshot_added:
+                            # Final fallback: save raw HTML
+                            tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
+                            all_temp_files.append(tmp_path)
+                            pending.append((
+                                tmp_path,
+                                {"filename": os.path.basename(tmp_path), "metadata": base_meta},
+                            ))
+                    # Update registry entry.  For changed URLs, omit last_ingested here —
+                    # it is cleared atomically before dispatch and restored by _harvest_done
+                    # only after the new chunks are confirmed written to ES.
+                    # For new URLs, set last_ingested optimistically (no old chunks to worry about).
+                    reg_update = {
                         "last_seen": now_iso,
-                        "last_ingested": now_iso,
                         "last_modified": resp_meta.get("last_modified"),
                         "etag": resp_meta.get("etag"),
                         "content_hash": new_hash,
                         "status_code": resp_meta.get("status_code", 200),
                     }
+                    if not is_changed:
+                        reg_update["last_ingested"] = now_iso
+                    registry[url] = reg_update
                     logger.info(
                         "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
                         pages_crawled, max_pages_display, url, len(pending), len(in_flight),
@@ -504,7 +676,14 @@ class SimpleWebCrawler:
 
                 # Collect any linked binary files
                 for href in linked_urls:
+                    # Strip fragment (#...) before resolving — same-page anchors
+                    # produce duplicate registry entries otherwise (e.g. page#section).
+                    href = href.split("#")[0]
+                    if not href:
+                        continue
                     abs_href = urljoin(url, href)
+                    if self._is_blocked_url(abs_href):
+                        continue
                     if self.extract_linked_files and _is_binary_url(abs_href):
                         if abs_href not in visited_files:
                             visited_files.add(abs_href)
@@ -529,21 +708,41 @@ class SimpleWebCrawler:
                                 files_skipped += 1
                                 # Refresh last_seen
                                 registry[abs_href] = {**file_reg, "last_seen": now_iso}
-                            elif entry is not None:
+                            elif entry is None:
+                                # Fetch failed — check for 404/410 on a previously-ingested file
+                                if file_meta.get("status_code") in (404, 410) and file_reg.get("last_ingested"):
+                                    deleted_urls.add(abs_href)
+                                    logger.info(
+                                        "Deleted binary file detected (HTTP %s): %s — "
+                                        "will purge ES chunks and remove from registry",
+                                        file_meta["status_code"], abs_href,
+                                    )
+                            else:
+                                # Track re-ingested binary files for stale chunk deletion.
+                                # Omit last_ingested for changed files; it is restored by
+                                # _harvest_done after successful ingest (atomic upsert).
+                                file_is_changed = bool(file_reg.get("last_ingested"))
+                                if file_is_changed:
+                                    changed_urls.add(abs_href)
                                 pending.append(entry)
-                                registry[abs_href] = {
+                                file_reg_update = {
                                     "last_seen": now_iso,
-                                    "last_ingested": now_iso,
                                     "last_modified": file_meta.get("last_modified"),
                                     "etag": file_meta.get("etag"),
                                     "content_hash": file_meta.get("content_hash"),
                                     "status_code": file_meta.get("status_code", 200),
                                 }
+                                if not file_is_changed:
+                                    file_reg_update["last_ingested"] = now_iso
+                                registry[abs_href] = file_reg_update
                     elif (
                         not _is_binary_url(abs_href)
                         and _same_domain(abs_href, self._netloc)
+                        and self._is_allowed_url(abs_href)
+                        and not self._is_blocked_url(abs_href)
                         and abs_href not in visited_html
                         and (self.max_pages is None or pages_crawled < self.max_pages)
+                        and (self.max_depth is None or depth + 1 <= self.max_depth)
                     ):
                         queue.append((abs_href, depth + 1))
 
@@ -552,12 +751,6 @@ class SimpleWebCrawler:
                     _dispatch_batch(pending)
                     pending = []
 
-                # Periodically flush registry + error CSV to disk and export
-                # to the host-mounted dir so artifacts are visible mid-crawl.
-                if pages_crawled % 100 == 0:
-                    self._save_registry(registry)
-                    self._flush_errors_to_csv(errors, error_matrix)
-                    self._export_crawl_artifacts()
 
             # ── Phase 2: flush remainder, then drain all in-flight batches ───
             _dispatch_batch(pending)
@@ -596,6 +789,39 @@ class SimpleWebCrawler:
                     os.unlink(tp)
                 except OSError:
                     pass
+
+            # Quit the shared Selenium driver if one was created.
+            if self._selenium_driver is not None:
+                try:
+                    self._selenium_driver.quit()
+                except Exception:
+                    pass
+                self._selenium_driver = None
+
+            # Purge ES chunks + registry entries for URLs that returned 404/410.
+            if deleted_urls:
+                logger.info(
+                    "Purging %d deleted URL(s) from ES and registry...", len(deleted_urls)
+                )
+                try:
+                    purge_future = asyncio.run_coroutine_threadsafe(
+                        ingestor.purge_deleted_urls(
+                            collection_name=collection_name,
+                            source_uris=list(deleted_urls),
+                            vdb_auth_token=vdb_auth_token,
+                        ),
+                        loop,
+                    )
+                    purge_future.result(timeout=120)
+                except Exception as exc:
+                    logger.warning("ES purge of deleted URLs failed: %s", exc)
+                # Remove deleted URLs from registry regardless of ES purge outcome.
+                for uri in deleted_urls:
+                    registry.pop(uri, None)
+                logger.info(
+                    "Removed %d deleted URL(s) from registry", len(deleted_urls)
+                )
+
             # Always persist the updated registry + error CSV and export
             # artifacts — even on interrupt/SIGTERM.
             self._save_registry(registry)
@@ -625,28 +851,52 @@ class SimpleWebCrawler:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _domain_slug(self) -> str:
-        """Return a filesystem-safe slug prefixed by collection name (when set).
+    def _collection_slug(self) -> str:
+        """Return a filesystem-safe slug based on collection name.
 
-        Format: ``{collection_name}_{domain}`` or just ``{domain}`` if no
-        collection name was given.  Domain processing: strips ``www.`` prefix,
-        drops port, replaces ``.`` and ``-`` with ``_``.
+        Uses the collection name when set, otherwise falls back to the domain.
+        Replaces ``.`` and ``-`` with ``_``.
 
         Examples:
-            collection=``nvidia``, domain=``www.nvidia.com`` → ``nvidia_nvidia_com``
+            collection=``nvidia``, domain=``www.nvidia.com`` → ``nvidia``
             collection=`""``,      domain=``www.nvidia.com`` → ``nvidia_com``
         """
+        if self.collection_name:
+            return self.collection_name.replace(".", "_").replace("-", "_")
         netloc = self._netloc.split(":")[0]
         if netloc.startswith("www."):
             netloc = netloc[4:]
-        domain = netloc.replace(".", "_").replace("-", "_")
-        if self.collection_name:
-            coll = self.collection_name.replace(".", "_").replace("-", "_")
-            return f"{coll}_{domain}"
-        return domain
+        return netloc.replace(".", "_").replace("-", "_")
 
     def _registry_path(self) -> str:
-        return os.path.join(self.registry_dir, f"{self._domain_slug()}_url_registry.json")
+        return os.path.join(self.registry_dir, f"{self._collection_slug()}_url_registry.json")
+
+    def _is_blocked_url(self, url: str) -> bool:
+        """Return True if *url* contains any of the ``blocked_url_patterns`` substrings.
+
+        Matching is a simple ``in`` check so partial path segments work, e.g.
+        ``"/stargazers"`` blocks ``https://github.com/org/repo/stargazers``.
+        """
+        return any(pat in url for pat in self.blocked_url_patterns)
+
+    def _is_allowed_url(self, url: str) -> bool:
+        """Return True if *url* passes the ``allowed_url_prefixes`` filter.
+
+        When ``allowed_url_prefixes`` is ``None`` (the default), every URL on
+        the same domain is allowed.  When a prefix list is set, only URLs that
+        start with at least one listed prefix are queued for crawling.
+
+        The start_url itself is always visited regardless of this filter.
+        """
+        if not self.allowed_url_prefixes:
+            return True
+        for prefix in self.allowed_url_prefixes:
+            # Exact match OR URL continues with '/', '?', or '#' after the prefix
+            # so that "github.com/nvidia" does not match "github.com/nvidia-cosmos".
+            if url == prefix or url.startswith(prefix + "/") \
+                    or url.startswith(prefix + "?") or url.startswith(prefix + "#"):
+                return True
+        return False
 
     @staticmethod
     def cleanup_crawl_artifacts(
@@ -665,8 +915,8 @@ class SimpleWebCrawler:
 
         coll = collection_name.replace(".", "_").replace("-", "_")
         patterns = [
-            os.path.join(registry_dir, f"{coll}_*_url_registry.json"),
-            os.path.join(registry_dir, f"{coll}_*_error_matrix.csv"),
+            os.path.join(registry_dir, f"{coll}_url_registry.json"),
+            os.path.join(registry_dir, f"{coll}_error_matrix.csv"),
         ]
         removed: list[str] = []
         for pattern in patterns:
@@ -768,6 +1018,19 @@ class SimpleWebCrawler:
                 "error": str(exc),
             }, empty_meta
 
+        # ── Selenium JS-rendering fallback ───────────────────────────────────
+        # If the static HTML is sparse (JS-rendered SPA) and Selenium is
+        # enabled, re-fetch with headless Chromium so BS4 sees rendered content.
+        if self.use_selenium and self._is_js_sparse(html_text):
+            logger.info("Static HTML sparse — retrying with Selenium: %s", url)
+            rendered_html = self._render_with_selenium(url)
+            if rendered_html:
+                html_text = rendered_html
+                resp_meta["content_hash"] = _sha256(html_text.encode("utf-8"))
+                logger.debug("Selenium rendered %d chars for %s", len(html_text), url)
+            else:
+                logger.warning("Selenium render failed for %s — using static HTML", url)
+
         try:
             soup = BeautifulSoup(html_text, "html.parser")
             title = (soup.title.string or "").strip() if soup.title else ""
@@ -790,6 +1053,150 @@ class SimpleWebCrawler:
             }, resp_meta
 
         return html_text, title, meta_desc, section_h1, hrefs, None, resp_meta
+
+    def _create_selenium_driver(self) -> Any:
+        """Create and return a configured headless Chromium WebDriver.
+
+        Called once per crawl when ``use_selenium=True``.  The driver is
+        stored on ``self._selenium_driver`` and reused across all JS pages so
+        that the ~5-10 s Chrome startup cost is paid only once.
+
+        Chrome binary is resolved from the environment variable
+        ``CHROMIUM_BIN`` (default: ``/usr/bin/chromium``).  A per-crawl
+        user-data-dir is created in a temp directory to prevent profile lock
+        issues on restart.
+        """
+        try:
+            from selenium import webdriver  # noqa: PLC0415
+            from selenium.webdriver.chrome.options import Options  # noqa: PLC0415
+        except ImportError:
+            logger.warning("selenium is not installed; use_selenium has no effect")
+            return None
+
+        # Google Chrome stable (Ubuntu 22.04 base image); override with CHROMIUM_BIN if needed.
+        chromium_bin = os.environ.get("CHROMIUM_BIN", "/usr/bin/google-chrome-stable")
+        if not os.path.exists(chromium_bin):
+            chromium_bin = "/usr/bin/google-chrome"  # fallback symlink
+        user_data_dir = tempfile.mkdtemp(prefix="crawler-chrome-")
+
+        opts = Options()
+        opts.binary_location = chromium_bin
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(f"--user-data-dir={user_data_dir}")
+        opts.add_argument(f"--user-agent={self._user_agent}")
+
+        try:
+            driver = webdriver.Chrome(options=opts)
+            driver.implicitly_wait(2)
+            driver.set_page_load_timeout(self._selenium_wait_timeout + 10)
+            logger.info("Selenium shared driver initialised (chromium: %s)", chromium_bin)
+            return driver
+        except Exception as exc:
+            logger.warning("Failed to start Selenium driver: %s", exc)
+            return None
+
+    def _is_js_sparse(self, html_text: str) -> bool:
+        """Return True if *html_text* likely needs JS rendering.
+
+        Two independent heuristics (either one triggers):
+        1. Visible text (scripts/styles stripped) is below the configured
+           threshold — classic SPA shell with minimal server-side content.
+        2. Body contains script/noscript tags but has very few real elements
+           (≤ 4 total tags) — the ``<div id="root"></div>`` SPA pattern.
+        """
+        try:
+            from bs4 import BeautifulSoup  # noqa: PLC0415
+            soup = BeautifulSoup(html_text, "html.parser")
+            # Heuristic 2: SPA root pattern — script-heavy body with almost no elements
+            if soup.body:
+                has_js_tags = bool(soup.body.find_all(["script", "noscript"]))
+                total_elements = len(soup.body.find_all(True))
+                if has_js_tags and total_elements <= 4:
+                    return True
+            # Heuristic 1: thin visible text after stripping noise tags
+            for tag in soup(["script", "style", "noscript", "head"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ", strip=True)
+            return len(text) < self._selenium_content_threshold
+        except Exception:
+            return False
+
+    def _render_with_selenium(self, url: str) -> str | None:
+        """Navigate the shared Selenium driver to *url* and return rendered HTML.
+
+        Reuses ``self._selenium_driver`` (created once per crawl) so Chrome
+        startup cost is not paid per page.  Returns None on failure.
+        """
+        driver = self._selenium_driver
+        if driver is None:
+            return None
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait  # noqa: PLC0415
+            driver.get(url)
+            try:
+                WebDriverWait(driver, self._selenium_wait_timeout).until(
+                    lambda d: len(d.find_element("tag name", "body").text.strip()) > 100
+                )
+            except Exception:
+                pass  # Timeout non-fatal — use whatever the page has rendered so far
+            return driver.page_source
+        except Exception as exc:
+            logger.warning("Selenium render error for %s: %s", url, exc)
+            return None
+
+    def _capture_screenshot(self, url: str, dest_dir: str) -> str | None:
+        """Capture a full-page JPEG screenshot of *url* via the shared driver.
+
+        Resizes the window to the full ``scrollWidth × scrollHeight`` of the
+        page (matching the original training-data crawler approach) before
+        capturing so the entire page is visible in one shot.
+
+        Saves as JPEG to *dest_dir* and returns the path, or None on failure.
+        """
+        driver = self._selenium_driver
+        if driver is None:
+            return None
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait  # noqa: PLC0415
+            driver.get(url)
+            try:
+                WebDriverWait(driver, self._selenium_wait_timeout).until(
+                    lambda d: len(d.find_element("tag name", "body").text.strip()) > 50
+                )
+            except Exception:
+                pass
+            # Measure full page dimensions (body vs documentElement — take the max)
+            width = driver.execute_script(
+                "return Math.max(document.body.scrollWidth, "
+                "document.documentElement.scrollWidth);"
+            )
+            height = driver.execute_script(
+                "return Math.max(document.body.scrollHeight, "
+                "document.documentElement.scrollHeight);"
+            )
+            driver.set_window_size(width, min(height, 16000))
+            time.sleep(2)  # allow any resize-triggered reflows to settle
+            png_data = driver.get_screenshot_as_png()
+        except Exception as exc:
+            logger.warning("Screenshot capture error for %s: %s", url, exc)
+            return None
+
+        try:
+            from PIL import Image  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            img = Image.open(io.BytesIO(png_data)).convert("RGB")
+            safe_name = hashlib.sha256(url.encode()).hexdigest()[:16]
+            jpg_path = os.path.join(dest_dir, f"screenshot_{safe_name}.jpg")
+            img.save(jpg_path, "JPEG", quality=85)
+            logger.info("Screenshot saved (%dx%d) → %s  [%s]", width, height, jpg_path, url)
+            return jpg_path
+        except Exception as exc:
+            logger.warning("Failed to convert screenshot to JPEG for %s: %s", url, exc)
+            return None
 
     def _collect_binary_file(
         self,
@@ -863,7 +1270,7 @@ class SimpleWebCrawler:
                 "status_code": status_code,
                 "error": str(exc),
             })
-            return None, empty_meta
+            return None, {"status_code": status_code}
         except Exception as exc:
             logger.warning("Failed to download binary file %s: %s", url, exc)
             errors.append({
@@ -949,7 +1356,7 @@ class SimpleWebCrawler:
         One row per error entry across all categories.  Existing file is
         overwritten.  Silently skips if the output directory is not writable.
         """
-        csv_path = os.path.join(self.registry_dir, f"{self._domain_slug()}_error_matrix.csv")
+        csv_path = os.path.join(self.registry_dir, f"{self._collection_slug()}_error_matrix.csv")
         total_errors = sum(len(v) for v in error_matrix.values())
         try:
             os.makedirs(self.registry_dir, exist_ok=True)
@@ -985,7 +1392,7 @@ class SimpleWebCrawler:
         if not self.export_dir:
             return
         import shutil
-        slug = self._domain_slug()
+        slug = self._collection_slug()
         sources = [
             os.path.join(self.registry_dir, f"{slug}_url_registry.json"),
             os.path.join(self.registry_dir, f"{slug}_error_matrix.csv"),

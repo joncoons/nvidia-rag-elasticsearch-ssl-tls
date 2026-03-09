@@ -1,17 +1,33 @@
 FROM nvcr.io/nvidia/blueprint/ingestor-server:2.4.0
 
-# Install poppler-utils — system dependency for pdf2image (provides pdftoppm).
-# Required by DocumentClassifierRouter to rasterise PDF pages for nemoretriever-parse
-# Pass 1 (detection_only) image-based classification.
-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+# Install system dependencies.
+# poppler-utils — pdftoppm for pdf2image (nemoretriever-parse PDF rasterisation).
+# Google Chrome stable — headless browser for Selenium JS-page rendering.
+#   Ubuntu 22.04 removed the 'chromium' apt package (snap-only); use Google's repo instead.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      poppler-utils curl gnupg \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+       | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+       http://dl.google.com/linux/chrome/deb/ stable main" \
+       > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages.
-# beautifulsoup4 — used by SimpleWebCrawler for HTML parsing.
+# beautifulsoup4 — HTML parsing for SimpleWebCrawler.
 # pdf2image      — rasterises PDF pages to PIL images for nemoretriever-parse classifier.
+# selenium       — headless Chrome automation for JS-rendered pages (use_selenium crawl opt).
+# Pillow         — screenshot JPEG conversion for selenium_screenshot_fallback path.
 COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /tmp/uv
 RUN /tmp/uv pip install --python /workspace/.venv/bin/python \
-      --no-cache beautifulsoup4 pdf2image lxml kubernetes && rm /tmp/uv
+      --no-cache beautifulsoup4 pdf2image lxml kubernetes selenium Pillow && rm /tmp/uv
+
+# Pre-download the matching chromedriver via Selenium Manager so there is no
+# runtime download when the pod starts.  The binary is cached under /root/.cache/selenium/.
+RUN find /workspace/.venv -name "selenium-manager" -executable 2>/dev/null \
+    | head -1 | xargs -I{} {} --browser chrome --output json || true
 
 # Overlay changed source files onto the installed package
 COPY src/nvidia_rag/ingestor_server/server.py \
@@ -20,6 +36,8 @@ COPY src/nvidia_rag/ingestor_server/main.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/ingestor_server/main.py
 COPY src/nvidia_rag/ingestor_server/document_classifier_router.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/ingestor_server/document_classifier_router.py
+COPY src/nvidia_rag/ingestor_server/health.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/ingestor_server/health.py
 COPY src/nvidia_rag/utils/configuration.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/configuration.py
 COPY src/nvidia_rag/utils/metadata_validation.py \
@@ -30,3 +48,5 @@ COPY src/nvidia_rag/utils/k8s_scaler.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/k8s_scaler.py
 COPY src/nvidia_rag/utils/xml_preprocessor.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/xml_preprocessor.py
+COPY src/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py

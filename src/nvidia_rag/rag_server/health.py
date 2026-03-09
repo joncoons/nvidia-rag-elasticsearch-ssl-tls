@@ -29,7 +29,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
-from pymilvus import connections, utility
 
 from nvidia_rag.utils.configuration import NvidiaRAGConfig
 from nvidia_rag.utils.health_models import (
