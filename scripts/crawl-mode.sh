@@ -45,6 +45,17 @@ wait_down() {
     echo "  WARNING: timeout waiting for ${1} to scale down — proceeding anyway"
 }
 
+wait_scheduled() {
+    echo "  → waiting for ${NAMESPACE}/${1} pod to be scheduled (GPU slot claimed)..."
+    for _ in $(seq 1 40); do
+        phase=$(kubectl get pods -n "${NAMESPACE}" -l "app=${1}" \
+                  -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+        [ "${phase}" = "Running" ] && return
+        sleep 5
+    done
+    echo "  WARNING: ${1} not yet Running — GPU0 slot may not be claimed; proceeding anyway"
+}
+
 case "${1:-disable}" in
     enable|on)
         echo "Enabling crawl mode..."
@@ -64,6 +75,9 @@ case "${1:-disable}" in
             NIM_MODEL_PROFILE="${NIM_LLM_PROFILE}"
         # Step 3: nim-llm lands on first available GPU (first-fit)
         scale nim-llm 1
+        # Step 3a: wait for nim-llm pod to reach Running phase (GPU0 slot claimed)
+        #           before filling remaining slots — prevents placeholder racing nim-llm
+        wait_scheduled nim-llm
         # Step 4: fill remaining GPU0 slots so nemotron-parse is forced to GPU1
         scale gpu0-placeholder "${PLACEHOLDER_REPLICAS}"
         # Step 5: single nemotron-parse instance on GPU1
