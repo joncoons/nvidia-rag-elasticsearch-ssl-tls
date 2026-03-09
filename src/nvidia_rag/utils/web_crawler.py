@@ -724,9 +724,18 @@ class SimpleWebCrawler:
                                     )
                             else:
                                 # Track re-ingested binary files for stale chunk deletion.
-                                # Omit last_ingested for changed files; it is restored by
-                                # _harvest_done after successful ingest (atomic upsert).
-                                file_is_changed = bool(file_reg.get("last_ingested"))
+                                # Only treat as changed if the content hash actually differs
+                                # (same logic as HTML pages). Without this guard every
+                                # previously-ingested PDF would trigger a delete+re-ingest
+                                # on every crawl pass, inflating ES deleted-doc counts.
+                                # Falls back to re-ingest (no delete) when either hash is
+                                # absent — safe default.
+                                file_is_changed = bool(
+                                    file_reg.get("last_ingested")
+                                    and file_reg.get("content_hash")
+                                    and file_meta.get("content_hash")
+                                    and file_reg["content_hash"] != file_meta["content_hash"]
+                                )
                                 if file_is_changed:
                                     changed_urls.add(abs_href)
                                 pending.append(entry)
