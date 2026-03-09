@@ -173,6 +173,24 @@ export const WebCrawlSection = () => {
 
       <Stack gap="density-sm">
         <Text kind="body/regular/sm" style={{ color: 'white' }}>
+          Batch ingest size
+        </Text>
+        <TextInput
+          type="number"
+          value={String(crawlConfig.batchIngestSize)}
+          onValueChange={(val: string) =>
+            setCrawlConfig({ batchIngestSize: Math.max(1, Math.min(500, Number(val) || 20)) })
+          }
+          disabled={isCrawling}
+          style={{ width: '120px' }}
+        />
+        <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+          Files accumulated before dispatching an ingest batch (1–500). Smaller = more parallelism; larger = less overhead.
+        </Text>
+      </Stack>
+
+      <Stack gap="density-sm">
+        <Text kind="body/regular/sm" style={{ color: 'white' }}>
           URL prefix filter
         </Text>
         <TextInput

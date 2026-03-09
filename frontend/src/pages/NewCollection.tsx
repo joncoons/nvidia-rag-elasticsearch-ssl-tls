@@ -297,6 +297,20 @@ function WebCrawlPanel() {
           </FormField>
 
           <FormField
+            slotLabel="Batch ingest size"
+            slotHelp="Files accumulated before dispatching an ingest batch (1–500). Smaller = more parallelism; larger = less overhead. Default is 20."
+          >
+            <TextInput
+              type="number"
+              value={String(crawlConfig.batchIngestSize)}
+              onValueChange={(val: string) =>
+                setCrawlConfig({ batchIngestSize: Math.max(1, Math.min(500, Number(val) || 20)) })
+              }
+              style={{ width: '120px' }}
+            />
+          </FormField>
+
+          <FormField
             slotLabel="URL prefix filter"
             slotHelp="Restrict crawl to URLs starting with these prefixes (comma-separated). Leave blank to auto-derive from start URL path, or allow the full domain if the start URL has no path."
           >
