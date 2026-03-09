@@ -1406,6 +1406,8 @@ class SimpleWebCrawler:
             if not os.path.exists(src):
                 continue
             dst = os.path.join(self.export_dir, os.path.basename(src))
+            if os.path.abspath(src) == os.path.abspath(dst):
+                continue
             try:
                 shutil.copy2(src, dst)
                 logger.info("Exported crawl artifact: %s → %s", src, dst)
