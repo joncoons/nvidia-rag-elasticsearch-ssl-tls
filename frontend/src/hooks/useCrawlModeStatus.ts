@@ -17,8 +17,12 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 
 export interface CrawlModeStatus {
   active: boolean;
+  /** nim-llm desired > 0 but ready_replicas < spec — warming up after crawl exit */
+  restoring: boolean;
   nim_llm_replicas: number;
+  nim_llm_ready_replicas: number;
   nemotron_parse_replicas: number;
+  nemotron_parse_ready_replicas: number;
 }
 
 async function fetchCrawlModeStatus(): Promise<CrawlModeStatus> {
@@ -33,24 +37,34 @@ async function postExitCrawlMode(): Promise<void> {
 }
 
 /**
- * Polls /api/crawl-mode/status every 15 s to detect whether nim-llm is offline.
- * Returns the raw status and a boolean `isCrawlMode`.
+ * Polls /api/crawl-mode/status.
+ * Polls every 10 s when idle; tightens to 5 s when active or restoring
+ * so the guard responds quickly to the nim-llm ready transition.
  */
 export function useCrawlModeStatus() {
   return useQuery<CrawlModeStatus>({
     queryKey: ["crawl-mode-status"],
     queryFn: fetchCrawlModeStatus,
-    refetchInterval: 15_000,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return 10_000;
+      return (data.active || data.restoring) ? 5_000 : 15_000;
+    },
     refetchIntervalInBackground: true,
-    // Don't treat a failure as an error — k8s may be unavailable in dev
     retry: false,
-    // Default to "not in crawl mode" while loading / on error
-    placeholderData: { active: false, nim_llm_replicas: 1, nemotron_parse_replicas: 1 },
+    placeholderData: {
+      active: false,
+      restoring: false,
+      nim_llm_replicas: 1,
+      nim_llm_ready_replicas: 1,
+      nemotron_parse_replicas: 1,
+      nemotron_parse_ready_replicas: 1,
+    },
   });
 }
 
 /**
- * Mutation that calls POST /api/crawl-mode/exit and then refetches the status.
+ * Mutation that calls POST /api/crawl-mode/exit.
  */
 export function useExitCrawlMode() {
   return useMutation({

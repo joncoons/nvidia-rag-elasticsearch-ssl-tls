@@ -569,6 +569,19 @@ class SimpleWebCrawler:
         # Switch to crawl-optimised GPU layout (nim-llm off, max nemotron-parse replicas).
         enable_crawl_mode()
 
+        # Seed progress entry immediately so the frontend sees the task the moment
+        # crawling begins, before any pages are counted.
+        if self.task_id:
+            _CRAWL_PROGRESS[self.task_id] = {
+                "task_type": "crawl",
+                "start_url": self.start_url,
+                "collection_name": self.collection_name,
+                "pages_crawled": 0,
+                "pages_queued": len(queue),
+                "pages_skipped": 0,
+                "files_dispatched": 0,
+            }
+
         # Initialise the shared Selenium driver once for the whole crawl so that
         # JS-heavy pages don't each pay the ~5-10 s Chrome startup cost.
         if self.use_selenium:
@@ -610,8 +623,8 @@ class SimpleWebCrawler:
 
                 pages_crawled += 1
 
-                # Publish live progress every 25 pages for frontend polling.
-                if self.task_id and pages_crawled % 25 == 0:
+                # Publish live progress every 5 pages for frontend polling.
+                if self.task_id and pages_crawled % 5 == 0:
                     _CRAWL_PROGRESS[self.task_id] = {
                         "task_type": "crawl",
                         "start_url": self.start_url,

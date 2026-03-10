@@ -1008,24 +1008,41 @@ async def get_task_status(task_id: str):
     tags=["Ingestion APIs"],
 )
 async def get_crawl_mode_status():
-    """Return current GPU layout — whether nim-llm is scaled down (crawl mode active)."""
+    """Return current GPU layout including ready replica counts for readiness gating."""
     try:
         from nvidia_rag.utils.k8s_scaler import _get_apps_v1, _NAMESPACE
         apps_v1 = _get_apps_v1()
         if apps_v1 is None:
-            return {"active": False, "nim_llm_replicas": -1, "nemotron_parse_replicas": -1}
+            return {
+                "active": False, "restoring": False,
+                "nim_llm_replicas": -1, "nim_llm_ready_replicas": -1,
+                "nemotron_parse_replicas": -1, "nemotron_parse_ready_replicas": -1,
+            }
         nim_llm = apps_v1.read_namespaced_deployment("nim-llm", _NAMESPACE)
         parse = apps_v1.read_namespaced_deployment("nemotron-parse-v12", _NAMESPACE)
         nim_llm_spec = nim_llm.spec.replicas or 0
+        nim_llm_ready = nim_llm.status.ready_replicas or 0
         parse_spec = parse.spec.replicas or 0
+        parse_ready = parse.status.ready_replicas or 0
+        # active = nim-llm intentionally scaled to 0 (crawl mode)
+        # restoring = nim-llm desired > 0 but not yet ready (warming up)
+        active = nim_llm_spec == 0
+        restoring = (not active) and nim_llm_ready < nim_llm_spec
         return {
-            "active": nim_llm_spec == 0,
+            "active": active,
+            "restoring": restoring,
             "nim_llm_replicas": nim_llm_spec,
+            "nim_llm_ready_replicas": nim_llm_ready,
             "nemotron_parse_replicas": parse_spec,
+            "nemotron_parse_ready_replicas": parse_ready,
         }
     except Exception as exc:
         logger.warning("crawl-mode/status: k8s unavailable: %r", exc)
-        return {"active": False, "nim_llm_replicas": -1, "nemotron_parse_replicas": -1}
+        return {
+            "active": False, "restoring": False,
+            "nim_llm_replicas": -1, "nim_llm_ready_replicas": -1,
+            "nemotron_parse_replicas": -1, "nemotron_parse_ready_replicas": -1,
+        }
 
 
 @app.post(

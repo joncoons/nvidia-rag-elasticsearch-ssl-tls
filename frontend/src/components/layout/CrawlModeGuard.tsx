@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, type JSX } from "react";
 import { Stack, Flex, Text, Button, ProgressBar, Spinner } from "@kui/react";
-import { Globe, Cpu, FolderOpen } from "lucide-react";
+import { Globe, Cpu, FolderOpen, CheckCircle } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { useCrawlModeStatus, useExitCrawlMode } from "../../hooks/useCrawlModeStatus";
@@ -27,20 +27,23 @@ interface CrawlModeGuardProps {
 }
 
 /**
- * Blocks the Chat UI while nim-llm is offline (crawl mode active).
+ * Blocks the Chat UI while nim-llm is offline (crawl mode) or warming up (restoring).
  *
- * Shows live crawl progress from pending crawl task notifications.
- * Auto-exits crawl mode once all pending crawl tasks finish.
+ * Phase 1 — active:    nim-llm=0, crawl in progress. Shows live progress.
+ * Phase 2 — restoring: nim-llm scaling up, not yet ready. Shows warm-up status.
+ * Phase 3 — ready:     nim-llm ready_replicas >= spec. Guard disappears, chat accessible.
  */
 export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
-  const { data: crawlModeStatus } = useCrawlModeStatus();
+  const { data: status } = useCrawlModeStatus();
   const exitCrawlMode = useExitCrawlMode();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { notifications } = useNotificationStore();
   const autoExitFiredRef = useRef(false);
-  const navigate = useNavigate();
 
-  const isCrawlMode = crawlModeStatus?.active ?? false;
+  const isCrawlMode = status?.active ?? false;
+  const isRestoring = status?.restoring ?? false;
+  const shouldBlock = isCrawlMode || isRestoring;
 
   // Crawl task notifications
   const crawlTasks = notifications.filter(
@@ -59,13 +62,12 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
         },
       });
     }
-    // Reset flag when a new crawl starts
     if (!allCrawlsDone) {
       autoExitFiredRef.current = false;
     }
   }, [isCrawlMode, allCrawlsDone, exitCrawlMode, queryClient]);
 
-  if (!isCrawlMode) {
+  if (!shouldBlock) {
     return <>{children}</>;
   }
 
@@ -89,113 +91,169 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
     }}>
       <Stack gap="density-xl" style={{ maxWidth: '640px', width: '100%' }}>
 
-        {/* Header */}
-        <Flex align="center" gap="density-md">
-          <Globe size={32} style={{ color: 'var(--color-brand-400)' }} />
-          <Stack gap="density-xs">
-            <Text kind="body/bold/2xl">Crawl Mode Active</Text>
-            <Text kind="body/regular/sm" style={{ color: 'var(--text-color-subtle)' }}>
-              Chat is unavailable while nim-llm is offline. GPU resources are allocated
-              to Nemotron-Parse for maximum crawl throughput.
-            </Text>
-          </Stack>
-        </Flex>
-
-        {/* Active crawl tasks */}
-        {pendingCrawlTasks.length > 0 && (
-          <Stack gap="density-md"
-            style={{
-              background: 'var(--background-color-surface-raised)',
-              borderRadius: '8px',
-              padding: '16px',
-              border: '1px solid var(--border-color-subtle)',
-            }}
-          >
-            <Text kind="body/semibold/sm">Active Crawl Tasks</Text>
-            {pendingCrawlTasks.map(n => {
-              const { pages_crawled = 0, pages_queued = 0, pages_skipped = 0 } = n.task.result || {};
-              const startUrl = n.task.start_url || n.task.documents?.[0]?.replace('Web crawl: ', '') || '';
-              return (
-                <Stack key={n.id} gap="density-xs">
-                  <Flex align="center" gap="density-sm">
-                    <Spinner size="small" aria-label="Crawling" />
-                    <Stack gap="0">
-                      <Text kind="body/semibold/xs">{n.task.collection_name}</Text>
-                      <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)', wordBreak: 'break-all' }}>
-                        {startUrl}
-                      </Text>
-                    </Stack>
-                  </Flex>
-                  <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
-                    {pages_crawled > 0
-                      ? `${pages_crawled} pages crawled · ${pages_skipped} unchanged · ~${pages_queued} queued`
-                      : 'Starting crawl…'}
-                  </Text>
-                  <ProgressBar kind="indeterminate" aria-label="Crawl in progress" />
-                </Stack>
-              );
-            })}
-          </Stack>
-        )}
-
-        {/* All done — waiting for exit */}
-        {allCrawlsDone && (
-          <Flex align="center" gap="density-sm"
-            style={{
-              background: 'var(--background-color-surface-raised)',
-              borderRadius: '8px',
-              padding: '16px',
-              border: '1px solid var(--border-color-subtle)',
-            }}
-          >
-            <Cpu size={20} style={{ color: 'var(--color-success-400)' }} />
-            <Stack gap="density-xs">
-              <Text kind="body/semibold/sm">Crawl complete — restoring inference mode</Text>
-              <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
-                Scaling nim-llm back up. Chat will become available in a few minutes.
-              </Text>
-            </Stack>
-          </Flex>
-        )}
-
-        {/* nim-llm loading indicator */}
-        {crawlModeStatus && crawlModeStatus.nim_llm_replicas === 0 && (
-          <Flex align="center" gap="density-sm" style={{ color: 'var(--text-color-subtle)' }}>
-            <Cpu size={16} />
-            <Text kind="body/regular/xs">
-              nim-llm: offline &nbsp;·&nbsp; nemotron-parse: {crawlModeStatus.nemotron_parse_replicas} replica{crawlModeStatus.nemotron_parse_replicas !== 1 ? 's' : ''}
-            </Text>
-          </Flex>
-        )}
-
-        {/* Navigation + exit */}
-        <Flex justify="between" align="center">
-          <Button
-            kind="tertiary"
-            size="medium"
-            onClick={() => navigate('/collections/new')}
-          >
-            <Flex align="center" gap="density-sm">
-              <FolderOpen size={16} />
-              Manage Collections
+        {/* ── Phase 1: Crawl active ── */}
+        {isCrawlMode && (
+          <>
+            <Flex align="center" gap="density-md">
+              <Globe size={32} style={{ color: 'var(--color-brand-400)' }} />
+              <Stack gap="density-xs">
+                <Text kind="body/bold/2xl">Crawl Mode Active</Text>
+                <Text kind="body/regular/sm" style={{ color: 'var(--text-color-subtle)' }}>
+                  Chat is unavailable while nim-llm is offline. GPU resources are
+                  allocated to Nemotron-Parse for maximum crawl throughput.
+                </Text>
+              </Stack>
             </Flex>
-          </Button>
-          <Button
-            kind="secondary"
-            size="medium"
-            onClick={handleManualExit}
-            disabled={exitCrawlMode.isPending}
-          >
-            {exitCrawlMode.isPending ? (
-              <Flex align="center" gap="density-sm">
-                <Spinner size="small" aria-label="Exiting" />
-                Restoring inference mode…
-              </Flex>
-            ) : (
-              'Exit Crawl Mode'
+
+            {/* Active crawl task progress */}
+            {pendingCrawlTasks.length > 0 && (
+              <Stack gap="density-md" style={{
+                background: 'var(--background-color-surface-raised)',
+                borderRadius: '8px',
+                padding: '16px',
+                border: '1px solid var(--border-color-subtle)',
+              }}>
+                <Text kind="body/semibold/sm">Active Crawl Tasks</Text>
+                {pendingCrawlTasks.map(n => {
+                  const { pages_crawled = 0, pages_queued = 0, pages_skipped = 0 } = n.task.result || {};
+                  const startUrl = n.task.start_url || n.task.documents?.[0]?.replace('Web crawl: ', '') || '';
+                  return (
+                    <Stack key={n.id} gap="density-xs">
+                      <Flex align="center" gap="density-sm">
+                        <Spinner size="small" aria-label="Crawling" />
+                        <Stack gap="0">
+                          <Text kind="body/semibold/xs">{n.task.collection_name}</Text>
+                          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)', wordBreak: 'break-all' }}>
+                            {startUrl}
+                          </Text>
+                        </Stack>
+                      </Flex>
+                      <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+                        {pages_crawled > 0
+                          ? `${pages_crawled} pages crawled · ${pages_skipped} unchanged · ~${pages_queued} queued`
+                          : 'Starting crawl…'}
+                      </Text>
+                      <ProgressBar kind="indeterminate" aria-label="Crawl in progress" />
+                    </Stack>
+                  );
+                })}
+              </Stack>
             )}
-          </Button>
-        </Flex>
+
+            {/* All crawl tasks done — waiting for exit to fire */}
+            {allCrawlsDone && (
+              <Flex align="center" gap="density-sm" style={{
+                background: 'var(--background-color-surface-raised)',
+                borderRadius: '8px',
+                padding: '16px',
+                border: '1px solid var(--border-color-subtle)',
+              }}>
+                <Spinner size="small" aria-label="Restoring" />
+                <Text kind="body/regular/sm">
+                  Crawl complete — initiating inference mode restore…
+                </Text>
+              </Flex>
+            )}
+
+            {/* GPU state indicator */}
+            {status && status.nim_llm_replicas === 0 && (
+              <Flex align="center" gap="density-sm" style={{ color: 'var(--text-color-subtle)' }}>
+                <Cpu size={16} />
+                <Text kind="body/regular/xs">
+                  nim-llm: offline &nbsp;·&nbsp; nemotron-parse: {status.nemotron_parse_replicas} replica{status.nemotron_parse_replicas !== 1 ? 's' : ''}
+                </Text>
+              </Flex>
+            )}
+
+            <Flex justify="between" align="center">
+              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections/new')}>
+                <Flex align="center" gap="density-sm">
+                  <FolderOpen size={16} />
+                  Manage Collections
+                </Flex>
+              </Button>
+              <Button
+                kind="secondary"
+                size="medium"
+                onClick={handleManualExit}
+                disabled={exitCrawlMode.isPending}
+              >
+                {exitCrawlMode.isPending ? (
+                  <Flex align="center" gap="density-sm">
+                    <Spinner size="small" aria-label="Exiting" />
+                    Restoring…
+                  </Flex>
+                ) : 'Exit Crawl Mode'}
+              </Button>
+            </Flex>
+          </>
+        )}
+
+        {/* ── Phase 2: Inference mode restoring ── */}
+        {isRestoring && (
+          <>
+            <Flex align="center" gap="density-md">
+              <Cpu size={32} style={{ color: 'var(--color-brand-400)' }} />
+              <Stack gap="density-xs">
+                <Text kind="body/bold/2xl">Restoring Inference Mode</Text>
+                <Text kind="body/regular/sm" style={{ color: 'var(--text-color-subtle)' }}>
+                  nim-llm is loading. Chat will become available automatically once the
+                  model is ready.
+                </Text>
+              </Stack>
+            </Flex>
+
+            <Stack gap="density-md" style={{
+              background: 'var(--background-color-surface-raised)',
+              borderRadius: '8px',
+              padding: '16px',
+              border: '1px solid var(--border-color-subtle)',
+            }}>
+              {/* nemotron-parse scaling down */}
+              <Flex justify="between" align="center">
+                <Flex align="center" gap="density-sm">
+                  {(status?.nemotron_parse_ready_replicas ?? 0) === 0 ? (
+                    <CheckCircle size={16} style={{ color: 'var(--color-success-400)' }} />
+                  ) : (
+                    <Spinner size="small" aria-label="Scaling down" />
+                  )}
+                  <Text kind="body/regular/sm">Nemotron-Parse</Text>
+                </Flex>
+                <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+                  {(status?.nemotron_parse_ready_replicas ?? 0) === 0
+                    ? 'scaled down'
+                    : `${status?.nemotron_parse_ready_replicas} pod${(status?.nemotron_parse_ready_replicas ?? 0) !== 1 ? 's' : ''} terminating`}
+                </Text>
+              </Flex>
+
+              {/* nim-llm warming up */}
+              <Flex justify="between" align="center">
+                <Flex align="center" gap="density-sm">
+                  {(status?.nim_llm_ready_replicas ?? 0) >= (status?.nim_llm_replicas ?? 1) ? (
+                    <CheckCircle size={16} style={{ color: 'var(--color-success-400)' }} />
+                  ) : (
+                    <Spinner size="small" aria-label="Loading model" />
+                  )}
+                  <Text kind="body/regular/sm">nim-llm</Text>
+                </Flex>
+                <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+                  {(status?.nim_llm_ready_replicas ?? 0) > 0 ? 'ready' : 'loading model…'}
+                </Text>
+              </Flex>
+
+              <ProgressBar kind="indeterminate" aria-label="Restoring inference mode" />
+            </Stack>
+
+            <Flex justify="start">
+              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections/new')}>
+                <Flex align="center" gap="density-sm">
+                  <FolderOpen size={16} />
+                  Manage Collections
+                </Flex>
+              </Button>
+            </Flex>
+          </>
+        )}
 
       </Stack>
     </div>
