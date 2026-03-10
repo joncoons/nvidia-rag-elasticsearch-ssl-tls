@@ -2691,6 +2691,7 @@ class NvidiaRAGIngestor:
         state_manager,
         nv_ingest_traces: bool = False,
         trace_context: dict[str, Any] | None = None,
+        job_timeout: int = 600,
     ):
         """
         Perform NV-Ingest ingestion asynchronously using .ingest_async() method
@@ -2698,6 +2699,9 @@ class NvidiaRAGIngestor:
 
         Arguments:
             - nv_ingest_ingestor: Ingestor - NV-Ingest ingestor instance
+            - job_timeout: int - Maximum seconds to wait for the job to complete.
+              If exceeded (e.g. corrupt PDF hangs the Ray pipeline), the future is
+              cancelled and a TimeoutError is raised so the caller can skip the batch.
 
         Returns:
             - tuple[list[list[dict[str, str | dict]]], list[dict[str, Any]]] - Results and failures
@@ -2711,45 +2715,63 @@ class NvidiaRAGIngestor:
         # Convert concurrent.futures.Future to asyncio.Future
         async_future = asyncio.wrap_future(future)
 
-        while True:
-            status_dict = await asyncio.to_thread(nv_ingest_ingestor.get_status)
-            filename_status_map = {}
-            # Normalize the status to a dictionary of filename to status
-            for filepath, file_status in status_dict.items():
-                filename = os.path.basename(filepath)
-                filename_status_map[filename] = file_status
-            nv_ingest_status = await state_manager.update_nv_ingest_status(
-                filename_status_map
-            )
-            await INGESTION_TASK_HANDLER.set_task_state_dict(
-                state_manager.get_task_id(),
-                {"nv_ingest_status": nv_ingest_status},
-            )
-
-            await asyncio.sleep(1)
-
-            if future.done():
-                break
-
-        if nv_ingest_traces:
-            results, failures, traces = await async_future
-
-            if trace_context is not None:
-                process_nv_ingest_traces(
-                    traces,
-                    tracer=TRACER,
-                    span_namespace=trace_context.get("span_namespace", "nv_ingest"),
-                    collection_name=trace_context.get("collection_name"),
-                    batch_number=trace_context.get("batch_number"),
-                    reference_time_ns=trace_context.get(
-                        "reference_time_ns", ingest_start_ns
-                    ),
+        try:
+            deadline = time.monotonic() + job_timeout
+            while True:
+                status_dict = await asyncio.to_thread(nv_ingest_ingestor.get_status)
+                filename_status_map = {}
+                # Normalize the status to a dictionary of filename to status
+                for filepath, file_status in status_dict.items():
+                    filename = os.path.basename(filepath)
+                    filename_status_map[filename] = file_status
+                nv_ingest_status = await state_manager.update_nv_ingest_status(
+                    filename_status_map
+                )
+                await INGESTION_TASK_HANDLER.set_task_state_dict(
+                    state_manager.get_task_id(),
+                    {"nv_ingest_status": nv_ingest_status},
                 )
 
+                if future.done():
+                    break
+
+                if time.monotonic() > deadline:
+                    future.cancel()
+                    async_future.cancel()
+                    raise TimeoutError(
+                        f"nv-ingest job did not complete within {job_timeout}s — "
+                        "likely caused by a corrupt or unprocessable document in this batch. "
+                        "Batch will be skipped."
+                    )
+
+                await asyncio.sleep(1)
+
+            if nv_ingest_traces:
+                results, failures, traces = await async_future
+
+                if trace_context is not None:
+                    process_nv_ingest_traces(
+                        traces,
+                        tracer=TRACER,
+                        span_namespace=trace_context.get("span_namespace", "nv_ingest"),
+                        collection_name=trace_context.get("collection_name"),
+                        batch_number=trace_context.get("batch_number"),
+                        reference_time_ns=trace_context.get(
+                            "reference_time_ns", ingest_start_ns
+                        ),
+                    )
+
+                return results, failures
+
+            results, failures = await async_future
             return results, failures
 
-        results, failures = await async_future
-        return results, failures
+        except TimeoutError as exc:
+            logger.warning(
+                "nv-ingest batch timed out after %ds — skipping batch (cause: %s)",
+                job_timeout, exc,
+            )
+            return [], []
 
     @trace_function("ingestor.main.perform_shallow_extraction", tracer=TRACER)
     async def _perform_shallow_extraction(
@@ -2811,6 +2833,7 @@ class NvidiaRAGIngestor:
                     span_namespace=f"nv_ingest.shallow_batch_{batch_number}",
                     batch_number=batch_number,
                 ),
+                job_timeout=self.config.nv_ingest.job_timeout,
             )
             total_time = time.time() - start_time
 
@@ -2893,6 +2916,7 @@ class NvidiaRAGIngestor:
                     collection_name=vdb_op.collection_name,
                     batch_number=batch_number,
                 ),
+                job_timeout=self.config.nv_ingest.job_timeout,
             )
             total_ingestion_time = time.time() - start_time
             document_info = self._log_result_info(
@@ -2943,6 +2967,7 @@ class NvidiaRAGIngestor:
                         collection_name=vdb_op.collection_name,
                         batch_number=batch_number,
                     ),
+                    job_timeout=self.config.nv_ingest.job_timeout,
                 )
                 total_ingestion_time = time.time() - start_time
                 document_info = self._log_result_info(
@@ -2984,6 +3009,7 @@ class NvidiaRAGIngestor:
                         collection_name=vdb_op.collection_name,
                         batch_number=batch_number,
                     ),
+                    job_timeout=self.config.nv_ingest.job_timeout,
                 )
                 total_ingestion_time = time.time() - start_time
                 document_info = self._log_result_info(

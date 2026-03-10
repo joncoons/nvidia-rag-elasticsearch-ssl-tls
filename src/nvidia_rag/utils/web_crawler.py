@@ -1403,6 +1403,22 @@ class SimpleWebCrawler:
                         if chunk:
                             fh.write(chunk)
                 logger.debug("Downloaded PDF to persistent repo: %s", tmp_path)
+                # Validate the downloaded PDF is parseable before queuing it.
+                try:
+                    from pdf2image import pdfinfo_from_path as _pdfinfo
+                    _pdfinfo(tmp_path)
+                except Exception as pdf_exc:
+                    logger.warning(
+                        "Corrupt or unreadable PDF at %s (pdfinfo failed: %s) — skipping",
+                        url, pdf_exc,
+                    )
+                    errors.append({
+                        "url": url,
+                        "error_type": "corrupt_file",
+                        "status_code": resp.status_code,
+                        "error": f"pdfinfo validation failed: {pdf_exc}",
+                    })
+                    return None, {"status_code": resp.status_code}
             else:
                 tmp_path = self._save_temp_stream(resp, suffix=suffix)
                 all_temp_files.append(tmp_path)
@@ -1483,7 +1499,7 @@ class SimpleWebCrawler:
         in-place so the finally block can use it without reprocessing.
         """
         # Clear and rebuild so we don't accumulate duplicates across calls.
-        for key in ("broken_links", "missing_files", "ingest_failures", "batch_errors"):
+        for key in ("broken_links", "missing_files", "ingest_failures", "batch_errors", "corrupt_files"):
             error_matrix[key] = []
         for e in errors:
             etype = e.get("error_type", "other")
@@ -1496,6 +1512,8 @@ class SimpleWebCrawler:
                 error_matrix["ingest_failures"].append(entry)
             elif etype == "batch_error":
                 error_matrix["batch_errors"].append(entry)
+            elif etype == "corrupt_file":
+                error_matrix["corrupt_files"].append(entry)
             else:
                 error_matrix.setdefault("other", []).append(entry)
         self._write_error_matrix_csv(error_matrix)

@@ -342,6 +342,16 @@ class NvIngestConfig(_ConfigBase):
         env="APP_NVINGEST_CHUNKOVERLAP",
         description="Number of overlapping tokens between chunks",
     )
+    job_timeout: int = Field(
+        default=600,
+        env="APP_NVINGEST_JOB_TIMEOUT",
+        description=(
+            "Maximum seconds to wait for a single nv-ingest batch job to complete. "
+            "If the job does not finish within this window (e.g. due to a corrupt PDF "
+            "causing a PDFium hang in the Ray pipeline), the batch is cancelled and "
+            "treated as a failure so the crawl/ingest task can continue."
+        ),
+    )
     caption_model_name: str = Field(
         default="nvidia/nemotron-nano-12b-v2-vl",
         env="APP_NVINGEST_CAPTIONMODELNAME",
