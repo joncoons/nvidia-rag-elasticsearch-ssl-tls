@@ -15,8 +15,9 @@
 
 import { useEffect, useRef, type JSX } from "react";
 import { Stack, Flex, Text, Button, ProgressBar, Spinner } from "@kui/react";
-import { Globe, Cpu } from "lucide-react";
+import { Globe, Cpu, FolderOpen } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import { useCrawlModeStatus, useExitCrawlMode } from "../../hooks/useCrawlModeStatus";
 import { useNotificationStore } from "../../store/useNotificationStore";
 import type { TaskNotification } from "../../types/notifications";
@@ -37,6 +38,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
   const queryClient = useQueryClient();
   const { notifications } = useNotificationStore();
   const autoExitFiredRef = useRef(false);
+  const navigate = useNavigate();
 
   const isCrawlMode = crawlModeStatus?.active ?? false;
 
@@ -166,8 +168,18 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
           </Flex>
         )}
 
-        {/* Manual exit button */}
-        <Flex justify="end">
+        {/* Navigation + exit */}
+        <Flex justify="between" align="center">
+          <Button
+            kind="tertiary"
+            size="medium"
+            onClick={() => navigate('/collections/new')}
+          >
+            <Flex align="center" gap="density-sm">
+              <FolderOpen size={16} />
+              Manage Collections
+            </Flex>
+          </Button>
           <Button
             kind="secondary"
             size="medium"
