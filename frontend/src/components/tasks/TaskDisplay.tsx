@@ -61,19 +61,46 @@ const TaskHeader = ({ task }: TaskHeaderProps) => {
 
 const TaskProgress = ({ task }: { task: TaskDisplayProps['task'] }) => {
   const { formatTimestamp } = useTaskUtils();
+
+  if (task.task_type === "crawl") {
+    const { pages_crawled = 0, pages_queued = 0, pages_skipped = 0 } = task.result || {};
+    const isFinished = task.state !== "PENDING";
+    const pagesIngested = pages_crawled - pages_skipped;
+    return (
+      <Stack gap="2" data-testid="task-progress">
+        <Text kind="body/regular/sm" data-testid="progress-text">
+          {isFinished
+            ? `Pages ingested: ${pagesIngested} (${pages_skipped} unchanged)`
+            : `Crawled: ${pages_crawled} pages${pages_queued > 0 ? ` · ~${pages_queued} queued` : ""}`}
+        </Text>
+        {task.completedAt && (
+          <Text kind="body/regular/xs" data-testid="completion-time">
+            {formatTimestamp(task.completedAt)}
+          </Text>
+        )}
+        {!isFinished && (
+          <ProgressBar kind="indeterminate" aria-label="Crawl in progress" data-testid="progress-bar" />
+        )}
+        {isFinished && (
+          <ProgressBar value={100} aria-label="Crawl complete" data-testid="progress-bar" />
+        )}
+      </Stack>
+    );
+  }
+
   const { documents = [], total_documents = 0 } = task.result || {};
   const progress = total_documents > 0 ? (documents.length / total_documents) * 100 : 0;
 
   return (
     <Stack gap="2" data-testid="task-progress">
-      <Text 
+      <Text
         kind="body/regular/sm"
         data-testid="progress-text"
       >
         Uploaded: {documents.length} / {total_documents}
       </Text>
       {task.completedAt && (
-        <Text 
+        <Text
           kind="body/regular/xs"
           data-testid="completion-time"
         >

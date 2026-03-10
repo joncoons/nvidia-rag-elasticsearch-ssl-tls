@@ -314,6 +314,8 @@ export function useCollectionActions() {
           id: data.task_id,
           collection_name: activeCollection.collection_name,
           documents: [`Web crawl: ${crawlConfig.startUrl}`],
+          task_type: "crawl",
+          start_url: crawlConfig.startUrl,
           state: "PENDING",
           created_at: new Date().toISOString(),
         });

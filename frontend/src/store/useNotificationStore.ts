@@ -87,15 +87,16 @@ const taskToNotification = (task: IngestionTask & { completedAt?: number }): Tas
   // Preserve existing completedAt if available (from localStorage), otherwise set on completion
   const completedAt = task.completedAt ?? (task.state !== "PENDING" ? Date.now() : undefined);
 
+  const isCrawl = task.task_type === "crawl";
   return {
     id: generateNotificationId("task", task.id),
     type: "task",
     title: `Collection: ${task.collection_name}`,
-    message: task.state === "FINISHED" 
-      ? `Upload completed successfully`
+    message: task.state === "FINISHED"
+      ? (isCrawl ? `Web crawl completed` : `Upload completed successfully`)
       : task.state === "FAILED"
-      ? `Upload failed`
-      : `Uploading documents...`,
+      ? (isCrawl ? `Web crawl failed` : `Upload failed`)
+      : (isCrawl ? `Crawling website...` : `Uploading documents...`),
     severity,
     createdAt: new Date(task.created_at).getTime(),
     read: false,
@@ -303,16 +304,17 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         }
         
         // Update notification
+        const isCrawl = updatedTask.task_type === "crawl";
         const updatedNotification: TaskNotification = {
           ...taskNotification,
           task: updatedTask,
-          severity: updates.state === "FAILED" ? "error" : 
-                   updates.state === "FINISHED" ? "success" : 
+          severity: updates.state === "FAILED" ? "error" :
+                   updates.state === "FINISHED" ? "success" :
                    taskNotification.severity,
-          message: updates.state === "FINISHED" 
-            ? `Upload completed successfully`
+          message: updates.state === "FINISHED"
+            ? (isCrawl ? `Web crawl completed` : `Upload completed successfully`)
             : updates.state === "FAILED"
-            ? `Upload failed`
+            ? (isCrawl ? `Web crawl failed` : `Upload failed`)
             : taskNotification.message,
         };
         

@@ -279,6 +279,8 @@ export function useSubmitNewCollection() {
                 id: crawlData.task_id,
                 collection_name: collectionName,
                 documents: [`Web crawl: ${crawlConfig.startUrl}`],
+                task_type: "crawl",
+                start_url: crawlConfig.startUrl,
                 state: "PENDING",
                 created_at: new Date().toISOString(),
               });

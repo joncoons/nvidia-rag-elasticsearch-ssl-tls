@@ -482,11 +482,11 @@ class IngestionTaskStatusResponse(BaseModel):
     """Response model for getting the status of an ingestion task."""
 
     state: str = Field("", description="State of the ingestion task.")
-    result: UploadDocumentResponse = Field(
-        ..., description="Result of the ingestion task."
+    result: dict[str, Any] = Field(
+        {}, description="Result of the ingestion task."
     )
     nv_ingest_status: NVIngestStatusResponse = Field(
-        ..., description="NV-Ingest status."
+        default_factory=NVIngestStatusResponse, description="NV-Ingest status."
     )
 
 
@@ -920,9 +920,11 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
     from nvidia_rag.utils.web_crawler import SimpleWebCrawler
 
     try:
+        from uuid import uuid4
         vdb_auth_token = _extract_vdb_auth_token(request)
         registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
         export_dir = os.getenv("APP_CRAWLER_EXPORT_DIR", "")
+        task_id = str(uuid4())
         crawler = SimpleWebCrawler(
             start_url=payload.start_url,
             max_pages=payload.max_pages,
@@ -943,6 +945,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
             pdf_repo_dir=CONFIG.pdf_repo_dir,
+            task_id=task_id,
         )
 
         async def _crawl_task():
@@ -950,7 +953,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
                 NV_INGEST_INGESTOR, payload.collection_name, vdb_auth_token
             )
 
-        task_id = await INGESTION_TASK_HANDLER.submit_task(_crawl_task)
+        await INGESTION_TASK_HANDLER.submit_task(_crawl_task, task_id=task_id)
         return IngestionTaskResponse(message="Crawl started", task_id=task_id)
     except Exception as e:
         logger.error(f"Error starting crawl task: {e}")
@@ -967,7 +970,9 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
 )
 @trace_function("ingestor.server.get_task_status", tracer=TRACER)
 async def get_task_status(task_id: str):
-    """Get the status of an ingestion task."""
+    """Get the status of an ingestion task (upload or crawl)."""
+    from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
+    from nvidia_rag.utils.web_crawler import _CRAWL_PROGRESS
 
     logger.info(f"Getting status of task {task_id}")
     try:
@@ -977,12 +982,67 @@ async def get_task_status(task_id: str):
             result=result.get("result", {}),
             nv_ingest_status=result.get("nv_ingest_status", {}),
         )
-    except KeyError as e:
-        logger.error(f"Task {task_id} not found with error: {e}")
-        return IngestionTaskStatusResponse(
-            state="UNKNOWN",
-            result={"message": "Task not found"},
-            nv_ingest_status={},
+    except KeyError:
+        # Not an NV-Ingest task — check local task handler (crawl tasks).
+        try:
+            local = INGESTION_TASK_HANDLER.get_task_status_and_result(task_id)
+            state = local.state
+            result_dict: dict[str, Any] = dict(local.result or {})
+            # Merge live progress fields if the crawl is still running.
+            progress = _CRAWL_PROGRESS.get(task_id, {})
+            if progress:
+                result_dict = {**result_dict, **progress}
+            return IngestionTaskStatusResponse(
+                state=state,
+                result=result_dict,
+            )
+        except KeyError:
+            return IngestionTaskStatusResponse(
+                state="UNKNOWN",
+                result={"message": "Task not found"},
+            )
+
+
+@app.get(
+    "/crawl-mode/status",
+    tags=["Ingestion APIs"],
+)
+async def get_crawl_mode_status():
+    """Return current GPU layout — whether nim-llm is scaled down (crawl mode active)."""
+    try:
+        from nvidia_rag.utils.k8s_scaler import _get_apps_v1, _NAMESPACE
+        apps_v1 = _get_apps_v1()
+        if apps_v1 is None:
+            return {"active": False, "nim_llm_replicas": -1, "nemotron_parse_replicas": -1}
+        nim_llm = apps_v1.read_namespaced_deployment("nim-llm", _NAMESPACE)
+        parse = apps_v1.read_namespaced_deployment("nemotron-parse-v12", _NAMESPACE)
+        nim_llm_spec = nim_llm.spec.replicas or 0
+        parse_spec = parse.spec.replicas or 0
+        return {
+            "active": nim_llm_spec == 0,
+            "nim_llm_replicas": nim_llm_spec,
+            "nemotron_parse_replicas": parse_spec,
+        }
+    except Exception as exc:
+        logger.warning("crawl-mode/status: k8s unavailable: %r", exc)
+        return {"active": False, "nim_llm_replicas": -1, "nemotron_parse_replicas": -1}
+
+
+@app.post(
+    "/crawl-mode/exit",
+    tags=["Ingestion APIs"],
+)
+async def exit_crawl_mode():
+    """Restore inference GPU layout (scale nim-llm back up, scale nemotron-parse down)."""
+    try:
+        from nvidia_rag.utils.k8s_scaler import disable_crawl_mode
+        disable_crawl_mode()
+        return {"message": "Inference mode restore initiated (background)"}
+    except Exception as exc:
+        logger.error("crawl-mode/exit failed: %r", exc)
+        return JSONResponse(
+            content={"message": f"Failed to exit crawl mode: {exc}"},
+            status_code=500,
         )
 
 

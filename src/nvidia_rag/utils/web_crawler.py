@@ -98,6 +98,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Live crawl progress keyed by task_id.  Written by the crawler during _crawl_sync
+# and read by the /status endpoint to report mid-crawl progress to the frontend.
+# Entries are removed when the task transitions out of PENDING.
+_CRAWL_PROGRESS: dict[str, dict] = {}
+
 # Sentinel returned by _collect_binary_file when server responds 304 Not Modified.
 _UNCHANGED: tuple = ()
 
@@ -256,8 +261,10 @@ class SimpleWebCrawler:
         max_depth: int | None = None,
         blocked_url_patterns: list[str] | None = None,
         use_sitemap: bool = False,
+        task_id: str | None = None,
     ) -> None:
         self.start_url = start_url.rstrip("/")
+        self.task_id = task_id
         self.max_pages = max_pages
         self.extract_linked_files = extract_linked_files
         self.batch_ingest_size = max(1, batch_ingest_size)
@@ -603,6 +610,18 @@ class SimpleWebCrawler:
 
                 pages_crawled += 1
 
+                # Publish live progress every 25 pages for frontend polling.
+                if self.task_id and pages_crawled % 25 == 0:
+                    _CRAWL_PROGRESS[self.task_id] = {
+                        "task_type": "crawl",
+                        "start_url": self.start_url,
+                        "collection_name": self.collection_name,
+                        "pages_crawled": pages_crawled,
+                        "pages_queued": len(queue) + len(in_flight),
+                        "pages_skipped": pages_skipped,
+                        "files_dispatched": total_files_dispatched,
+                    }
+
                 # ── Delta check for HTML: compare content hash ───────────────
                 new_hash = resp_meta.get("content_hash", "")
                 reg_entry = registry.get(url, {})
@@ -864,12 +883,18 @@ class SimpleWebCrawler:
 
         binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
 
+        # Remove live progress entry — task is now FINISHED/FAILED.
+        _CRAWL_PROGRESS.pop(self.task_id, None)
+
         return {
             "message": (
                 f"Crawl complete: {pages_crawled - pages_skipped} HTML pages and "
                 f"{binary_files} linked files ingested "
                 f"({pages_skipped} pages and {files_skipped} files unchanged/skipped)."
             ),
+            "task_type": "crawl",
+            "start_url": self.start_url,
+            "collection_name": self.collection_name,
             "pages_crawled": pages_crawled,
             "pages_skipped": pages_skipped,
             "files_skipped": files_skipped,

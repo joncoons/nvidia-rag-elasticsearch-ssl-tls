@@ -73,22 +73,26 @@ export const TaskPoller = ({ taskId }: TaskPollerProps) => {
       collection_name: data.collection_name || existingTask?.collection_name || "Unknown Collection",
     };
 
-    // Only update on significant changes: state change or initial load
-    // Progress changes (documents_completed incrementing) don't require notification updates
-    // This prevents notification count flickering during document processing
     const hasStateChanged = task.state !== previousStateRef.current;
     const isInitialLoad = !hasInitialized.current;
-    
-    if (hasStateChanged || isInitialLoad) {
+    // For crawl tasks update on every poll so live page-count progress is visible.
+    const isCrawlTask = existingTask?.task_type === "crawl" ||
+      (task.result as Record<string, unknown>)?.task_type === "crawl";
+
+    if (hasStateChanged || isInitialLoad || isCrawlTask) {
       hasInitialized.current = true;
-      
+
       // Check if task just completed (state changed from PENDING to something else)
       const justCompleted = previousStateRef.current === "PENDING" && task.state !== "PENDING";
       previousStateRef.current = task.state;
-      
-      // Update task with latest data from API
-      updateTaskNotification(taskId, task);
-      
+
+      // Update task — preserve task_type / start_url set at registration time
+      updateTaskNotification(taskId, {
+        ...task,
+        task_type: existingTask?.task_type ?? task.task_type,
+        start_url: existingTask?.start_url ?? task.start_url,
+      });
+
       // Invalidate collections query to refresh file counts after ingestion completes
       if (justCompleted) {
         queryClient.invalidateQueries({ queryKey: ["collections"] });

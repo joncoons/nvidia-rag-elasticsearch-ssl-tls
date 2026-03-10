@@ -18,10 +18,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Chat from "./pages/Chat";
 import NewCollection from "./pages/NewCollection";
 import Layout from "./components/layout/Layout";
+import { CrawlModeGuard } from "./components/layout/CrawlModeGuard";
 import SettingsPage from "./pages/SettingsPage";
 import { ToastContainer } from "./components/ui/ToastContainer";
 import { useAppHealthStatus, useServerDefaultsInitialization } from "./store/useSettingsStore";
 import { useHealthMonitoring } from "./hooks/useHealthMonitoring";
+import { useCrawlModeStatus } from "./hooks/useCrawlModeStatus";
 
 /**
  * React Query client configuration with default options.
@@ -49,11 +51,14 @@ function AppContent() {
   
   // Monitor service health and create notifications for issues
   useHealthMonitoring();
-  
+
+  // Keep crawl-mode status fresh (polls every 15 s)
+  useCrawlModeStatus();
+
   return (
     <Layout>
       <Routes>
-        <Route path="/" element={<Chat />} />
+        <Route path="/" element={<CrawlModeGuard><Chat /></CrawlModeGuard>} />
         <Route path="/collections/new" element={<NewCollection />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>

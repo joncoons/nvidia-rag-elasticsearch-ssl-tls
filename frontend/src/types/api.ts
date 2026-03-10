@@ -107,6 +107,11 @@ export interface IngestionTask {
 
   state: "PENDING" | "FINISHED" | "FAILED" | "UNKNOWN";
 
+  /** Discriminate upload tasks from web crawl tasks. */
+  task_type?: "upload" | "crawl";
+  /** Start URL for crawl tasks. */
+  start_url?: string;
+
   documents?: string[];
 
   result?: {
@@ -126,6 +131,14 @@ export interface IngestionTask {
     documents_completed?: number;
     /** Number of batches completed (for granular progress during PENDING state) */
     batches_completed?: number;
+    /** Crawl task: HTML pages fetched so far. */
+    pages_crawled?: number;
+    /** Crawl task: estimated remaining pages (queue + in-flight). */
+    pages_queued?: number;
+    /** Crawl task: pages skipped (hash unchanged). */
+    pages_skipped?: number;
+    /** Crawl task: binary files dispatched. */
+    files_dispatched?: number;
   };
 }
 
