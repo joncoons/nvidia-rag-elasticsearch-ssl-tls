@@ -205,7 +205,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
             )}
 
             <Flex justify="between" align="center">
-              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections/new')}>
+              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections')}>
                 <Flex align="center" gap="density-sm">
                   <FolderOpen size={16} />
                   Manage Collections
@@ -284,7 +284,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
             </Stack>
 
             <Flex justify="start">
-              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections/new')}>
+              <Button kind="tertiary" size="medium" onClick={() => navigate('/collections')}>
                 <Flex align="center" gap="density-sm">
                   <FolderOpen size={16} />
                   Manage Collections
