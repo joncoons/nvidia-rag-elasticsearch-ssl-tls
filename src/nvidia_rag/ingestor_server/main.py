@@ -2521,11 +2521,20 @@ class NvidiaRAGIngestor:
                     task = process_batch(sub_filepaths, batch_num)
                     tasks.append(task)
 
-                # Wait for all tasks to complete
-                batch_results = await asyncio.gather(*tasks)
+                # Wait for all tasks to complete; use return_exceptions=True so
+                # that a single failing sub-batch does not orphan the remaining
+                # tasks as un-awaited asyncio tasks (which keeps their nv-ingest
+                # jobs running and clogs the service for subsequent batches).
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Combine results from all batches
-                for results, failures in batch_results:
+                # Combine results from all batches; skip failed sub-batches.
+                for item in batch_results:
+                    if isinstance(item, BaseException):
+                        logger.warning(
+                            "Sub-batch failed and will be skipped: %r", item
+                        )
+                        continue
+                    results, failures = item
                     all_results.extend(results)
                     all_failures.extend(failures)
 

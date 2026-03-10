@@ -841,8 +841,21 @@ class SimpleWebCrawler:
                 pages_crawled, pages_skipped, len(in_flight),
             )
 
-            # Poll until all in-flight futures complete (no timeout).
+            # Poll until all in-flight futures complete.
+            # Bound the wait so a permanently-stuck future cannot block forever;
+            # each future has its own internal 600 s nv-ingest timeout, so
+            # drain_timeout gives a generous outer guard on top of that.
+            drain_deadline = time.monotonic() + max(self.max_concurrent_batches * 700, 2100)
             while in_flight:
+                if time.monotonic() > drain_deadline:
+                    logger.warning(
+                        "Drain deadline exceeded — %d in-flight batch(es) forcibly abandoned",
+                        len(in_flight),
+                    )
+                    for f, bnum, *_ in in_flight:
+                        f.cancel()
+                    in_flight.clear()
+                    break
                 time.sleep(2)
                 _harvest_done()
 
