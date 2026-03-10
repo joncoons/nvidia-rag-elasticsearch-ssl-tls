@@ -17,6 +17,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Chat from "./pages/Chat";
 import NewCollection from "./pages/NewCollection";
+import CollectionsPage from "./pages/CollectionsPage";
 import Layout from "./components/layout/Layout";
 import { CrawlModeGuard } from "./components/layout/CrawlModeGuard";
 import SettingsPage from "./pages/SettingsPage";
@@ -59,6 +60,7 @@ function AppContent() {
     <Layout>
       <Routes>
         <Route path="/" element={<CrawlModeGuard><Chat /></CrawlModeGuard>} />
+        <Route path="/collections" element={<CollectionsPage />} />
         <Route path="/collections/new" element={<NewCollection />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>

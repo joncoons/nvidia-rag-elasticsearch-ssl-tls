@@ -478,6 +478,15 @@ class NemoParseConfig(_ConfigBase):
             "Set to match nemotron-parse replica count x max-num-seqs / max_parallel_pages."
         ),
     )
+    page_batch_size: int = Field(
+        default=32,
+        env="APP_NEMOPARSE_PAGE_BATCH_SIZE",
+        description=(
+            "Number of PDF pages rasterised into memory at once per document. "
+            "Smaller values reduce peak RAM at the cost of more convert_from_path calls. "
+            "At 300 DPI JPEG each page is ~25 MB; batch_size=32 → ~800 MB peak per doc."
+        ),
+    )
 
 
 class ModelParametersConfig(_ConfigBase):

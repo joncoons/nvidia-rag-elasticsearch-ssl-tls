@@ -180,6 +180,7 @@ class DocumentClassifierRouter:
         chunk_overlap: int = 150,
         max_parallel_pages: int = 8,
         max_parallel_docs: int = 4,
+        page_batch_size: int = 32,
         vlm_endpoint_url: str = "",
         vlm_model_name: str = VLM_DESCRIBE_MODEL_DEFAULT,
     ) -> None:
@@ -189,6 +190,7 @@ class DocumentClassifierRouter:
         self.dpi = dpi
         self.max_parallel_pages = max(1, max_parallel_pages)
         self.max_parallel_docs = max(1, max_parallel_docs)
+        self.page_batch_size = max(1, page_batch_size)
         self._max_tokens = max_tokens
         self._chunk_overlap = chunk_overlap
         self.vlm_endpoint_url = vlm_endpoint_url.rstrip("/") if vlm_endpoint_url else ""
@@ -230,6 +232,7 @@ class DocumentClassifierRouter:
             max_tokens=config.nv_ingest.chunk_size,
             chunk_overlap=config.nv_ingest.chunk_overlap,
             max_parallel_docs=config.nemo_parse.max_parallel_docs,
+            page_batch_size=config.nemo_parse.page_batch_size,
             vlm_endpoint_url=config.nemo_parse.figure_describe_endpoint,
             vlm_model_name=config.nemo_parse.figure_describe_model,
         )
@@ -265,33 +268,74 @@ class DocumentClassifierRouter:
         logger.info("Starting nemoretriever-parse pass for: %s", os.path.basename(filepath))
 
         try:
-            from pdf2image import convert_from_path  # lazy import
-
-            pages = convert_from_path(filepath, dpi=self.dpi)
-            page_count = len(pages)
+            from pdf2image import convert_from_path, pdfinfo_from_path  # lazy import
+            page_count = pdfinfo_from_path(filepath)["Pages"]
         except Exception as exc:
             logger.warning(
-                "Could not rasterise '%s': %s — falling back to standard pipeline",
+                "Could not read page count for '%s': %s — falling back to standard pipeline",
                 filepath, exc,
             )
             return None
 
-        # ── Parallel single-pass extraction ─────────────────────────────
-        # 4 replica pods × 4 max-num-seqs = 16 concurrent inference slots.
-        # 8 workers × 2 concurrent document batches = 16 in-flight requests.
+        # ── Batched page rasterisation + parallel extraction ─────────────
+        # Pages are loaded in batches of page_batch_size to cap peak memory.
+        # Each batch is rasterised, processed by the thread pool, then freed
+        # before the next batch is loaded.  Cross-batch element boundaries
+        # are stitched using the same rules as within-page boundaries.
         logger.info(
-            "Processing %d pages of '%s' with %d parallel workers",
-            page_count, os.path.basename(filepath), self.max_parallel_pages,
+            "Processing %d pages of '%s' in batches of %d with %d parallel workers",
+            page_count, os.path.basename(filepath),
+            self.page_batch_size, self.max_parallel_pages,
         )
 
-        with ThreadPoolExecutor(max_workers=self.max_parallel_pages) as executor:
-            page_results: list[tuple[int, list[tuple[str, str]]]] = list(
-                executor.map(self._process_page, enumerate(pages))
-            )
+        all_elements: list[tuple[str, str]] = []
 
-        # ── Cross-page stitch ────────────────────────────────────────────
-        page_element_lists = [elems for _, elems in page_results]
-        all_elements = self._stitch_page_boundaries(page_element_lists)
+        for batch_start in range(0, page_count, self.page_batch_size):
+            batch_end = min(batch_start + self.page_batch_size, page_count)
+            try:
+                pages = convert_from_path(
+                    filepath, dpi=self.dpi,
+                    first_page=batch_start + 1,  # 1-indexed
+                    last_page=batch_end,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not rasterise pages %d-%d of '%s': %s — skipping batch",
+                    batch_start + 1, batch_end, os.path.basename(filepath), exc,
+                )
+                continue
+
+            with ThreadPoolExecutor(max_workers=self.max_parallel_pages) as executor:
+                batch_results: list[tuple[int, list[tuple[str, str]]]] = list(
+                    executor.map(self._process_page, enumerate(pages, start=batch_start))
+                )
+
+            # Stitch within this batch
+            page_element_lists = [elems for _, elems in batch_results]
+            batch_elements = self._stitch_page_boundaries(page_element_lists)
+
+            # Cross-batch stitch: attempt to join the last element of the
+            # previous batch with the first element of this batch using the
+            # same rules as _stitch_page_boundaries.
+            if all_elements and batch_elements:
+                prev_cls, prev_text = all_elements[-1]
+                next_cls, next_text = batch_elements[0]
+                prev_l = prev_cls.lower()
+                next_l = next_cls.lower()
+                should_stitch = False
+                if prev_l in _STITCHABLE_CLASSES and prev_l == next_l:
+                    if prev_text and prev_text.rstrip()[-1] not in _TERMINAL_PUNCT:
+                        should_stitch = True
+                elif prev_l in _ATOMIC_CLASSES and prev_l == next_l:
+                    should_stitch = True
+                if should_stitch:
+                    sep = " " if prev_l in _STITCHABLE_CLASSES else "\n"
+                    stitched = prev_text.rstrip() + sep + next_text.lstrip()
+                    all_elements[-1] = (prev_cls, stitched)
+                    batch_elements = batch_elements[1:]
+
+            all_elements.extend(batch_elements)
+            # PIL images freed here as `pages` goes out of scope
 
         # ── Routing decision ─────────────────────────────────────────────
         if not force:
