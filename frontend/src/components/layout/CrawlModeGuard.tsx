@@ -51,7 +51,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
       n.type === "task" &&
       (n.task.task_type === "crawl" || n.task.task_type === "upload")
   );
-  const pendingIngestTasks = ingestTasks.filter(n => n.task.state === "PENDING");
+  const pendingIngestTasks = ingestTasks.filter(n => n.task.state === "PENDING" || n.task.state === "UNKNOWN");
   const pendingCrawlTasks = pendingIngestTasks.filter(n => n.task.task_type === "crawl");
   const pendingUploadTasks = pendingIngestTasks.filter(n => n.task.task_type === "upload");
   const allIngestDone = ingestTasks.length > 0 && pendingIngestTasks.length === 0;

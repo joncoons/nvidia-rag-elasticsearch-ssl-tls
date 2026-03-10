@@ -203,7 +203,7 @@ def _restore_inference_blocking() -> None:
     # Step 4: fill remaining GPU0 slots with placeholders
     _patch_replicas(apps_v1, "gpu0-placeholder", _PLACEHOLDER_REPLICAS)
 
-    # Step 4: nemotron-parse inference replicas → forced to GPU1
+    # Step 5: nemotron-parse inference replicas → forced to GPU1 by nim-llm VRAM barrier
     _patch_replicas(apps_v1, "nemotron-parse-v12", _INFERENCE_REPLICAS)
 
     logger.info(

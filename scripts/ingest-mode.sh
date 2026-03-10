@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# crawl-mode.sh — manually switch GPU layout between crawl mode and inference mode.
+# ingest-mode.sh — manually switch GPU layout between ingest mode and inference mode.
 #
-# Crawl mode:     nim-llm=0, gpu0-placeholder=0, nemotron-parse=7
+# Ingest mode:    nim-llm=0, gpu0-placeholder=0, nemotron-parse=7, nim-vlm=1
 #                 Maximises nemotron-parse throughput; GPU chat is unavailable.
+#                 nim-vlm remains up on GPU0 throughout (used for VLM inference).
 #
 # Inference mode: nim-llm=1 (GPU0 exclusive), gpu0-placeholder=3 (fills GPU0),
-#                 nemotron-parse=1 (GPU1).
+#                 nemotron-parse=1 (GPU1), nim-vlm=1 (unchanged — never scaled down).
 #                 Ordering matters for device-plugin first-fit GPU assignment:
 #                   1. nemotron-parse → 0  (free all GPU slots; wait for termination)
-#                   2. nim-llm → 1         (first-fit → GPU0)
+#                   2. nim-llm → 1         (first-fit → GPU0; VRAM fills it completely)
 #                   3. gpu0-placeholder → 3 (fill remaining GPU0 slots)
-#                   4. nemotron-parse → 1  (forced to GPU1)
+#                   4. nemotron-parse → 1  (forced to GPU1 by nim-llm VRAM barrier)
+#                   nim-vlm is left at 1 — no change needed.
 #
 # Usage:
-#   scripts/crawl-mode.sh enable    # switch to crawl mode
-#   scripts/crawl-mode.sh disable   # restore inference mode (default)
+#   scripts/ingest-mode.sh enable    # switch to ingest mode
+#   scripts/ingest-mode.sh disable   # restore inference mode (default)
+#   scripts/ingest-mode.sh status    # show current replica counts
 
 set -euo pipefail
 
@@ -53,36 +56,37 @@ wait_scheduled() {
         [ "${phase}" = "Running" ] && return
         sleep 5
     done
-    echo "  WARNING: ${1} not yet Running — GPU0 slot may not be claimed; proceeding anyway"
+    echo "  WARNING: ${1} not yet Running — GPU slot may not be claimed; proceeding anyway"
 }
 
 case "${1:-disable}" in
     enable|on)
-        echo "Enabling crawl mode..."
+        echo "Enabling ingest mode..."
         scale nim-llm 0
         scale gpu0-placeholder 0
         scale nemotron-parse-v12 "${CRAWL_PARSE_REPLICAS}"
-        # nim-vlm stays up in crawl mode (1 slot on GPU0; fits within 8-slot budget)
+        # nim-vlm stays up during ingest mode (1 slot on GPU0; fits within 8-slot budget)
         scale nim-vlm 1
-        echo "Crawl mode active. nim-llm is offline; RAG chat unavailable."
+        echo "Ingest mode active. nim-llm is offline; RAG chat unavailable."
         ;;
     disable|off)
-        echo "Disabling crawl mode — restoring inference layout..."
-        # Step 1: free all GPU slots
+        echo "Disabling ingest mode — restoring inference layout..."
+        # Step 1: free GPU slots held by nemotron-parse
         scale nemotron-parse-v12 0
         wait_down nemotron-parse-v12
         # Step 2: ensure nim-llm uses the correct TP1 NVFP4 profile
         echo "  → setting nim-llm profile to ${NIM_LLM_PROFILE}"
         kubectl set env -n "${NAMESPACE}" deploy/nim-llm \
             NIM_MODEL_PROFILE="${NIM_LLM_PROFILE}"
-        # Step 3: nim-llm lands on first available GPU (first-fit)
+        # Step 3: nim-llm lands on first available GPU (first-fit); its VRAM fills it completely
         scale nim-llm 1
-        # Step 3a: wait for nim-llm pod to reach Running phase (GPU0 slot claimed)
+        # Step 3a: wait for nim-llm pod to reach Running (GPU slot claimed)
         #           before filling remaining slots — prevents placeholder racing nim-llm
         wait_scheduled nim-llm
         # Step 4: fill remaining GPU0 slots so nemotron-parse is forced to GPU1
         scale gpu0-placeholder "${PLACEHOLDER_REPLICAS}"
         # Step 5: single nemotron-parse instance on GPU1
+        # nim-vlm is unchanged — it stays at 1 throughout
         scale nemotron-parse-v12 "${INFERENCE_PARSE_REPLICAS}"
         echo "Inference mode restored. nim-llm startup may take several minutes."
         ;;

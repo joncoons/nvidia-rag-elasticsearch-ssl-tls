@@ -42,22 +42,40 @@ export const TaskPoller = ({ taskId }: TaskPollerProps) => {
   const previousStateRef = useRef<string>("PENDING");
   const hasInitialized = useRef(false);
   const errorCountRef = useRef(0);
+  const unknownCountRef = useRef(0);
 
-  // Handle errors - if task doesn't exist on backend, remove the orphaned notification
+  // Handle HTTP errors - if task doesn't exist on backend, remove the orphaned notification
   useEffect(() => {
     if (error && !isLoading) {
       errorCountRef.current++;
-      // After 3 consecutive errors, assume task doesn't exist and remove it
-      // This handles orphaned tasks from previous deployments
+      // After 3 consecutive HTTP errors, assume task doesn't exist and remove it
       if (errorCountRef.current >= 3) {
         const taskNotificationId = `task-${taskId}`;
         removeNotification(taskNotificationId);
       }
     } else if (data) {
-      // Reset error count on successful fetch
       errorCountRef.current = 0;
     }
   }, [error, isLoading, data, taskId, removeNotification]);
+
+  // Handle UNKNOWN state — task not found on backend (e.g. pod restarted).
+  // Treat as transient; after 3 consecutive UNKNOWN responses mark as FAILED.
+  useEffect(() => {
+    if (!data || isLoading) return;
+    if (data.state === "UNKNOWN") {
+      unknownCountRef.current++;
+      if (unknownCountRef.current >= 3) {
+        updateTaskNotification(taskId, {
+          ...data,
+          id: taskId,
+          state: "FAILED" as const,
+          result: { message: `Task '${taskId}' not found — the ingestor may have restarted.`, total_documents: 0, documents: [], failed_documents: [] },
+        });
+      }
+    } else {
+      unknownCountRef.current = 0;
+    }
+  }, [data, isLoading, taskId, updateTaskNotification]);
 
   useEffect(() => {
     if (!data || isLoading || error) return;

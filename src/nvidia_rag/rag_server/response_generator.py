@@ -804,7 +804,7 @@ def prepare_citations(
                 content = doc.page_content
                 document_type = doc.metadata.get("content_metadata", {}).get("type")
                 content_metadata = doc.metadata.get("content_metadata", {})
-                page_number = content_metadata.get("page_number", 0)
+                page_number = content_metadata.get("page_number", 0) or 0
                 source_metadata = SourceMetadata(
                     page_number=page_number,
                     description=doc.page_content,
@@ -817,8 +817,8 @@ def prepare_citations(
             ]:
                 # Pull required metadata
                 page_number = doc.metadata.get("content_metadata", {}).get(
-                    "page_number"
-                )
+                    "page_number", 0
+                ) or 0
                 location = doc.metadata.get("content_metadata", {}).get("location")
                 if doc.metadata.get("content_metadata", {}).get("type") == "image":
                     document_type = doc.metadata.get("content_metadata", {}).get("type")
