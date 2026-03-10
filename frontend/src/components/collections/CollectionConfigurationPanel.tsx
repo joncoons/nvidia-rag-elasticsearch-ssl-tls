@@ -20,36 +20,44 @@ import { Settings, ChevronDown } from "lucide-react";
 interface CollectionConfigurationPanelProps {
   generateSummary: boolean;
   onGenerateSummaryChange: (value: boolean) => void;
+  useNemotronParse: boolean;
+  onUseNemotronParseChange: (value: boolean) => void;
+  forceNemotronParse: boolean;
+  onForceNemotronParseChange: (value: boolean) => void;
 }
 
 /**
  * Expandable panel for collection-specific configuration settings.
- * 
+ *
  * Displays settings that control how documents are processed when uploaded
  * to this collection. Follows the same pattern as CatalogMetadataSection.
  */
-export function CollectionConfigurationPanel({ 
+export function CollectionConfigurationPanel({
   generateSummary,
-  onGenerateSummaryChange
+  onGenerateSummaryChange,
+  useNemotronParse,
+  onUseNemotronParseChange,
+  forceNemotronParse,
+  onForceNemotronParseChange,
 }: CollectionConfigurationPanelProps) {
   const [isExpanded, setIsExpanded] = useState(false);
 
   return (
     <Panel
       slotHeading={
-        <Flex 
-          align="center" 
-          justify="between" 
+        <Flex
+          align="center"
+          justify="between"
           style={{ width: '100%', cursor: 'pointer' }}
           onClick={() => setIsExpanded(!isExpanded)}
         >
           <span>Collection Configuration</span>
-          <ChevronDown 
-            size={16} 
-            style={{ 
+          <ChevronDown
+            size={16}
+            style={{
               transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
               transition: 'transform 0.2s ease'
-            }} 
+            }}
           />
         </Flex>
       }
@@ -62,19 +70,46 @@ export function CollectionConfigurationPanel({
       {isExpanded && (
         <Stack gap="density-md" style={{ marginTop: 'var(--spacing-density-lg)' }}>
           {/* Summarization Toggle */}
-          <Flex>
-            <Stack gap="density-xs">
-              <Switch
-                checked={generateSummary}
-                onCheckedChange={onGenerateSummaryChange}
-                size="medium"
-                slotLabel="Document Summarization"
-              />
-              <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
-                Automatically generate summaries for uploaded documents. This feature could increase costs and processing time.
-              </Text>
-            </Stack>
-          </Flex>
+          <Stack gap="density-xs">
+            <Switch
+              checked={generateSummary}
+              onCheckedChange={onGenerateSummaryChange}
+              size="medium"
+              slotLabel="Document Summarization"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Automatically generate summaries for uploaded documents. This feature could increase costs and processing time.
+            </Text>
+          </Stack>
+
+          {/* Nemotron Parse Toggles */}
+          <Stack gap="density-xs">
+            <Switch
+              checked={useNemotronParse || forceNemotronParse}
+              onCheckedChange={(checked: boolean) => {
+                onUseNemotronParseChange(checked);
+                if (!checked) onForceNemotronParseChange(false);
+              }}
+              size="medium"
+              slotLabel="Nemotron Parse (complex data elements)"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Route PDFs with tables, charts, or infographics through nemoretriever-parse VLM for high-quality markdown extraction.
+            </Text>
+
+            <Switch
+              checked={forceNemotronParse}
+              onCheckedChange={(checked: boolean) => {
+                onForceNemotronParseChange(checked);
+                if (checked) onUseNemotronParseChange(true);
+              }}
+              size="medium"
+              slotLabel="Nemotron Parse (all pages)"
+            />
+            <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+              Skip classification and run all PDF pages through VLM. Recommended for dense financial or technical documents.
+            </Text>
+          </Stack>
         </Stack>
       )}
     </Panel>

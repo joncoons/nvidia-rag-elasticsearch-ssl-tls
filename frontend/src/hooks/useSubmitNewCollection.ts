@@ -205,6 +205,8 @@ export function useSubmitNewCollection() {
           collection_name: collectionName,
           blocking: false,
           generate_summary: collectionConfig.generateSummary,
+          use_nemoretriever_parse: collectionConfig.useNemotronParse || collectionConfig.forceNemotronParse,
+          force_nemoretriever_parse: collectionConfig.forceNemotronParse,
           custom_metadata: selectedFiles.map((file) => {
             const rawFileMetadata = fileMetadata[file.name] || {};
             // Process metadata values to convert array JSON strings back to arrays and handle types
@@ -239,6 +241,7 @@ export function useSubmitNewCollection() {
             id: data.task_id,
             collection_name: collectionName,
             documents: selectedFiles.map((f) => f.name),
+            task_type: "upload" as const,
             state: "PENDING" as const,
             created_at: new Date().toISOString(),
           };

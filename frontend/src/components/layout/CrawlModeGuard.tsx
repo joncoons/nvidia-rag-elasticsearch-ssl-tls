@@ -45,16 +45,20 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
   const isRestoring = status?.restoring ?? false;
   const shouldBlock = isCrawlMode || isRestoring;
 
-  // Crawl task notifications
-  const crawlTasks = notifications.filter(
-    (n): n is TaskNotification => n.type === "task" && n.task.task_type === "crawl"
+  // Ingest task notifications (both crawl and file upload)
+  const ingestTasks = notifications.filter(
+    (n): n is TaskNotification =>
+      n.type === "task" &&
+      (n.task.task_type === "crawl" || n.task.task_type === "upload")
   );
-  const pendingCrawlTasks = crawlTasks.filter(n => n.task.state === "PENDING");
-  const allCrawlsDone = crawlTasks.length > 0 && pendingCrawlTasks.length === 0;
+  const pendingIngestTasks = ingestTasks.filter(n => n.task.state === "PENDING");
+  const pendingCrawlTasks = pendingIngestTasks.filter(n => n.task.task_type === "crawl");
+  const pendingUploadTasks = pendingIngestTasks.filter(n => n.task.task_type === "upload");
+  const allIngestDone = ingestTasks.length > 0 && pendingIngestTasks.length === 0;
 
-  // Auto-exit crawl mode when all crawl tasks finish
+  // Auto-exit when all ingest tasks finish
   useEffect(() => {
-    if (isCrawlMode && allCrawlsDone && !autoExitFiredRef.current && !exitCrawlMode.isPending) {
+    if (isCrawlMode && allIngestDone && !autoExitFiredRef.current && !exitCrawlMode.isPending) {
       autoExitFiredRef.current = true;
       exitCrawlMode.mutate(undefined, {
         onSuccess: () => {
@@ -62,10 +66,10 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
         },
       });
     }
-    if (!allCrawlsDone) {
+    if (!allIngestDone) {
       autoExitFiredRef.current = false;
     }
-  }, [isCrawlMode, allCrawlsDone, exitCrawlMode, queryClient]);
+  }, [isCrawlMode, allIngestDone, exitCrawlMode, queryClient]);
 
   if (!shouldBlock) {
     return <>{children}</>;
@@ -91,16 +95,16 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
     }}>
       <Stack gap="density-xl" style={{ maxWidth: '640px', width: '100%' }}>
 
-        {/* ── Phase 1: Crawl active ── */}
+        {/* ── Phase 1: Ingestion active ── */}
         {isCrawlMode && (
           <>
             <Flex align="center" gap="density-md">
               <Globe size={32} style={{ color: 'var(--color-brand-400)' }} />
               <Stack gap="density-xs">
-                <Text kind="body/bold/2xl">Crawl Mode Active</Text>
+                <Text kind="body/bold/2xl">Ingestion Mode Active</Text>
                 <Text kind="body/regular/sm" style={{ color: 'var(--text-color-subtle)' }}>
                   Chat is unavailable while nim-llm is offline. GPU resources are
-                  allocated to Nemotron-Parse for maximum crawl throughput.
+                  allocated to Nemotron-Parse for maximum ingestion throughput.
                 </Text>
               </Stack>
             </Flex>
@@ -113,7 +117,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
                 padding: '16px',
                 border: '1px solid var(--border-color-subtle)',
               }}>
-                <Text kind="body/semibold/sm">Active Crawl Tasks</Text>
+                <Text kind="body/semibold/sm">Active Web Crawls</Text>
                 {pendingCrawlTasks.map(n => {
                   const { pages_crawled = 0, pages_queued = 0, pages_skipped = 0 } = n.task.result || {};
                   const startUrl = n.task.start_url || n.task.documents?.[0]?.replace('Web crawl: ', '') || '';
@@ -140,8 +144,43 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
               </Stack>
             )}
 
-            {/* All crawl tasks done — waiting for exit to fire */}
-            {allCrawlsDone && (
+            {/* Active file upload task progress */}
+            {pendingUploadTasks.length > 0 && (
+              <Stack gap="density-md" style={{
+                background: 'var(--background-color-surface-raised)',
+                borderRadius: '8px',
+                padding: '16px',
+                border: '1px solid var(--border-color-subtle)',
+              }}>
+                <Text kind="body/semibold/sm">Active File Ingestions</Text>
+                {pendingUploadTasks.map(n => {
+                  const { documents = [], total_documents = 0 } = n.task.result || {};
+                  const fileCount = n.task.documents?.length ?? 0;
+                  return (
+                    <Stack key={n.id} gap="density-xs">
+                      <Flex align="center" gap="density-sm">
+                        <Spinner size="small" aria-label="Ingesting" />
+                        <Stack gap="0">
+                          <Text kind="body/semibold/xs">{n.task.collection_name}</Text>
+                          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+                            {fileCount} file{fileCount !== 1 ? 's' : ''}
+                          </Text>
+                        </Stack>
+                      </Flex>
+                      <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+                        {total_documents > 0
+                          ? `${documents.length} / ${total_documents} processed`
+                          : 'Processing…'}
+                      </Text>
+                      <ProgressBar kind="indeterminate" aria-label="Ingest in progress" />
+                    </Stack>
+                  );
+                })}
+              </Stack>
+            )}
+
+            {/* All ingest tasks done — waiting for exit to fire */}
+            {allIngestDone && (
               <Flex align="center" gap="density-sm" style={{
                 background: 'var(--background-color-surface-raised)',
                 borderRadius: '8px',
@@ -150,7 +189,7 @@ export function CrawlModeGuard({ children }: CrawlModeGuardProps) {
               }}>
                 <Spinner size="small" aria-label="Restoring" />
                 <Text kind="body/regular/sm">
-                  Crawl complete — initiating inference mode restore…
+                  Ingestion complete — initiating inference mode restore…
                 </Text>
               </Flex>
             )}

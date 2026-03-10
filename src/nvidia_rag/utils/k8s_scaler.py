@@ -43,6 +43,11 @@ import threading
 import time
 from typing import Optional
 
+_NIM_LLM_PROFILE = os.environ.get(
+    "NIM_LLM_PROFILE",
+    "e9cc0c5ea49283a493a0b18a05a97eb9b15a82a0d6acbb967e35609ddeb767fa",
+)
+
 logger = logging.getLogger(__name__)
 
 _NAMESPACE = os.environ.get("K8S_SCALER_NAMESPACE", "rag")
@@ -78,6 +83,35 @@ def _patch_replicas(apps_v1, name: str, replicas: int) -> bool:
     except Exception as exc:
         logger.warning("k8s: failed to scale %s/%s: %r", _NAMESPACE, name, exc)
         return False
+
+
+def _wait_scheduled(name: str, timeout: int = 200) -> None:
+    """Poll until at least one pod for the deployment is Running (GPU slot claimed)."""
+    try:
+        from kubernetes import client, config as k8s_config
+        try:
+            k8s_config.load_incluster_config()
+        except Exception:
+            k8s_config.load_kube_config()
+        core_v1 = client.CoreV1Api()
+    except Exception as exc:
+        logger.warning("k8s: _wait_scheduled unavailable: %r", exc)
+        return
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            pods = core_v1.list_namespaced_pod(
+                _NAMESPACE, label_selector=f"app={name}"
+            )
+            for pod in pods.items:
+                if pod.status and pod.status.phase == "Running":
+                    logger.info("k8s: %s/%s pod is Running — GPU slot claimed", _NAMESPACE, name)
+                    return
+        except Exception:
+            pass
+        time.sleep(5)
+    logger.warning("k8s: timeout waiting for %s/%s to reach Running", _NAMESPACE, name)
 
 
 def _wait_scaled_down(apps_v1, name: str, timeout: int = 120) -> None:
@@ -133,10 +167,40 @@ def _restore_inference_blocking() -> None:
     _patch_replicas(apps_v1, "nemotron-parse-v12", 0)
     _wait_scaled_down(apps_v1, "nemotron-parse-v12", timeout=120)
 
-    # Step 2: nim-llm → 1 (device-plugin assigns it to GPU0, now empty)
+    # Step 2: ensure nim-llm uses the correct single-GPU TP1 NVFP4 profile,
+    # then scale to 1. Device-plugin assigns it to the first available GPU.
+    try:
+        apps_v1.patch_namespaced_deployment(
+            name="nim-llm",
+            namespace=_NAMESPACE,
+            body={"spec": {"template": {"spec": {"containers": [
+                {"name": "nim-llm-ctr", "env": [
+                    {"name": "NIM_MODEL_PROFILE", "value": _NIM_LLM_PROFILE}
+                ]}
+            ]}}}},
+        )
+        logger.info("k8s: nim-llm NIM_MODEL_PROFILE set to %s", _NIM_LLM_PROFILE)
+    except Exception as exc:
+        logger.warning("k8s: could not patch nim-llm NIM_MODEL_PROFILE: %r", exc)
+        # Fallback: use kubectl set env via subprocess
+        try:
+            import subprocess
+            subprocess.run(
+                ["kubectl", "set", "env", "-n", _NAMESPACE, "deploy/nim-llm",
+                 f"NIM_MODEL_PROFILE={_NIM_LLM_PROFILE}"],
+                check=True, capture_output=True,
+            )
+            logger.info("k8s: nim-llm NIM_MODEL_PROFILE set via kubectl")
+        except Exception as exc2:
+            logger.warning("k8s: kubectl fallback also failed: %r", exc2)
+
     _patch_replicas(apps_v1, "nim-llm", 1)
 
-    # Step 3: fill remaining GPU0 slots with placeholders
+    # Step 3: wait for nim-llm pod to reach Running (GPU slot claimed) before
+    # filling remaining slots — prevents gpu0-placeholder racing nim-llm.
+    _wait_scheduled("nim-llm")
+
+    # Step 4: fill remaining GPU0 slots with placeholders
     _patch_replicas(apps_v1, "gpu0-placeholder", _PLACEHOLDER_REPLICAS)
 
     # Step 4: nemotron-parse inference replicas → forced to GPU1

@@ -459,6 +459,10 @@ export default function NewCollection() {
             <CollectionConfigurationPanel
               generateSummary={collectionConfig.generateSummary}
               onGenerateSummaryChange={(value) => setCollectionConfig({ generateSummary: value })}
+              useNemotronParse={collectionConfig.useNemotronParse}
+              onUseNemotronParseChange={(value) => setCollectionConfig({ useNemotronParse: value, forceNemotronParse: value ? collectionConfig.forceNemotronParse : false })}
+              forceNemotronParse={collectionConfig.forceNemotronParse}
+              onForceNemotronParseChange={(value) => setCollectionConfig({ forceNemotronParse: value, useNemotronParse: value ? true : collectionConfig.useNemotronParse })}
             />
 
             <MetadataSchemaEditor />

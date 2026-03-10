@@ -529,6 +529,12 @@ class NvidiaRAGIngestor:
                         )
                     finally:
                         _cleanup_nemoparse_temps(_temp_files_for_cleanup)
+                        # Restore inference GPU layout once ingest completes/fails.
+                        try:
+                            from nvidia_rag.utils.k8s_scaler import disable_crawl_mode
+                            disable_crawl_mode()
+                        except Exception as _exc:
+                            logger.warning("disable_crawl_mode() in ingest task failed (non-fatal): %r", _exc)
 
                 task_id = await INGESTION_TASK_HANDLER.submit_task(
                     _task, task_id=task_id

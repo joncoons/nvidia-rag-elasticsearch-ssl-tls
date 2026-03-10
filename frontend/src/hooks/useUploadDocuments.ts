@@ -48,6 +48,7 @@ export function useUploadDocuments() {
             id: responseData.task_id,
             collection_name: String(data.metadata.collection_name),
             documents: data.files.map((f) => f.name),
+            task_type: "upload" as const,
             state: "PENDING" as const,
             created_at: new Date().toISOString(),
           };

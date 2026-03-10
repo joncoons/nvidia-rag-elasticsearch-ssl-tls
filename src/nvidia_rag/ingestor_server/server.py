@@ -864,6 +864,15 @@ async def upload_document(
             documents, payload.collection_name
         )
 
+        # Switch to ingest GPU layout before starting a background ingest task
+        # (same layout as crawl: nim-llm=0, nemotron-parse=N).
+        if not payload.blocking:
+            try:
+                from nvidia_rag.utils.k8s_scaler import enable_crawl_mode
+                enable_crawl_mode()
+            except Exception as _exc:
+                logger.warning("enable_crawl_mode() failed (non-fatal): %r", _exc)
+
         response_dict = await NV_INGEST_INGESTOR.upload_documents(
             filepaths=all_file_paths,
             vdb_auth_token=vdb_auth_token,
