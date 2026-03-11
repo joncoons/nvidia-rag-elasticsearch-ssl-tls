@@ -24,12 +24,14 @@ interface CollectionDrawerState {
   activeCollection: Collection | null;
   showUploader: boolean;
   showCrawler: boolean;
+  showMediaQueue: boolean;
   deleteError: string | null;
 
   openDrawer: (collection: Collection) => void;
   closeDrawer: () => void;
   toggleUploader: (show?: boolean) => void;
   toggleCrawler: (show?: boolean) => void;
+  toggleMediaQueue: (show?: boolean) => void;
   setDeleteError: (error: string | null) => void;
   updateActiveCollection: (collection: Collection) => void;
   reset: () => void;
@@ -55,25 +57,32 @@ export const useCollectionDrawerStore = create<CollectionDrawerState>((set) => (
   activeCollection: null,
   showUploader: false,
   showCrawler: false,
+  showMediaQueue: false,
   deleteError: null,
 
   openDrawer: (collection) =>
-    set({ isOpen: true, activeCollection: collection, showUploader: false, showCrawler: false }),
+    set({ isOpen: true, activeCollection: collection, showUploader: false, showCrawler: false, showMediaQueue: false }),
 
   closeDrawer: () =>
-    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, deleteError: null }),
+    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, showMediaQueue: false, deleteError: null }),
 
-  // Mutually exclusive: opening uploader closes crawler and vice-versa.
+  // All three sections are mutually exclusive.
   toggleUploader: (show) =>
     set((state) => {
       const next = show ?? !state.showUploader;
-      return { showUploader: next, showCrawler: next ? false : state.showCrawler };
+      return { showUploader: next, showCrawler: next ? false : state.showCrawler, showMediaQueue: next ? false : state.showMediaQueue };
     }),
 
   toggleCrawler: (show) =>
     set((state) => {
       const next = show ?? !state.showCrawler;
-      return { showCrawler: next, showUploader: next ? false : state.showUploader };
+      return { showCrawler: next, showUploader: next ? false : state.showUploader, showMediaQueue: next ? false : state.showMediaQueue };
+    }),
+
+  toggleMediaQueue: (show) =>
+    set((state) => {
+      const next = show ?? !state.showMediaQueue;
+      return { showMediaQueue: next, showUploader: next ? false : state.showUploader, showCrawler: next ? false : state.showCrawler };
     }),
 
   setDeleteError: (error) =>
@@ -87,5 +96,5 @@ export const useCollectionDrawerStore = create<CollectionDrawerState>((set) => (
     ),
 
   reset: () =>
-    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, deleteError: null }),
+    set({ isOpen: false, activeCollection: null, showUploader: false, showCrawler: false, showMediaQueue: false, deleteError: null }),
 })); 

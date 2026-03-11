@@ -48,5 +48,9 @@ COPY src/nvidia_rag/utils/k8s_scaler.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/k8s_scaler.py
 COPY src/nvidia_rag/utils/xml_preprocessor.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/xml_preprocessor.py
+COPY src/nvidia_rag/utils/batch_utils.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/batch_utils.py
+COPY src/nvidia_rag/utils/direct_ingest.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/direct_ingest.py
 COPY src/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py

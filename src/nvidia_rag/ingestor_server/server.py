@@ -744,6 +744,16 @@ class CrawlRequest(BaseModel):
             "and blocked_url_patterns.  Default False."
         ),
     )
+    extra_metadata: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional key/value pairs merged into every chunk's metadata at ingest "
+            "time.  Use this to attach collection-specific fields (e.g. product, "
+            "version, environment) that are not auto-populated by the crawler.  "
+            "Crawler-generated fields (source_uri, heading, page_title, etc.) always "
+            "take precedence over values supplied here."
+        ),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -954,7 +964,12 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
             pdf_repo_dir=CONFIG.pdf_repo_dir,
+            docs_repo_dir=CONFIG.docs_repo_dir,
+            audio_repo_dir=CONFIG.audio_repo_dir,
+            video_repo_dir=CONFIG.video_repo_dir,
+            max_media_file_mb=CONFIG.max_media_file_mb,
             task_id=task_id,
+            extra_metadata=payload.extra_metadata,
         )
 
         async def _crawl_task():
@@ -968,6 +983,154 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
         logger.error(f"Error starting crawl task: {e}")
         return JSONResponse(
             content={"message": f"Failed to start crawl: {e}"},
+            status_code=500,
+        )
+
+
+@app.get(
+    "/media-queue",
+    tags=["Ingestion APIs"],
+    response_model=dict,
+)
+@trace_function("ingestor.server.get_media_queue", tracer=TRACER)
+async def get_media_queue(
+    collection_name: str,
+    media_type: str | None = None,
+):
+    """Return pending audio/video files from the binary manifest for manual ingest.
+
+    Rows are considered pending when ``last_ingested_hash`` is empty or differs
+    from the current ``content_hash`` (file was updated since last ingest).
+
+    Query params:
+        collection_name: The collection whose manifest to inspect.
+        media_type: Optional filter — ``"audio"`` or ``"video"``.
+                    Omit to return all pending media rows.
+    """
+    from nvidia_rag.utils.web_crawler import load_binary_manifest
+
+    registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
+    try:
+        manifest = load_binary_manifest(collection_name, registry_dir)
+        pending = [
+            row for row in manifest
+            if row.get("media_type") in ("audio", "video")
+            and os.path.exists(row.get("local_path", ""))
+            and row.get("content_hash") != row.get("last_ingested_hash", "")
+            and (media_type is None or row.get("media_type") == media_type)
+        ]
+        return {
+            "collection_name": collection_name,
+            "pending": pending,
+            "total": len(pending),
+            "audio": sum(1 for r in pending if r.get("media_type") == "audio"),
+            "video": sum(1 for r in pending if r.get("media_type") == "video"),
+        }
+    except Exception as exc:
+        logger.error("get_media_queue failed: %r", exc)
+        return JSONResponse(
+            content={"message": f"Failed to read media queue: {exc}"},
+            status_code=500,
+        )
+
+
+class MediaIngestRequest(BaseModel):
+    """Request body for POST /ingest-media."""
+
+    collection_name: str = Field(..., description="Collection to ingest media files into.")
+    local_paths: list[str] = Field(
+        ...,
+        description=(
+            "List of NFS-local file paths from the binary manifest to ingest. "
+            "Paths must exist on the ingestor pod filesystem."
+        ),
+    )
+    use_nemoretriever_parse: bool = Field(
+        default=False,
+        description="Route complex PDF pages through nemoretriever-parse (rarely relevant for media).",
+    )
+
+
+@app.post(
+    "/ingest-media",
+    tags=["Ingestion APIs"],
+    response_model=IngestionTaskResponse,
+)
+@trace_function("ingestor.server.ingest_media", tracer=TRACER)
+async def ingest_media(request: Request, payload: MediaIngestRequest) -> IngestionTaskResponse:
+    """Manually trigger ingestion of NFS-persisted audio/video files.
+
+    Files are submitted to the existing nv-ingest pipeline which handles audio
+    transcription via Riva ASR gRPC (Parakeet 1.1B CTC) automatically.
+    Video files with audio tracks are also handled natively.
+
+    On success the ``last_ingested_hash`` is updated in the binary manifest so
+    the file no longer appears in ``GET /media-queue`` until its content changes.
+    """
+    from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
+    from nvidia_rag.utils.web_crawler import load_binary_manifest, save_binary_manifest
+    from uuid import uuid4
+
+    try:
+        vdb_auth_token = _extract_vdb_auth_token(request)
+        registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
+
+        # Validate that all paths exist before starting the task.
+        missing = [p for p in payload.local_paths if not os.path.exists(p)]
+        if missing:
+            return JSONResponse(
+                content={"message": f"File(s) not found: {missing}"},
+                status_code=400,
+            )
+
+        task_id = str(uuid4())
+
+        async def _media_ingest_task():
+            try:
+                from nvidia_rag.utils.k8s_scaler import enable_crawl_mode as _enable
+                _enable()
+            except Exception as _exc:
+                logger.warning("enable_crawl_mode() failed (non-fatal): %r", _exc)
+
+            try:
+                result = await NV_INGEST_INGESTOR.upload_documents(
+                    filepaths=payload.local_paths,
+                    collection_name=payload.collection_name,
+                    vdb_auth_token=vdb_auth_token,
+                    blocking=True,
+                    use_nemoretriever_parse=payload.use_nemoretriever_parse,
+                    force_nemoretriever_parse=False,
+                    skip_existing_check=True,
+                )
+                # Update last_ingested_hash only for files that ingested without error.
+                failed_names = {
+                    fd.get("document_name", "")
+                    for fd in (result or {}).get("failed_documents", [])
+                } if isinstance(result, dict) else set()
+                path_set = set(payload.local_paths)
+                manifest = load_binary_manifest(payload.collection_name, registry_dir)
+                for row in manifest:
+                    lp = row.get("local_path", "")
+                    if lp in path_set and os.path.basename(lp) not in failed_names:
+                        row["last_ingested_hash"] = row.get("content_hash", "")
+                save_binary_manifest(manifest, payload.collection_name, registry_dir)
+                return result
+            finally:
+                try:
+                    from nvidia_rag.utils.k8s_scaler import disable_crawl_mode as _disable
+                    _disable()
+                except Exception as _exc:
+                    logger.warning("disable_crawl_mode() failed (non-fatal): %r", _exc)
+
+        await INGESTION_TASK_HANDLER.submit_task(_media_ingest_task, task_id=task_id)
+        return IngestionTaskResponse(
+            message=f"Media ingest started for {len(payload.local_paths)} file(s)",
+            task_id=task_id,
+        )
+    except Exception as exc:
+        logger.error("ingest_media failed: %r", exc)
+        return JSONResponse(
+            content={"message": f"Failed to start media ingest: {exc}"},
             status_code=500,
         )
 

@@ -78,12 +78,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
@@ -105,23 +106,57 @@ _CRAWL_PROGRESS: dict[str, dict] = {}
 
 # Sentinel returned by _collect_binary_file when server responds 304 Not Modified.
 _UNCHANGED: tuple = ()
+# Sentinel returned by _collect_binary_file when the file was written to the
+# binary manifest (NFS-persisted documents — Phase 2 handles ingest).
+_MANIFEST: tuple = (None,)
+
+# Document extensions routed to NFS persistent repos + binary manifest.
+# Phase 3 (post-HTML-drain) batch-ingests these automatically.
+_NFS_DOCUMENT_EXTENSIONS = frozenset({
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+})
+
+# Audio extensions routed to NFS audio-repo + binary manifest (manual ingest).
+# nv-ingest handles WAV/MP3 natively; other formats need ffmpeg → WAV conversion.
+# Riva Parakeet 1.1B CTC ASR handles transcription via gRPC.
+_NFS_AUDIO_EXTENSIONS = frozenset({
+    ".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".opus",
+})
+
+# Video extensions routed to NFS video-repo + binary manifest (manual ingest).
+# nv-ingest extracts audio from MP4/AVI/MOV/MKV natively via Riva ASR.
+_NFS_VIDEO_EXTENSIONS = frozenset({
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v",
+})
+
+# Union of audio + video extensions for routing checks.
+_NFS_MEDIA_EXTENSIONS = _NFS_AUDIO_EXTENSIONS | _NFS_VIDEO_EXTENSIONS
+
+# Columns written to the per-crawl binary manifest CSV.
+# media_type: "document" | "audio" | "video"
+_BINARY_MANIFEST_COLUMNS = [
+    "source_uri", "filename", "local_path", "referring_page_url",
+    "content_hash", "crawl_depth", "file_size_bytes", "content_type",
+    "downloaded_at", "last_ingested_hash", "collection_name",
+    "media_type",
+]
 
 # File extensions considered binary / document files (not crawled as HTML).
 # These are downloaded and ingested when extract_linked_files=True.
-# Only extensions supported by nv-ingest are included.
 _BINARY_EXTENSIONS: frozenset[str] = frozenset(
     {
-        # Documents
+        # Documents (NFS + Phase 3 auto-ingest)
         ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls",
         # Markdown / plain text
         ".md", ".txt",
         # Images
         ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
-        # Audio
-        ".wav", ".mp3",
+        # Audio (NFS + manual ingest queue)
+        ".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".opus",
+        # Video (NFS + manual ingest queue) — nv-ingest extracts audio via Riva ASR
+        ".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v",
         # XML -- pre-processed to Markdown before ingestion via xml_preprocessor
         ".xml",
-        # Video excluded: avi/mkv/mov/mp4 have no nv-ingest extractor registered
     }
 )
 
@@ -130,6 +165,53 @@ def _is_binary_url(url: str) -> bool:
     """Return True if *url* points to a binary document file."""
     path = urlparse(url).path.lower()
     return any(path.endswith(ext) for ext in _BINARY_EXTENSIONS)
+
+
+def _collection_slug_for(collection_name: str) -> str:
+    """Return the filesystem-safe slug for *collection_name*."""
+    return re.sub(r"[^a-z0-9_-]", "_", collection_name.lower())
+
+
+def load_binary_manifest(collection_name: str, registry_dir: str) -> list[dict]:
+    """Load the binary manifest CSV for *collection_name* from *registry_dir*.
+
+    Returns an empty list if the manifest does not exist or cannot be read.
+    Used by server.py endpoints without needing a live SimpleWebCrawler instance.
+    """
+    slug = _collection_slug_for(collection_name)
+    path = os.path.join(registry_dir, f"{slug}_binary_manifest.csv")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+    except Exception as exc:
+        logger.warning("Could not load binary manifest at %s: %s", path, exc)
+        return []
+
+
+def save_binary_manifest(
+    manifest: list[dict], collection_name: str, registry_dir: str
+) -> None:
+    """Write *manifest* rows to the binary manifest CSV (overwrites).
+
+    Used by server.py endpoints to update ``last_ingested_hash`` after manual
+    media ingest without needing a live SimpleWebCrawler instance.
+    """
+    slug = _collection_slug_for(collection_name)
+    path = os.path.join(registry_dir, f"{slug}_binary_manifest.csv")
+    try:
+        os.makedirs(registry_dir, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=_BINARY_MANIFEST_COLUMNS,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(manifest)
+    except Exception as exc:
+        logger.warning("Could not save binary manifest to %s: %s", path, exc)
 
 
 def _same_domain(url: str, netloc: str) -> bool:
@@ -234,6 +316,16 @@ class SimpleWebCrawler:
         "/pulse", "/security", "/discussions"]``
         Trailing slashes are stripped automatically, so ``"/pull/"`` and
         ``"/pull"`` both block ``/pull/123`` and the ``/pulls`` listing page.
+    extra_metadata : dict or None
+        Additional metadata key/value pairs merged into every chunk's metadata
+        at ingest time.  Crawler-set fields (source_uri, page_title, heading,
+        etc.) always take precedence; extra_metadata fills in collection-specific
+        fields not auto-populated by the crawler.  Default None.
+    docs_repo_dir : str
+        Persistent directory for non-PDF Office documents (DOCX, XLSX, PPTX,
+        DOC, XLS, PPT) downloaded during crawl.  Mirrors ``pdf_repo_dir``.
+        Files are stored under ``<docs_repo_dir>/<collection_name>/<filename>``.
+        Empty string disables persistence (files go to a temp path).
     """
 
     def __init__(
@@ -262,6 +354,11 @@ class SimpleWebCrawler:
         blocked_url_patterns: list[str] | None = None,
         use_sitemap: bool = False,
         task_id: str | None = None,
+        extra_metadata: dict | None = None,
+        docs_repo_dir: str = "",
+        audio_repo_dir: str = "",
+        video_repo_dir: str = "",
+        max_media_file_mb: int = 500,
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.task_id = task_id
@@ -278,6 +375,13 @@ class SimpleWebCrawler:
         self._html_chunk_max_tokens = html_chunk_max_tokens
         self.export_dir = export_dir
         self.pdf_repo_dir = pdf_repo_dir
+        self.docs_repo_dir = docs_repo_dir
+        self.audio_repo_dir = audio_repo_dir
+        self.video_repo_dir = video_repo_dir
+        self.max_media_file_mb = max(1, max_media_file_mb)
+        # Caller-supplied metadata defaults — merged at chunk-build time.
+        # Crawler-auto-populated fields always win over these.
+        self.extra_metadata: dict = dict(extra_metadata or {})
         self.allowed_url_prefixes = [p.rstrip("/") for p in allowed_url_prefixes] if allowed_url_prefixes else None
         self.max_depth = max_depth
         # Strip trailing slashes so e.g. "/pull/" also blocks "/pulls" (listing pages).
@@ -393,9 +497,11 @@ class SimpleWebCrawler:
         }
         pages_crawled = 0
         pages_skipped = 0   # unchanged HTML pages (hash match)
-        files_skipped = 0   # unchanged binary files (304)
+        files_skipped = 0   # unchanged inline binary files (304)
         total_files_dispatched = 0
         files_ingested = 0
+        binary_files_ingested = 0   # NFS-persisted documents ingested in Phase 3
+        binary_files_skipped = 0    # NFS-persisted documents skipped (unchanged)
 
         # Current batch being accumulated before dispatch
         pending: list[tuple[str, dict]] = []
@@ -655,8 +761,12 @@ class SimpleWebCrawler:
                     if is_changed:
                         changed_urls.add(url)
                     # New or changed — extract semantic elements, chunk, queue for ingest
+                    # extra_metadata provides user-set defaults; crawler-auto
+                    # fields are listed last so they always take precedence.
                     base_meta = {
+                        **self.extra_metadata,
                         "source_uri": url,
+                        "filename": url.rstrip("/").rsplit("/", 1)[-1] or self._netloc,
                         "page_title": page_title,
                         "crawl_depth": depth,
                         "section_h1": section_h1,
@@ -679,6 +789,9 @@ class SimpleWebCrawler:
                             meta = {**base_meta}
                             if section_path:
                                 meta["section_path"] = section_path
+                                # heading = most immediate parent heading — better
+                                # for exact-match pre-filtering than full breadcrumb.
+                                meta["heading"] = section_path.split(" > ")[-1].strip()
                             pending.append((
                                 tmp_path,
                                 {"filename": os.path.basename(tmp_path), "metadata": meta},
@@ -755,6 +868,7 @@ class SimpleWebCrawler:
 
                             entry, file_meta = self._collect_binary_file(
                                 abs_href, depth + 1, all_temp_files, errors,
+                                referring_page_url=url,
                                 if_none_match=if_none_match,
                                 if_modified_since=if_modified_since,
                             )
@@ -771,14 +885,27 @@ class SimpleWebCrawler:
                                         "will purge ES chunks and remove from registry",
                                         file_meta["status_code"], abs_href,
                                     )
+                            elif entry is _MANIFEST:
+                                # NFS-persisted document file — recorded in binary manifest,
+                                # will be batch-ingested in Phase 2 after HTML drain.
+                                file_is_changed = bool(
+                                    file_reg.get("last_ingested")
+                                    and file_reg.get("content_hash")
+                                    and file_meta.get("content_hash")
+                                    and file_reg["content_hash"] != file_meta["content_hash"]
+                                )
+                                if file_is_changed:
+                                    changed_urls.add(abs_href)
+                                file_reg_update = {
+                                    "last_seen": now_iso,
+                                    "last_modified": file_meta.get("last_modified"),
+                                    "etag": file_meta.get("etag"),
+                                    "content_hash": file_meta.get("content_hash"),
+                                    "status_code": file_meta.get("status_code", 200),
+                                }
+                                registry[abs_href] = file_reg_update
                             else:
-                                # Track re-ingested binary files for stale chunk deletion.
-                                # Only treat as changed if the content hash actually differs
-                                # (same logic as HTML pages). Without this guard every
-                                # previously-ingested PDF would trigger a delete+re-ingest
-                                # on every crawl pass, inflating ES deleted-doc counts.
-                                # Falls back to re-ingest (no delete) when either hash is
-                                # absent — safe default.
+                                # Inline binary file (images, audio, text) — add to pending batch.
                                 file_is_changed = bool(
                                     file_reg.get("last_ingested")
                                     and file_reg.get("content_hash")
@@ -841,7 +968,7 @@ class SimpleWebCrawler:
                 pages_crawled, pages_skipped, len(in_flight),
             )
 
-            # Poll until all in-flight futures complete.
+            # Poll until all HTML in-flight futures complete.
             # Bound the wait so a permanently-stuck future cannot block forever;
             # each future has its own internal 600 s nv-ingest timeout, so
             # drain_timeout gives a generous outer guard on top of that.
@@ -858,6 +985,99 @@ class SimpleWebCrawler:
                     break
                 time.sleep(2)
                 _harvest_done()
+
+            # ── Phase 3: batch-ingest NFS-persisted binary documents ─────────
+            # All HTML batches are now drained.  Read the binary manifest and
+            # ingest any rows whose content_hash changed since last ingest.
+            binary_manifest = self._load_binary_manifest()
+            binary_files_ingested = 0
+            binary_files_skipped = 0
+            if binary_manifest:
+                pending_binary = [
+                    row for row in binary_manifest
+                    if row.get("local_path") and os.path.exists(row["local_path"])
+                    and row.get("content_hash") != row.get("last_ingested_hash", "")
+                ]
+                logger.info(
+                    "Phase 3 binary ingest: %d/%d manifest rows need ingest",
+                    len(pending_binary), len(binary_manifest),
+                )
+                binary_files_skipped = len(binary_manifest) - len(pending_binary)
+                # Group by PDF vs. other to apply different parse flags.
+                # Only process document media_type rows here; audio/video are
+                # pending for manual trigger via POST /ingest-media.
+                pending_docs = [r for r in pending_binary if r.get("media_type", "document") == "document"]
+                pdf_rows = [r for r in pending_docs if r["local_path"].lower().endswith(".pdf")]
+                other_rows = [r for r in pending_docs if not r["local_path"].lower().endswith(".pdf")]
+
+                def _ingest_binary_batch(rows: list[dict], use_parse: bool, force_parse: bool) -> int:
+                    """Submit one batch of binary rows; return count successfully ingested."""
+                    if not rows:
+                        return 0
+                    filepaths = [r["local_path"] for r in rows]
+                    custom_metadata = [
+                        {
+                            "filename": os.path.basename(r["local_path"]),
+                            "metadata": {
+                                **self.extra_metadata,
+                                "source_uri": r["source_uri"],
+                                "filename": r["filename"],
+                                "referring_page_url": r.get("referring_page_url", ""),
+                                "crawl_depth": int(r.get("crawl_depth", 0)),
+                                "document_type": Path(r["filename"]).suffix.lstrip(".").lower(),
+                                "source_system": "web_crawl",
+                            },
+                        }
+                        for r in rows
+                    ]
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            ingestor.upload_documents(
+                                filepaths=filepaths,
+                                collection_name=collection_name,
+                                vdb_auth_token=vdb_auth_token,
+                                blocking=True,
+                                custom_metadata=custom_metadata,
+                                use_nemoretriever_parse=use_parse,
+                                force_nemoretriever_parse=force_parse,
+                                source_system="web_crawl",
+                                is_final_batch=False,
+                            ),
+                            loop,
+                        )
+                        result = fut.result(timeout=600)
+                        failed = {
+                            fd.get("document_name", "")
+                            for fd in (result or {}).get("failed_documents", [])
+                        } if isinstance(result, dict) else set()
+                        # Mark successfully ingested rows
+                        for r in rows:
+                            if os.path.basename(r["local_path"]) not in failed:
+                                r["last_ingested_hash"] = r["content_hash"]
+                        return len(rows) - len(failed)
+                    except Exception as exc:
+                        logger.error("Phase 3 binary ingest batch failed: %r", exc)
+                        return 0
+
+                # Process in batch_ingest_size chunks
+                for i in range(0, len(pdf_rows), self.batch_ingest_size):
+                    batch = pdf_rows[i : i + self.batch_ingest_size]
+                    binary_files_ingested += _ingest_binary_batch(
+                        batch,
+                        use_parse=self.use_nemoretriever_parse,
+                        force_parse=self.force_nemoretriever_parse,
+                    )
+                for i in range(0, len(other_rows), self.batch_ingest_size):
+                    batch = other_rows[i : i + self.batch_ingest_size]
+                    binary_files_ingested += _ingest_binary_batch(
+                        batch, use_parse=False, force_parse=False,
+                    )
+
+                self._save_binary_manifest(binary_manifest)
+                logger.info(
+                    "Phase 3 complete: %d binary files ingested, %d skipped (unchanged)",
+                    binary_files_ingested, binary_files_skipped,
+                )
 
         finally:
             for tp in all_temp_files:
@@ -898,8 +1118,8 @@ class SimpleWebCrawler:
                     "Removed %d deleted URL(s) from registry", len(deleted_urls)
                 )
 
-            # Always persist the updated registry + error CSV and export
-            # artifacts — even on interrupt/SIGTERM.
+            # Always persist the updated registry + error CSV + binary manifest
+            # and export artifacts — even on interrupt/SIGTERM.
             self._save_registry(registry)
             self._flush_errors_to_csv(errors, error_matrix)
             self._export_crawl_artifacts()
@@ -907,7 +1127,8 @@ class SimpleWebCrawler:
             # Restore inference GPU layout in a background thread (non-blocking).
             disable_crawl_mode()
 
-        binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
+        inline_binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
+        total_binary_ingested = inline_binary_files + binary_files_ingested
 
         # Remove live progress entry — task is now FINISHED/FAILED.
         _CRAWL_PROGRESS.pop(self.task_id, None)
@@ -915,16 +1136,17 @@ class SimpleWebCrawler:
         return {
             "message": (
                 f"Crawl complete: {pages_crawled - pages_skipped} HTML pages and "
-                f"{binary_files} linked files ingested "
-                f"({pages_skipped} pages and {files_skipped} files unchanged/skipped)."
+                f"{total_binary_ingested} linked files ingested "
+                f"({pages_skipped} pages and {files_skipped + binary_files_skipped} "
+                f"files unchanged/skipped)."
             ),
             "task_type": "crawl",
             "start_url": self.start_url,
             "collection_name": self.collection_name,
             "pages_crawled": pages_crawled,
             "pages_skipped": pages_skipped,
-            "files_skipped": files_skipped,
-            "files_ingested": binary_files,
+            "files_skipped": files_skipped + binary_files_skipped,
+            "files_ingested": total_binary_ingested,
             "errors": errors,
             "error_matrix": error_matrix,
         }
@@ -1371,6 +1593,7 @@ class SimpleWebCrawler:
         depth: int,
         all_temp_files: list[str],
         errors: list[dict],
+        referring_page_url: str = "",
         if_none_match: str | None = None,
         if_modified_since: str | None = None,
     ) -> tuple[tuple[str, dict] | tuple | None, dict]:
@@ -1380,6 +1603,8 @@ class SimpleWebCrawler:
         ``entry`` is one of:
         * ``(tmp_path, metadata_dict)`` — new or changed file, add to batch.
         * ``_UNCHANGED`` (empty tuple sentinel) — server returned 304, skip.
+        * ``_MANIFEST`` — NFS-persisted document (PDF/Office); row appended to
+          binary manifest for Phase 3 batch ingest.  No temp file added.
         * ``None`` — download or pre-processing failed, error logged.
 
         ``response_meta`` carries ``last_modified``, ``etag``,
@@ -1404,41 +1629,129 @@ class SimpleWebCrawler:
                 logger.debug("304 Not Modified (unchanged): %s", url)
                 return _UNCHANGED, empty_meta
             resp.raise_for_status()
-            # PDFs go to the persistent repo dir (if configured) so they are
-            # retained after ingest and accessible on the host filesystem.
-            if self.pdf_repo_dir and suffix.lower() == ".pdf":
-                dest_dir = Path(self.pdf_repo_dir) / self.collection_name
-                dest_dir.mkdir(parents=True, exist_ok=True)
+
+            suffix_lower = suffix.lower()
+            is_nfs_document = suffix_lower in _NFS_DOCUMENT_EXTENSIONS
+            is_pdf = suffix_lower == ".pdf"
+            is_nfs_media = suffix_lower in _NFS_MEDIA_EXTENSIONS
+
+            # ── media file size cap ──────────────────────────────────────────
+            if is_nfs_media:
+                content_length = int(resp.headers.get("Content-Length", 0))
+                max_bytes = self.max_media_file_mb * 1024 * 1024
+                if content_length > 0 and content_length > max_bytes:
+                    size_mb = content_length // (1024 * 1024)
+                    logger.warning(
+                        "Media file too large (%d MB > %d MB limit), skipping: %s",
+                        size_mb, self.max_media_file_mb, url,
+                    )
+                    errors.append({
+                        "url": url,
+                        "error_type": "missing_file",
+                        "status_code": resp.status_code,
+                        "error": f"file size {size_mb} MB exceeds limit {self.max_media_file_mb} MB",
+                    })
+                    return None, {"status_code": resp.status_code}
+
+            if is_nfs_document:
+                # Route to typed NFS persistent repo so files survive pod restarts.
+                if is_pdf and self.pdf_repo_dir:
+                    dest_dir = Path(self.pdf_repo_dir) / self.collection_name
+                    manifest_media_type = "document"
+                elif not is_pdf and self.docs_repo_dir:
+                    dest_dir = Path(self.docs_repo_dir) / self.collection_name
+                    manifest_media_type = "document"
+                else:
+                    # NFS not configured — fall through to temp-file path below.
+                    is_nfs_document = False
+                    dest_dir = None  # silence linter
+                    manifest_media_type = ""
+            elif is_nfs_media:
+                # Route audio/video to typed NFS repo for manual ingest queue.
+                if suffix_lower in _NFS_AUDIO_EXTENSIONS and self.audio_repo_dir:
+                    dest_dir = Path(self.audio_repo_dir) / self.collection_name
+                    manifest_media_type = "audio"
+                elif suffix_lower in _NFS_VIDEO_EXTENSIONS and self.video_repo_dir:
+                    dest_dir = Path(self.video_repo_dir) / self.collection_name
+                    manifest_media_type = "video"
+                else:
+                    # NFS not configured — fall through to temp-file path below.
+                    is_nfs_media = False
+                    dest_dir = None  # silence linter
+                    manifest_media_type = ""
+            else:
+                manifest_media_type = ""
+
+            if is_nfs_document or is_nfs_media:
+                dest_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
                 filename = Path(urlparse(url).path).name or f"download{suffix}"
                 tmp_path = str(dest_dir / filename)
                 with open(tmp_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             fh.write(chunk)
-                logger.debug("Downloaded PDF to persistent repo: %s", tmp_path)
-                # Validate the downloaded PDF is parseable before queuing it.
-                try:
-                    from pdf2image import pdfinfo_from_path as _pdfinfo
-                    _pdfinfo(tmp_path)
-                except Exception as pdf_exc:
-                    logger.warning(
-                        "Corrupt or unreadable PDF at %s (pdfinfo failed: %s) — skipping",
-                        url, pdf_exc,
-                    )
-                    errors.append({
-                        "url": url,
-                        "error_type": "corrupt_file",
-                        "status_code": resp.status_code,
-                        "error": f"pdfinfo validation failed: {pdf_exc}",
-                    })
-                    return None, {"status_code": resp.status_code}
+                logger.debug(
+                    "Downloaded %s (%s) to NFS repo: %s",
+                    suffix_lower, manifest_media_type, tmp_path,
+                )
+
+                # Validate PDFs before registering them.
+                if is_pdf:
+                    try:
+                        from pdf2image import pdfinfo_from_path as _pdfinfo
+                        _pdfinfo(tmp_path)
+                    except Exception as pdf_exc:
+                        logger.warning(
+                            "Corrupt or unreadable PDF at %s (pdfinfo failed: %s) — skipping",
+                            url, pdf_exc,
+                        )
+                        errors.append({
+                            "url": url,
+                            "error_type": "corrupt_file",
+                            "status_code": resp.status_code,
+                            "error": f"pdfinfo validation failed: {pdf_exc}",
+                        })
+                        return None, {"status_code": resp.status_code}
+
+                # Compute hash and append to binary manifest.
+                with open(tmp_path, "rb") as fh:
+                    content_hash = _sha256(fh.read())
+                file_size = os.path.getsize(tmp_path)
+                content_type = resp.headers.get("Content-Type", "")
+                file_meta: dict = {
+                    "last_modified": resp.headers.get("Last-Modified"),
+                    "etag": resp.headers.get("ETag"),
+                    "content_hash": content_hash,
+                    "status_code": resp.status_code,
+                }
+                # Load existing manifest, remove any stale row for this URL,
+                # then append the fresh row.
+                manifest = self._load_binary_manifest()
+                manifest = [r for r in manifest if r.get("source_uri") != url]
+                manifest.append({
+                    "source_uri": url,
+                    "filename": filename,
+                    "local_path": tmp_path,
+                    "referring_page_url": referring_page_url,
+                    "content_hash": content_hash,
+                    "crawl_depth": depth,
+                    "file_size_bytes": file_size,
+                    "content_type": content_type,
+                    "downloaded_at": datetime.now(UTC).isoformat(),
+                    "last_ingested_hash": "",
+                    "collection_name": self.collection_name,
+                    "media_type": manifest_media_type,
+                })
+                self._save_binary_manifest(manifest)
+                return _MANIFEST, file_meta
             else:
                 tmp_path = self._save_temp_stream(resp, suffix=suffix)
                 all_temp_files.append(tmp_path)
+
             # Compute hash from the downloaded file
             with open(tmp_path, "rb") as fh:
                 content_hash = _sha256(fh.read())
-            file_meta: dict = {
+            file_meta = {
                 "last_modified": resp.headers.get("Last-Modified"),
                 "etag": resp.headers.get("ETag"),
                 "content_hash": content_hash,
@@ -1490,15 +1803,54 @@ class SimpleWebCrawler:
         entry = (
             tmp_path,
             {
-                "filename": os.path.basename(tmp_path),
+                "filename": Path(urlparse(url).path).name or os.path.basename(tmp_path),
                 "metadata": {
+                    **self.extra_metadata,
                     "source_uri": url,
+                    "filename": Path(urlparse(url).path).name or os.path.basename(tmp_path),
+                    "referring_page_url": referring_page_url,
                     "crawl_depth": depth,
                     "source_system": "web_crawl",
                 },
             },
         )
         return entry, file_meta
+
+    # ── binary manifest helpers ───────────────────────────────────────────────
+
+    def _binary_manifest_path(self) -> str:
+        """Return the path to the per-crawl binary manifest CSV."""
+        slug = self._collection_slug()
+        return os.path.join(self.registry_dir, f"{slug}_binary_manifest.csv")
+
+    def _load_binary_manifest(self) -> list[dict]:
+        """Load the binary manifest CSV; return empty list if it does not exist."""
+        path = self._binary_manifest_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                return list(reader)
+        except Exception as exc:
+            logger.warning("Could not load binary manifest at %s: %s", path, exc)
+            return []
+
+    def _save_binary_manifest(self, manifest: list[dict]) -> None:
+        """Write *manifest* rows to the binary manifest CSV (overwrites)."""
+        path = self._binary_manifest_path()
+        try:
+            os.makedirs(self.registry_dir, exist_ok=True)
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=_BINARY_MANIFEST_COLUMNS,
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(manifest)
+        except Exception as exc:
+            logger.warning("Could not save binary manifest to %s: %s", path, exc)
 
     def _flush_errors_to_csv(
         self,
@@ -1581,6 +1933,7 @@ class SimpleWebCrawler:
         sources = [
             os.path.join(self.registry_dir, f"{slug}_url_registry.json"),
             os.path.join(self.registry_dir, f"{slug}_error_matrix.csv"),
+            os.path.join(self.registry_dir, f"{slug}_binary_manifest.csv"),
         ]
         try:
             os.makedirs(self.export_dir, exist_ok=True)

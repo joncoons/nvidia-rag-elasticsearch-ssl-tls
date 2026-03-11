@@ -95,6 +95,8 @@ interface NewCollectionState {
   collectionConfig: CollectionConfiguration;
   // Crawl configuration
   crawlConfig: CrawlConfiguration;
+  // Global metadata defaults for crawl (analogous to per-file fileMetadata)
+  crawlMetadata: Record<string, unknown>;
   setCollectionName: (name: string) => void;
   setCollectionNameTouched: (touched: boolean) => void;
   setMetadataSchema: (schema: UIMetadataField[]) => void;
@@ -108,6 +110,8 @@ interface NewCollectionState {
   setCollectionConfig: (updates: Partial<CollectionConfiguration>) => void;
   // Crawl configuration setters
   setCrawlConfig: (updates: Partial<CrawlConfiguration>) => void;
+  // Crawl metadata setters
+  setCrawlMetadataField: (field: string, value: unknown) => void;
   addFiles: (files: File[]) => void;
   setFiles: (files: File[]) => void;
   removeFile: (index: number) => void;
@@ -326,6 +330,7 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
   catalogMetadata: { ...defaultCatalogMetadata },
   collectionConfig: { ...defaultCollectionConfig },
   crawlConfig: { ...defaultCrawlConfig },
+  crawlMetadata: {},
 
   setCollectionName: (name) => set({ collectionName: name }),
   setCollectionNameTouched: (touched) => set({ collectionNameTouched: touched }),
@@ -341,6 +346,10 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
   })),
   setCrawlConfig: (updates) => set((state) => ({
     crawlConfig: { ...state.crawlConfig, ...updates }
+  })),
+
+  setCrawlMetadataField: (field, value) => set((state) => ({
+    crawlMetadata: { ...state.crawlMetadata, [field]: value },
   })),
 
   setMetadataSchema: (schema) => {
@@ -485,5 +494,6 @@ export const useNewCollectionStore = create<NewCollectionState>((set, get) => ({
       catalogMetadata: { ...defaultCatalogMetadata },
       collectionConfig: { ...defaultCollectionConfig },
       crawlConfig: { ...defaultCrawlConfig },
+      crawlMetadata: {},
     }),
 }));

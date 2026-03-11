@@ -18,6 +18,7 @@ import { useNewCollectionStore } from "../../store/useNewCollectionStore";
 import { useCollectionDrawerStore } from "../../store/useCollectionDrawerStore";
 import { useCollectionActions } from "../../hooks/useCollectionActions";
 import { Button, Stack, Flex, Text, Switch, Spinner, TextInput } from "@kui/react";
+import { CrawlMetadataForm } from "./CrawlMetadataForm";
 
 const CloseIcon = () => (
   <svg style={{ width: '16px', height: '16px', color: 'white' }} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -262,6 +263,8 @@ export const WebCrawlSection = () => {
           </Text>
         </Stack>
       </Flex>
+
+      <CrawlMetadataForm />
 
       <Button
         onClick={handleSubmit}

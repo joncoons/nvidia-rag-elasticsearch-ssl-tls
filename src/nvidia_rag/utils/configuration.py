@@ -352,6 +352,26 @@ class NvIngestConfig(_ConfigBase):
             "treated as a failure so the crawl/ingest task can continue."
         ),
     )
+    max_concurrent_jobs: int = Field(
+        default=2,
+        env="APP_NVINGEST_MAX_CONCURRENT_JOBS",
+        description=(
+            "Maximum number of nv-ingest jobs that may be in-flight simultaneously "
+            "across all concurrent crawler batches and ingest calls. An asyncio.Semaphore "
+            "enforces this limit so that the Ray worker queue never accumulates more jobs "
+            "than workers can drain, preventing timeout cascades on large PDFs."
+        ),
+    )
+    enable_direct_ingest: bool = Field(
+        default=False,
+        env="APP_NVINGEST_ENABLE_DIRECT_INGEST",
+        description=(
+            "When True, nemoretriever-parse output chunks bypass nv-ingest entirely: "
+            "text is embedded directly via the embedding service and written to ES "
+            "using the async bulk API.  Eliminates Ray queue pressure and timeout "
+            "risk for text-only content (HTML pages, pre-chunked PDF text)."
+        ),
+    )
     caption_model_name: str = Field(
         default="nvidia/nemotron-nano-12b-v2-vl",
         env="APP_NVINGEST_CAPTIONMODELNAME",
@@ -1223,6 +1243,47 @@ class NvidiaRAGConfig(_ConfigBase):
             "Persistent directory for storing uploaded PDFs after ingestion. "
             "PDFs are stored under <pdf_repo_dir>/<collection_name>/<filename> "
             "and are NOT deleted after ingest. Empty string disables persistence."
+        ),
+    )
+    docs_repo_dir: str = Field(
+        default="",
+        env="APP_DOCS_REPO_DIR",
+        description=(
+            "Persistent directory for storing non-PDF Office documents (DOCX, XLSX, "
+            "PPTX, DOC, XLS, PPT) downloaded during web crawls. "
+            "Files are stored under <docs_repo_dir>/<collection_name>/<filename>. "
+            "Empty string disables persistence (files go to a temp path instead)."
+        ),
+    )
+    audio_repo_dir: str = Field(
+        default="",
+        env="APP_AUDIO_REPO_DIR",
+        description=(
+            "Persistent directory for storing audio files (MP3, WAV, FLAC, OGG, AAC, "
+            "M4A, OPUS) downloaded during web crawls. "
+            "Files are stored under <audio_repo_dir>/<collection_name>/<filename>. "
+            "Empty string disables persistence (files go to a temp path instead). "
+            "Ingestion is triggered manually via POST /ingest-media."
+        ),
+    )
+    video_repo_dir: str = Field(
+        default="",
+        env="APP_VIDEO_REPO_DIR",
+        description=(
+            "Persistent directory for storing video files (MP4, MKV, MOV, AVI, WEBM, "
+            "TS, M4V) downloaded during web crawls. "
+            "Files are stored under <video_repo_dir>/<collection_name>/<filename>. "
+            "Empty string disables persistence (files go to a temp path instead). "
+            "Ingestion is triggered manually via POST /ingest-media."
+        ),
+    )
+    max_media_file_mb: int = Field(
+        default=500,
+        env="APP_MAX_MEDIA_FILE_MB",
+        description=(
+            "Maximum file size in MB for audio/video downloads during web crawl. "
+            "Files larger than this limit (checked via Content-Length header before "
+            "downloading) are skipped and logged as errors. Default 500 MB."
         ),
     )
 

@@ -64,6 +64,16 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
+      '/api/media-queue': {
+        target: VDB_BASE,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/api/ingest-media': {
+        target: VDB_BASE,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
       '/api/configuration': {
         target: CHAT_TARGET,
         changeOrigin: true,
@@ -116,6 +126,16 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/api/crawl': {
+        target: VDB_BASE,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/api/media-queue': {
+        target: VDB_BASE,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/api/ingest-media': {
         target: VDB_BASE,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),

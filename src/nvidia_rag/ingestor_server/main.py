@@ -167,6 +167,13 @@ class NvidiaRAGIngestor:
         self.config = config or NvidiaRAGConfig()
         self.prompts = get_prompts(prompts)
 
+        # Global semaphore limiting simultaneous nv-ingest Ray jobs across all callers.
+        self._nv_ingest_sem = asyncio.Semaphore(self.config.nv_ingest.max_concurrent_jobs)
+
+        # Semaphore for direct-ingest embedding calls.  Embedding is fast compared to
+        # nv-ingest, so we allow more concurrency (8 batches × EMBED_BATCH_SIZE chunks).
+        self._embed_sem = asyncio.Semaphore(8)
+
         # Initialize instance-based clients
         self.nv_ingest_client = get_nv_ingest_client(
             config=self.config, get_lite_client=self.mode == Mode.LITE
@@ -290,6 +297,7 @@ class NvidiaRAGIngestor:
         source_system: str = "",
         is_final_batch: bool = True,
         source_uris_to_delete: list[str] | None = None,
+        skip_existing_check: bool = False,
     ) -> dict[str, Any]:
         """Upload documents to the vector store.
 
@@ -408,7 +416,9 @@ class NvidiaRAGIngestor:
                 " (force mode — Pass 1 skipped)" if force_nemoretriever_parse else "",
             )
             router = DocumentClassifierRouter.from_config(self.config)
-            routing_map = router.route_documents(filepaths, force=force_nemoretriever_parse)
+            routing_map = await asyncio.to_thread(
+                router.route_documents, filepaths, force=force_nemoretriever_parse
+            )
 
             replaced_filepaths: list[str] = []
             for fp in filepaths:
@@ -492,6 +502,51 @@ class NvidiaRAGIngestor:
 
         custom_metadata = augmented_metadata
 
+        # ----------------------------------------------------------------
+        # Direct-ingest path detection
+        # When APP_NVINGEST_ENABLE_DIRECT_INGEST=true, two cases qualify:
+        #
+        #  A) Nemoretriever-parse routing ran (chunk_to_original populated):
+        #     PDFs were converted to .md chunk files; embed directly.
+        #
+        #  B) All incoming files are already .md chunk files (no nemoretriever-
+        #     parse routing needed — this is the web-crawler case where the
+        #     crawler's internal HTML chunker writes one .md file per section
+        #     before calling upload_documents).
+        #
+        # In both cases the files are pre-chunked text, so we can read, embed,
+        # and bulk-write to ES without going through nv-ingest/Ray at all.
+        # ----------------------------------------------------------------
+        _all_md_pre_chunked = (
+            bool(filepaths)
+            and all(fp.lower().endswith((".md", ".txt")) for fp in filepaths)
+            and not chunk_to_original  # not already counted in case A
+        )
+        _use_direct_ingest: bool = (
+            self.config.nv_ingest.enable_direct_ingest
+            and (bool(chunk_to_original) or _all_md_pre_chunked)
+        )
+        _direct_source_uri_map: dict[str, str] = {}
+        _direct_extra_meta_map: dict[str, dict] = {}
+        if _use_direct_ingest:
+            for m in custom_metadata:
+                fname = m.get("filename", "")
+                meta = m.get("metadata", {})
+                if fname:
+                    _direct_source_uri_map[fname] = meta.get("source_uri", fname)
+                    # Carry over per-chunk metadata (section_path, chunk_index, etc.)
+                    extra = {
+                        k: v for k, v in meta.items()
+                        if k not in {"source_uri", "content_hash", "ingested_at",
+                                     "upload_batch_id", "source_system"}
+                    }
+                    if extra:
+                        _direct_extra_meta_map[fname] = extra
+            logger.info(
+                "Direct-ingest path active: %d chunk file(s) will bypass nv-ingest",
+                len(_direct_source_uri_map),
+            )
+
         # Initialize document-wise status
         nv_ingest_status = await state_manager.initialize_nv_ingest_status(filepaths)
 
@@ -526,6 +581,10 @@ class NvidiaRAGIngestor:
                             state_manager=state_manager,
                             documents_catalog_metadata=documents_catalog_metadata,
                             vdb_auth_token=vdb_auth_token,
+                            direct_ingest=_use_direct_ingest,
+                            direct_source_uri_map=_direct_source_uri_map,
+                            direct_extra_meta_map=_direct_extra_meta_map,
+                            skip_existing_check=skip_existing_check,
                         )
                     finally:
                         _cleanup_nemoparse_temps(_temp_files_for_cleanup)
@@ -585,6 +644,10 @@ class NvidiaRAGIngestor:
                         vdb_auth_token=vdb_auth_token,
                         is_final_batch=is_final_batch,
                         source_uris_to_delete=source_uris_to_delete,
+                        direct_ingest=_use_direct_ingest,
+                        direct_source_uri_map=_direct_source_uri_map,
+                        direct_extra_meta_map=_direct_extra_meta_map,
+                        skip_existing_check=skip_existing_check,
                     )
                 finally:
                     _cleanup_nemoparse_temps(_nemoparse_temp_files)
@@ -617,6 +680,10 @@ class NvidiaRAGIngestor:
         vdb_auth_token: str = "",
         is_final_batch: bool = True,
         source_uris_to_delete: list[str] | None = None,
+        direct_ingest: bool = False,
+        direct_source_uri_map: dict[str, str] | None = None,
+        direct_extra_meta_map: dict[str, dict] | None = None,
+        skip_existing_check: bool = False,
     ) -> dict[str, Any]:
         """
         Main function called by ingestor server to ingest
@@ -735,8 +802,10 @@ class NvidiaRAGIngestor:
                         }
                     )
 
-                # Check if the provided filepaths are already in vector-DB
-                if filename in existing_documents:
+                # Check if the provided filepaths are already in vector-DB.
+                # Skipped for media re-ingest (ingest-media endpoint) where the
+                # file may have been ingested before and is being re-processed.
+                if not skip_existing_check and filename in existing_documents:
                     logger.error(
                         f"Document {file} already exists. Upload failed. Please call PATCH /documents endpoint to delete and replace this file."
                     )
@@ -810,15 +879,23 @@ class NvidiaRAGIngestor:
                 vdb_op.delete_by_content_url(collection_name, source_uris_to_delete)
 
             start_time = time.time()
-            results, failures = await self.__run_nvingest_batched_ingestion(
-                filepaths=filepaths,
-                collection_name=collection_name,
-                vdb_op=vdb_op,
-                split_options=split_options,
-                generate_summary=generate_summary,
-                summary_options=summary_options,
-                state_manager=state_manager,
-            )
+            if direct_ingest and direct_source_uri_map:
+                results, failures = await self._run_direct_ingest(
+                    filepaths=filepaths,
+                    collection_name=collection_name,
+                    source_uri_map=direct_source_uri_map,
+                    extra_meta_map=direct_extra_meta_map,
+                )
+            else:
+                results, failures = await self.__run_nvingest_batched_ingestion(
+                    filepaths=filepaths,
+                    collection_name=collection_name,
+                    vdb_op=vdb_op,
+                    split_options=split_options,
+                    generate_summary=generate_summary,
+                    summary_options=summary_options,
+                    state_manager=state_manager,
+                )
 
             build_ingestion_response_start_time = time.time()
             response_data = await self.__build_ingestion_response(
@@ -828,6 +905,7 @@ class NvidiaRAGIngestor:
                 state_manager=state_manager,
                 is_final_batch=is_final_batch,
                 vdb_op=vdb_op,
+                direct_ingest=direct_ingest,
             )
             logger.info(
                 f"== Final build ingestion response and adding document info is complete! Time taken: {time.time() - build_ingestion_response_start_time} seconds =="
@@ -930,6 +1008,7 @@ class NvidiaRAGIngestor:
         is_final_batch: bool = True,
         state_manager: IngestionStateManager = None,
         vdb_op: VDBRag = None,
+        direct_ingest: bool = False,
     ) -> dict[str, Any]:
         """
         Builds the ingestion response dictionary.
@@ -939,6 +1018,7 @@ class NvidiaRAGIngestor:
             failures: List[dict[str, Any]] - List of failures from the ingestion process
             is_final_batch: bool - Whether the batch is the final batch
             state_manager: IngestionStateManager - State manager for the ingestion process
+            direct_ingest: bool - When True, skips VDB document_info existence checks (direct path)
         """
         # Get failed documents
         failed_documents = await self.__get_failed_documents(
@@ -946,6 +1026,7 @@ class NvidiaRAGIngestor:
             filepaths=filepaths,
             collection_name=state_manager.collection_name,
             is_final_batch=is_final_batch,
+            direct_ingest=direct_ingest,
         )
         failures_filepaths = [
             failed_document.get("document_name") for failed_document in failed_documents
@@ -981,8 +1062,10 @@ class NvidiaRAGIngestor:
                     raw_text_elements_size=raw_text_elements_size,
                 )
 
-                # Always add document info for each document
-                if not is_final_batch:
+                # Always add document info for each document.
+                # For direct-ingest we also write on the final batch because
+                # nv-ingest never ran and document_info was never populated.
+                if not is_final_batch or direct_ingest:
                     vdb_op.add_document_info(
                         info_type="document",
                         collection_name=state_manager.collection_name,
@@ -2357,6 +2440,54 @@ class NvidiaRAGIngestor:
 
             logger.info("Shallow extraction complete, starting deep ingestion")
 
+    async def _run_direct_ingest(
+        self,
+        filepaths: list[str],
+        collection_name: str,
+        source_uri_map: dict[str, str],
+        extra_meta_map: dict[str, dict] | None = None,
+    ) -> tuple[list, list]:
+        """
+        Embed nemoretriever-parse chunk files and write directly to ES.
+
+        Bypasses nv-ingest entirely: reads each pre-chunked text file,
+        calls the embedding API, and bulk-writes to ES using aiohttp.
+        Returns ``(results, failures)`` in the same shape expected by
+        ``__build_ingestion_response()`` — results is an empty list since
+        per-document nv-ingest metadata is not available on this path.
+        """
+        from nvidia_rag.utils.direct_ingest import ingest_chunk_files
+
+        logger.info(
+            "_run_direct_ingest: embedding %d chunk file(s) → collection=%s",
+            len(filepaths), collection_name,
+        )
+        try:
+            written = await ingest_chunk_files(
+                chunk_files=filepaths,
+                source_uri_map=source_uri_map,
+                collection_name=collection_name,
+                config=self.config,
+                embed_semaphore=self._embed_sem,
+                extra_meta_map=extra_meta_map,
+            )
+        except Exception as exc:
+            logger.exception("_run_direct_ingest failed: %r", exc)
+            failures = [
+                {"document_name": os.path.basename(fp), "error": str(exc)}
+                for fp in filepaths
+            ]
+            return [], failures
+
+        logger.info(
+            "_run_direct_ingest: %d/%d chunks written to collection=%s",
+            written, len(filepaths), collection_name,
+        )
+        # Build minimal results list so __build_ingestion_response shows all
+        # files as successfully uploaded (empty per-file detail is acceptable
+        # because direct-ingest skips nv-ingest metadata extraction).
+        return [], []
+
     @trace_function("ingestor.main.run_nvingest_batched_ingestion", tracer=TRACER)
     async def __run_nvingest_batched_ingestion(
         self,
@@ -2430,28 +2561,32 @@ class NvidiaRAGIngestor:
             return results, failures
 
         else:
-            # BATCH_MODE
+            # BATCH_MODE: process sub-batches sequentially within each upload call.
+            # Cross-call concurrency is handled by self._nv_ingest_sem — when 3 crawler
+            # batches are in flight simultaneously, the semaphore caps total nv-ingest
+            # jobs system-wide at max_concurrent_jobs without creating a flood of waiting
+            # coroutines from large PDF chunk outputs (e.g. admin-manual.pdf → 2500+ chunks
+            # → 125 tasks → thrashes the event loop on a 2-slot semaphore).
+            total_batches = (
+                len(filepaths) + state_manager.files_per_batch - 1
+            ) // state_manager.files_per_batch
             logger.info(
                 f"== Performing ingestion in BATCH_MODE for collection_name: {collection_name} "
-                f"with {len(filepaths)} files =="
+                f"with {len(filepaths)} files across {total_batches} sub-batch(es) "
+                f"(max_concurrent_jobs={self.config.nv_ingest.max_concurrent_jobs}) =="
             )
 
-            # Process batches sequentially
-            if not self.config.nv_ingest.enable_parallel_batch_mode:
-                logger.info("Processing batches sequentially")
-                all_results = []
-                all_failures = []
-                for i in range(0, len(filepaths), state_manager.files_per_batch):
-                    sub_filepaths = filepaths[i : i + state_manager.files_per_batch]
-                    batch_num = i // state_manager.files_per_batch + 1
-                    total_batches = (
-                        len(filepaths) + state_manager.files_per_batch - 1
-                    ) // state_manager.files_per_batch
-                    logger.info(
-                        f"=== Batch Processing Status - Collection: {collection_name} - "
-                        f"Processing batch {batch_num} of {total_batches} - "
-                        f"Documents in current batch: {len(sub_filepaths)} ==="
-                    )
+            all_results = []
+            all_failures = []
+            for i in range(0, len(filepaths), state_manager.files_per_batch):
+                sub_filepaths = filepaths[i : i + state_manager.files_per_batch]
+                batch_num = i // state_manager.files_per_batch + 1
+                logger.info(
+                    f"=== Processing Batch - Collection: {collection_name} - "
+                    f"Batch {batch_num} of {total_batches} - "
+                    f"Documents in batch: {len(sub_filepaths)} ==="
+                )
+                try:
                     results, failures = await self.__nv_ingest_ingestion_pipeline(
                         filepaths=sub_filepaths,
                         collection_name=collection_name,
@@ -2464,91 +2599,20 @@ class NvidiaRAGIngestor:
                     )
                     all_results.extend(results)
                     all_failures.extend(failures)
+                except Exception as exc:
+                    logger.warning("Sub-batch %d failed and will be skipped: %r", batch_num, exc)
 
-                if (
-                    hasattr(vdb_op, "csv_file_path")
-                    and vdb_op.csv_file_path is not None
-                ):
-                    os.remove(vdb_op.csv_file_path)
-                    logger.debug(
-                        f"Deleted temporary custom metadata csv file: {vdb_op.csv_file_path} "
-                        f"for collection: {collection_name}"
-                    )
-
-                return all_results, all_failures
-
-            else:
-                # Process batches in parallel with worker pool
-                logger.info(
-                    f"Processing batches in parallel with concurrency: {state_manager.concurrent_batches}"
+            if (
+                hasattr(vdb_op, "csv_file_path")
+                and vdb_op.csv_file_path is not None
+            ):
+                os.remove(vdb_op.csv_file_path)
+                logger.debug(
+                    f"Deleted temporary custom metadata csv file: {vdb_op.csv_file_path} "
+                    f"for collection: {collection_name}"
                 )
-                all_results = []
-                all_failures = []
-                tasks = []
-                semaphore = asyncio.Semaphore(
-                    state_manager.concurrent_batches
-                )  # Limit concurrent tasks
 
-                async def process_batch(sub_filepaths, batch_num):
-                    async with semaphore:
-                        if len(filepaths) % state_manager.files_per_batch == 0:
-                            total_batches = (
-                                len(filepaths) // state_manager.files_per_batch
-                            )
-                        else:
-                            total_batches = (
-                                len(filepaths) // state_manager.files_per_batch + 1
-                            )
-                        logger.info(
-                            f"=== Processing Batch - Collection: {collection_name} - "
-                            f"Batch {batch_num} of {total_batches} - "
-                            f"Documents in batch: {len(sub_filepaths)} ==="
-                        )
-                        return await self.__nv_ingest_ingestion_pipeline(
-                            filepaths=sub_filepaths,
-                            collection_name=collection_name,
-                            vdb_op=vdb_op,
-                            batch_number=batch_num,
-                            split_options=split_options,
-                            generate_summary=generate_summary,
-                            summary_options=summary_options,
-                            state_manager=state_manager,
-                        )
-
-                for i in range(0, len(filepaths), state_manager.files_per_batch):
-                    sub_filepaths = filepaths[i : i + state_manager.files_per_batch]
-                    batch_num = i // state_manager.files_per_batch + 1
-                    task = process_batch(sub_filepaths, batch_num)
-                    tasks.append(task)
-
-                # Wait for all tasks to complete; use return_exceptions=True so
-                # that a single failing sub-batch does not orphan the remaining
-                # tasks as un-awaited asyncio tasks (which keeps their nv-ingest
-                # jobs running and clogs the service for subsequent batches).
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Combine results from all batches; skip failed sub-batches.
-                for item in batch_results:
-                    if isinstance(item, BaseException):
-                        logger.warning(
-                            "Sub-batch failed and will be skipped: %r", item
-                        )
-                        continue
-                    results, failures = item
-                    all_results.extend(results)
-                    all_failures.extend(failures)
-
-                if (
-                    hasattr(vdb_op, "csv_file_path")
-                    and vdb_op.csv_file_path is not None
-                ):
-                    os.remove(vdb_op.csv_file_path)
-                    logger.debug(
-                        f"Deleted temporary custom metadata csv file: {vdb_op.csv_file_path} "
-                        f"for collection: {collection_name}"
-                    )
-
-                return all_results, all_failures
+            return all_results, all_failures
 
     @trace_function("ingestor.main.run_nv_ingest_ingestion_pipeline", tracer=TRACER)
     async def __nv_ingest_ingestion_pipeline(
@@ -2834,16 +2898,17 @@ class NvidiaRAGIngestor:
             )
 
             start_time = time.time()
-            results, failures = await self.__perform_async_nv_ingest_ingestion(
-                nv_ingest_ingestor=nv_ingest_ingestor,
-                state_manager=state_manager,
-                nv_ingest_traces=True,
-                trace_context=create_nv_ingest_trace_context(
-                    span_namespace=f"nv_ingest.shallow_batch_{batch_number}",
-                    batch_number=batch_number,
-                ),
-                job_timeout=self.config.nv_ingest.job_timeout,
-            )
+            async with self._nv_ingest_sem:
+                results, failures = await self.__perform_async_nv_ingest_ingestion(
+                    nv_ingest_ingestor=nv_ingest_ingestor,
+                    state_manager=state_manager,
+                    nv_ingest_traces=True,
+                    trace_context=create_nv_ingest_trace_context(
+                        span_namespace=f"nv_ingest.shallow_batch_{batch_number}",
+                        batch_number=batch_number,
+                    ),
+                    job_timeout=self.config.nv_ingest.job_timeout,
+                )
             total_time = time.time() - start_time
 
             logger.debug(
@@ -2916,17 +2981,18 @@ class NvidiaRAGIngestor:
             logger.info(
                 f"Performing ingestion for batch {batch_number} with parameters: {split_options}"
             )
-            results, failures = await self.__perform_async_nv_ingest_ingestion(
-                nv_ingest_ingestor=nv_ingest_ingestor,
-                state_manager=state_manager,
-                nv_ingest_traces=True,
-                trace_context=create_nv_ingest_trace_context(
-                    span_namespace=f"nv_ingest.batch_{batch_number}",
-                    collection_name=vdb_op.collection_name,
-                    batch_number=batch_number,
-                ),
-                job_timeout=self.config.nv_ingest.job_timeout,
-            )
+            async with self._nv_ingest_sem:
+                results, failures = await self.__perform_async_nv_ingest_ingestion(
+                    nv_ingest_ingestor=nv_ingest_ingestor,
+                    state_manager=state_manager,
+                    nv_ingest_traces=True,
+                    trace_context=create_nv_ingest_trace_context(
+                        span_namespace=f"nv_ingest.batch_{batch_number}",
+                        collection_name=vdb_op.collection_name,
+                        batch_number=batch_number,
+                    ),
+                    job_timeout=self.config.nv_ingest.job_timeout,
+                )
             total_ingestion_time = time.time() - start_time
             document_info = self._log_result_info(
                 batch_number, results, failures, total_ingestion_time
@@ -2964,20 +3030,21 @@ class NvidiaRAGIngestor:
                 logger.info(
                     f"Performing ingestion for PDF files for batch {batch_number} with parameters: {split_options}"
                 )
-                (
-                    results_pdf,
-                    failures_pdf,
-                ) = await self.__perform_async_nv_ingest_ingestion(
-                    nv_ingest_ingestor=nv_ingest_ingestor,
-                    state_manager=state_manager,
-                    nv_ingest_traces=True,
-                    trace_context=create_nv_ingest_trace_context(
-                        span_namespace=f"nv_ingest.batch_{batch_number}.pdf",
-                        collection_name=vdb_op.collection_name,
-                        batch_number=batch_number,
-                    ),
-                    job_timeout=self.config.nv_ingest.job_timeout,
-                )
+                async with self._nv_ingest_sem:
+                    (
+                        results_pdf,
+                        failures_pdf,
+                    ) = await self.__perform_async_nv_ingest_ingestion(
+                        nv_ingest_ingestor=nv_ingest_ingestor,
+                        state_manager=state_manager,
+                        nv_ingest_traces=True,
+                        trace_context=create_nv_ingest_trace_context(
+                            span_namespace=f"nv_ingest.batch_{batch_number}.pdf",
+                            collection_name=vdb_op.collection_name,
+                            batch_number=batch_number,
+                        ),
+                        job_timeout=self.config.nv_ingest.job_timeout,
+                    )
                 total_ingestion_time = time.time() - start_time
                 document_info = self._log_result_info(
                     batch_number,
@@ -3006,20 +3073,21 @@ class NvidiaRAGIngestor:
                 logger.info(
                     f"Performing ingestion for non-PDF files for batch {batch_number} with parameters: {split_options}"
                 )
-                (
-                    results_non_pdf,
-                    failures_non_pdf,
-                ) = await self.__perform_async_nv_ingest_ingestion(
-                    nv_ingest_ingestor=nv_ingest_ingestor,
-                    state_manager=state_manager,
-                    nv_ingest_traces=True,
-                    trace_context=create_nv_ingest_trace_context(
-                        span_namespace=f"nv_ingest.batch_{batch_number}.non_pdf",
-                        collection_name=vdb_op.collection_name,
-                        batch_number=batch_number,
-                    ),
-                    job_timeout=self.config.nv_ingest.job_timeout,
-                )
+                async with self._nv_ingest_sem:
+                    (
+                        results_non_pdf,
+                        failures_non_pdf,
+                    ) = await self.__perform_async_nv_ingest_ingestion(
+                        nv_ingest_ingestor=nv_ingest_ingestor,
+                        state_manager=state_manager,
+                        nv_ingest_traces=True,
+                        trace_context=create_nv_ingest_trace_context(
+                            span_namespace=f"nv_ingest.batch_{batch_number}.non_pdf",
+                            collection_name=vdb_op.collection_name,
+                            batch_number=batch_number,
+                        ),
+                        job_timeout=self.config.nv_ingest.job_timeout,
+                    )
                 total_ingestion_time = time.time() - start_time
                 document_info = self._log_result_info(
                     batch_number,
@@ -3153,6 +3221,7 @@ class NvidiaRAGIngestor:
         filepaths: list[str] | None = None,
         collection_name: str | None = None,
         is_final_batch: bool = True,
+        direct_ingest: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Get failed documents
@@ -3161,6 +3230,8 @@ class NvidiaRAGIngestor:
             - failures: List[Dict[str, Any]] - List of failures
             - filepaths: List[str] - List of filepaths
             - results: List[List[Dict[str, Union[str, dict]]]] - List of results
+            - direct_ingest: bool - When True, skip unsupported-type and VDB existence
+              checks; direct-ingest files bypass nv-ingest and document_info entirely.
 
         Returns:
             - List[Dict[str, Any]] - List of failed documents
@@ -3178,6 +3249,13 @@ class NvidiaRAGIngestor:
             # For non-final batches, we don't need to add non-supported files
             # and document to failed documents if it is not in the Milvus
             # because we will continue to ingest the next batch
+            return failed_documents
+
+        # Direct-ingest path: all files were embedded+written by _run_direct_ingest.
+        # Skip the unsupported-type check (chunk .md files are "unsupported" by
+        # nv-ingest) and the VDB document_info existence check (never populated).
+        # Any real embedding/write failures were already put in `failures` above.
+        if direct_ingest:
             return failed_documents
 
         # Add non-supported files to failed documents

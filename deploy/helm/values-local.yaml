@@ -197,6 +197,18 @@ ingestor-server:
     # ---------------------------------------------------------------------------
     APP_PDF_REPO_DIR: "/pdf-repo"
     # ---------------------------------------------------------------------------
+    # Office document repository — crawled DOCX/XLSX/PPTX/DOC/XLS/PPT files.
+    # Host path: /mnt/nvme2/docs-repo/<collection_name>/<filename>
+    # ---------------------------------------------------------------------------
+    APP_DOCS_REPO_DIR: "/docs-repo"
+    # ---------------------------------------------------------------------------
+    # Audio / video repositories — crawled media files queued for manual ingest.
+    # Host paths: /mnt/nvme2/audio-repo and /mnt/nvme2/video-repo
+    # ---------------------------------------------------------------------------
+    APP_AUDIO_REPO_DIR: "/audio-repo"
+    APP_VIDEO_REPO_DIR: "/video-repo"
+    APP_MAX_MEDIA_FILE_MB: "500"
+    # ---------------------------------------------------------------------------
     # Chunking — max tokens per semantic chunk (HTML + PDF/nemoparse paths).
     # Must be <= NIM_TRITON_MAX_SEQ_LENGTH on embedding + reranking NIMs (2048).
     # ---------------------------------------------------------------------------
@@ -213,6 +225,18 @@ ingestor-server:
       hostPath:
         path: /mnt/nvme2/pdf-repo
         type: DirectoryOrCreate
+    - name: docs-repo
+      hostPath:
+        path: /mnt/nvme2/docs-repo
+        type: DirectoryOrCreate
+    - name: audio-repo
+      hostPath:
+        path: /mnt/nvme2/audio-repo
+        type: DirectoryOrCreate
+    - name: video-repo
+      hostPath:
+        path: /mnt/nvme2/video-repo
+        type: DirectoryOrCreate
   extraVolumeMounts:
     - name: eck-ca
       mountPath: /etc/ssl/eck
@@ -221,6 +245,12 @@ ingestor-server:
       mountPath: /crawl-exports
     - name: pdf-repo
       mountPath: /pdf-repo
+    - name: docs-repo
+      mountPath: /docs-repo
+    - name: audio-repo
+      mountPath: /audio-repo
+    - name: video-repo
+      mountPath: /video-repo
 
 # ---------------------------------------------------------------------------
 # ECK Elasticsearch — HTTPS with ECK self-signed cert + elastic user auth

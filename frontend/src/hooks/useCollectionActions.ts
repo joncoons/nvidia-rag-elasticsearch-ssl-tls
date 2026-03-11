@@ -284,10 +284,15 @@ export function useCollectionActions() {
   const handleStartCrawl = async () => {
     if (!activeCollection?.collection_name) return;
 
-    const { crawlConfig } = useNewCollectionStore.getState();
+    const { crawlConfig, crawlMetadata } = useNewCollectionStore.getState();
     if (!crawlConfig.startUrl) return;
 
-    const payload = {
+    // Include non-empty crawl metadata values as extra_metadata.
+    const extraMeta = Object.fromEntries(
+      Object.entries(crawlMetadata).filter(([, v]) => v !== "" && v !== null && v !== undefined)
+    );
+
+    const payload: Record<string, unknown> = {
       start_url: crawlConfig.startUrl,
       collection_name: activeCollection.collection_name,
       max_pages: crawlConfig.maxPages,
@@ -299,6 +304,10 @@ export function useCollectionActions() {
       force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
       extract_linked_files: crawlConfig.extractLinkedFiles,
     };
+
+    if (Object.keys(extraMeta).length > 0) {
+      payload.extra_metadata = extraMeta;
+    }
 
     try {
       const res = await fetch("/api/crawl", {

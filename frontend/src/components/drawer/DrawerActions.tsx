@@ -18,7 +18,7 @@ import {
   Flex,
   Spinner
 } from "@kui/react";
-import { Trash2, Plus, X, Globe } from "lucide-react";
+import { Trash2, Plus, X, Globe, Music } from "lucide-react";
 
 interface DrawerActionsProps {
   onDelete: () => void;
@@ -26,9 +26,12 @@ interface DrawerActionsProps {
   onCloseUploader: () => void;
   onAddCrawl: () => void;
   onCloseCrawler: () => void;
+  onOpenMediaQueue: () => void;
+  onCloseMediaQueue: () => void;
   isDeleting?: boolean;
   showUploader?: boolean;
   showCrawler?: boolean;
+  showMediaQueue?: boolean;
 }
 
 export const DrawerActions = ({
@@ -37,11 +40,14 @@ export const DrawerActions = ({
   onCloseUploader,
   onAddCrawl,
   onCloseCrawler,
+  onOpenMediaQueue,
+  onCloseMediaQueue,
   isDeleting = false,
   showUploader = false,
   showCrawler = false,
+  showMediaQueue = false,
 }: DrawerActionsProps) => (
-  <Flex gap="3" justify="stretch" style={{ width: '100%' }}>
+  <Flex gap="3" justify="stretch" style={{ width: '100%', flexWrap: 'wrap' }}>
     <Button
       kind="secondary"
       color="danger"
@@ -75,6 +81,14 @@ export const DrawerActions = ({
     >
       {showCrawler ? <X size={16} /> : <Globe size={16} />}
       {showCrawler ? "Close Crawler" : "Crawl Web"}
+    </Button>
+
+    <Button
+      color={showMediaQueue ? "neutral" : "brand"}
+      onClick={showMediaQueue ? onCloseMediaQueue : onOpenMediaQueue}
+    >
+      {showMediaQueue ? <X size={16} /> : <Music size={16} />}
+      {showMediaQueue ? "Close Media Queue" : "Media Queue"}
     </Button>
   </Flex>
 );

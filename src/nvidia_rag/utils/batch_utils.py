@@ -39,7 +39,7 @@ TEXT_LIKE_EXTENSIONS = frozenset({
 
 # Optimal batch parameters for text-like files
 # Text files process quickly, so we use larger batches with sequential processing
-TEXT_FILE_BATCH_SIZE = 200
+TEXT_FILE_BATCH_SIZE = 20
 TEXT_FILE_CONCURRENT_BATCHES = 1
 
 # Threshold percentage to determine if workload is text-heavy

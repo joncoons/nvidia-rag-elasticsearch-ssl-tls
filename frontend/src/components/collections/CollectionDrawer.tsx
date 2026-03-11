@@ -25,6 +25,7 @@ import { Notification, SidePanel, Stack } from "@kui/react";
 import { DocumentsList } from "../tasks/DocumentsList";
 import { UploaderSection } from "../drawer/UploaderSection";
 import { WebCrawlSection } from "../drawer/WebCrawlSection";
+import { MediaQueueSection } from "../drawer/MediaQueueSection";
 import { CollectionCatalogInfo } from "./CollectionCatalogInfo";
 import type { Collection } from "../../types/collections";
 
@@ -38,7 +39,7 @@ export { UploaderSection } from "../drawer/UploaderSection";
 export { DrawerActions } from "../drawer/DrawerActions";
 
 export default function CollectionDrawer() {
-  const { activeCollection, closeDrawer, toggleUploader, toggleCrawler, deleteError, showUploader, showCrawler, updateActiveCollection } = useCollectionDrawerStore();
+  const { activeCollection, closeDrawer, toggleUploader, toggleCrawler, toggleMediaQueue, deleteError, showUploader, showCrawler, showMediaQueue, updateActiveCollection } = useCollectionDrawerStore();
   const { setMetadataSchema } = useNewCollectionStore();
   const { deleteCollectionWithoutConfirm, isDeleting } = useCollectionActions();
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -87,13 +88,22 @@ export default function CollectionDrawer() {
   }, [toggleUploader]);
 
   const handleAddCrawl = useCallback(() => {
+    setMetadataSchema(activeCollection?.metadata_schema || []);
     toggleCrawler(true);
-  }, [toggleCrawler]);
+  }, [activeCollection, setMetadataSchema, toggleCrawler]);
 
   const handleCloseCrawler = useCallback(() => {
     toggleCrawler(false);
     useNewCollectionStore.getState().reset();
   }, [toggleCrawler]);
+
+  const handleOpenMediaQueue = useCallback(() => {
+    toggleMediaQueue(true);
+  }, [toggleMediaQueue]);
+
+  const handleCloseMediaQueue = useCallback(() => {
+    toggleMediaQueue(false);
+  }, [toggleMediaQueue]);
 
   const handleDeleteClick = useCallback(() => {
     if (activeCollection?.collection_name) {
@@ -126,17 +136,21 @@ export default function CollectionDrawer() {
           onCloseUploader={handleCloseUploader}
           onAddCrawl={handleAddCrawl}
           onCloseCrawler={handleCloseCrawler}
+          onOpenMediaQueue={handleOpenMediaQueue}
+          onCloseMediaQueue={handleCloseMediaQueue}
           isDeleting={isDeleting}
           showUploader={showUploader}
           showCrawler={showCrawler}
+          showMediaQueue={showMediaQueue}
         />
       }
       closeOnClickOutside
     >
       {showUploader && <UploaderSection />}
       {showCrawler && <WebCrawlSection />}
+      {showMediaQueue && <MediaQueueSection />}
 
-      {!showUploader && !showCrawler && (
+      {!showUploader && !showCrawler && !showMediaQueue && (
         <Stack gap="density-md">
           {activeCollection && (
             <CollectionCatalogInfo
