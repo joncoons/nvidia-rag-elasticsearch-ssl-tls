@@ -848,7 +848,14 @@ class SimpleWebCrawler:
                     href = href.split("#")[0]
                     if not href:
                         continue
-                    abs_href = urljoin(url, href)
+                    try:
+                        abs_href = urljoin(url, href)
+                    except ValueError:
+                        # Python 3.13 urlsplit raises ValueError for bracketed
+                        # non-IPv6 hosts (e.g. href="/config/[server_ip]/...").
+                        # Skip these malformed template URLs.
+                        logger.debug("Skipping malformed href (bracket host): %r from %s", href, url)
+                        continue
                     if self._is_blocked_url(abs_href):
                         continue
                     if self.extract_linked_files and _is_binary_url(abs_href):

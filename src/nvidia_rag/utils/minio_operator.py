@@ -86,6 +86,9 @@ class MinioOperator:
 
     def put_payloads_bulk(self, payloads: list[dict], object_names: list[str]):
         """Put list of dictionaries to S3 storage using minio client"""
+        if not payloads:
+            return
+
         json_datas = [json.dumps(payload).encode("utf-8") for payload in payloads]
 
         snowball_objects = []
@@ -96,8 +99,31 @@ class MinioOperator:
                 )
             )
 
-        # Bulk upload objects to MinIO
-        self.client.upload_snowball_objects(self.default_bucket_name, snowball_objects)
+        # Bulk upload objects to MinIO.
+        # upload_snowball_objects validates the endpoint as an IP address internally,
+        # which fails when the endpoint is a hostname (e.g. 'rag-minio').
+        # Fall back to individual put_object calls on ValueError.
+        try:
+            self.client.upload_snowball_objects(self.default_bucket_name, snowball_objects)
+        except (ValueError, Exception) as exc:
+            logger.warning(
+                "put_payloads_bulk: snowball upload failed (%r), falling back to individual puts",
+                exc,
+            )
+            for object_name, json_data in zip(object_names, json_datas, strict=False):
+                try:
+                    self.client.put_object(
+                        self.default_bucket_name,
+                        object_name,
+                        BytesIO(json_data),
+                        len(json_data),
+                        content_type="application/json",
+                    )
+                except Exception as put_exc:
+                    logger.warning(
+                        "put_payloads_bulk: individual put failed for %s: %r",
+                        object_name, put_exc,
+                    )
 
     def get_payload(self, object_name: str) -> dict:
         """Get dictionary from S3 storage using minio client"""
