@@ -683,7 +683,7 @@ class CrawlRequest(BaseModel):
         ),
     )
     use_selenium: bool = Field(
-        default=False,
+        default=True,
         description=(
             "When True, pages whose static HTML yields fewer than "
             "``selenium_content_threshold`` visible characters are re-fetched via "
@@ -985,6 +985,53 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             content={"message": f"Failed to start crawl: {e}"},
             status_code=500,
         )
+
+
+@app.post(
+    "/cancel",
+    tags=["Ingestion APIs"],
+    response_model=IngestionTaskResponse,
+    responses={
+        404: {
+            "description": "Task not found or already complete",
+            "content": {"application/json": {"example": {"detail": "Task not found"}}},
+        },
+    },
+)
+@trace_function("ingestor.server.cancel_task", tracer=TRACER)
+async def cancel_task(task_id: str) -> IngestionTaskResponse:
+    """Send a cancellation signal to a running crawl task.
+
+    The crawl exits gracefully at the next BFS iteration: the registry is saved,
+    temp files are cleaned up, and Selenium (if active) is quit.  The task state
+    transitions to CANCELLED in Redis.
+    """
+    from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
+    from nvidia_rag.utils.web_crawler import _CRAWL_CANCEL
+
+    cancel_event = _CRAWL_CANCEL.get(task_id)
+    if cancel_event is not None:
+        cancel_event.set()
+        await INGESTION_TASK_HANDLER.set_task_status_and_result(
+            task_id, "CANCELLED", {"message": "Cancelled by user request"}
+        )
+        logger.info("Cancel signal sent to crawl task %s", task_id)
+        return IngestionTaskResponse(message="Cancel signal sent", task_id=task_id)
+
+    # Not a crawl task — check if it's a regular asyncio task still running
+    task = INGESTION_TASK_HANDLER.task_map.get(task_id)
+    if task is not None and not task.done():
+        task.cancel()
+        await INGESTION_TASK_HANDLER.set_task_status_and_result(
+            task_id, "CANCELLED", {"message": "Cancelled by user request"}
+        )
+        logger.info("Cancel signal sent to task %s", task_id)
+        return IngestionTaskResponse(message="Cancel signal sent", task_id=task_id)
+
+    return JSONResponse(
+        content={"message": f"Task {task_id} not found or already complete"},
+        status_code=404,
+    )
 
 
 @app.get(
