@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pillow         — screenshot JPEG conversion for selenium_screenshot_fallback path.
 COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /tmp/uv
 RUN /tmp/uv pip install --python /workspace/.venv/bin/python \
-      --no-cache beautifulsoup4 pdf2image lxml kubernetes selenium Pillow && rm /tmp/uv
+      --no-cache beautifulsoup4 pdf2image lxml kubernetes selenium Pillow tiktoken && rm /tmp/uv
 
 # Pre-download the matching chromedriver via Selenium Manager so there is no
 # runtime download when the pod starts.  The binary is cached under /root/.cache/selenium/.

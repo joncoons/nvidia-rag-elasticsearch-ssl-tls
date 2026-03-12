@@ -213,6 +213,14 @@ ingestor-server:
     # Must be <= NIM_TRITON_MAX_SEQ_LENGTH on embedding + reranking NIMs (2048).
     # ---------------------------------------------------------------------------
     APP_NVINGEST_CHUNKSIZE: "2048"
+    # ---------------------------------------------------------------------------
+    # Chunking tokenizer — use the embedding model's own tokenizer so chunk token
+    # counts exactly match the embedding NIM's vocabulary.
+    # Files copied (symlinks resolved) from NIM cache to NFS flat dir — air-gapped,
+    # no HuggingFace download needed at runtime. Same path mounted in rag-nv-ingest.
+    # tokenizer-4096 snapshot matches NIM_TRITON_MAX_SEQ_LENGTH=2048 window.
+    # ---------------------------------------------------------------------------
+    APP_NVINGEST_TOKENIZER: "/embed-tokenizer"
   extraVolumes:
     - name: eck-ca
       configMap:
@@ -237,6 +245,10 @@ ingestor-server:
       hostPath:
         path: /mnt/nvme2/video-repo
         type: DirectoryOrCreate
+    - name: embed-tokenizer
+      hostPath:
+        path: /mnt/nvme4/hf_models/tokenizers/llama-3.2-nv-embedqa-1b-v2
+        type: Directory
   extraVolumeMounts:
     - name: eck-ca
       mountPath: /etc/ssl/eck
@@ -251,6 +263,9 @@ ingestor-server:
       mountPath: /audio-repo
     - name: video-repo
       mountPath: /video-repo
+    - name: embed-tokenizer
+      mountPath: /embed-tokenizer
+      readOnly: true
 
 # ---------------------------------------------------------------------------
 # ECK Elasticsearch — HTTPS with ECK self-signed cert + elastic user auth
