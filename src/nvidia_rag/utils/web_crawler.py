@@ -364,6 +364,7 @@ class SimpleWebCrawler:
         audio_repo_dir: str = "",
         video_repo_dir: str = "",
         max_media_file_mb: int = 500,
+        skip_phase3: bool = False,
     ) -> None:
         self.start_url = start_url.rstrip("/")
         self.task_id = task_id
@@ -384,6 +385,7 @@ class SimpleWebCrawler:
         self.audio_repo_dir = audio_repo_dir
         self.video_repo_dir = video_repo_dir
         self.max_media_file_mb = max(1, max_media_file_mb)
+        self.skip_phase3 = skip_phase3
         # Caller-supplied metadata defaults — merged at chunk-build time.
         # Crawler-auto-populated fields always win over these.
         self.extra_metadata: dict = dict(extra_metadata or {})
@@ -1060,9 +1062,18 @@ class SimpleWebCrawler:
             # ── Phase 3: batch-ingest NFS-persisted binary documents ─────────
             # All HTML batches are now drained.  Read the binary manifest and
             # ingest any rows whose content_hash changed since last ingest.
-            binary_manifest = self._load_binary_manifest()
-            binary_files_ingested = 0
-            binary_files_skipped = 0
+            if self.skip_phase3 or (cancel_event and cancel_event.is_set()):
+                logger.info(
+                    "Phase 3 binary ingest skipped (%s).",
+                    "skip_phase3=True" if self.skip_phase3 else "cancel requested",
+                )
+                binary_manifest = []
+                binary_files_ingested = 0
+                binary_files_skipped = 0
+            else:
+                binary_manifest = self._load_binary_manifest()
+                binary_files_ingested = 0
+                binary_files_skipped = 0
             if binary_manifest:
                 pending_binary = [
                     row for row in binary_manifest

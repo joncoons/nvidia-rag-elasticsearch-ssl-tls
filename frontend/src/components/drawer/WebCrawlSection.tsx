@@ -225,13 +225,27 @@ export const WebCrawlSection = () => {
         <Stack gap="density-xs">
           <Switch
             checked={crawlConfig.extractLinkedFiles}
-            onCheckedChange={(checked: boolean) => setCrawlConfig({ extractLinkedFiles: checked })}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({
+              extractLinkedFiles: checked,
+              skipPhase3: checked ? crawlConfig.skipPhase3 : false,
+            })}
             size="medium"
             slotLabel="Extract linked files (PDF / DOCX / XLSX)"
             disabled={isCrawling}
           />
           <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
             Download and ingest binary documents found as href links on crawled pages.
+          </Text>
+
+          <Switch
+            checked={crawlConfig.skipPhase3}
+            onCheckedChange={(checked: boolean) => setCrawlConfig({ skipPhase3: checked })}
+            size="medium"
+            slotLabel="Skip binary file processing (Phase 3)"
+            disabled={isCrawling || !crawlConfig.extractLinkedFiles}
+          />
+          <Text kind="body/regular/xs" style={{ color: 'var(--text-color-subtle)' }}>
+            Complete HTML crawl only; defer binary file ingestion to a later run. Files are still recorded in the manifest.
           </Text>
 
           <Switch

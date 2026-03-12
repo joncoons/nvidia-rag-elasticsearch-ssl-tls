@@ -303,6 +303,7 @@ export function useCollectionActions() {
       use_nemoretriever_parse: crawlConfig.useCrawlNemotronParse || crawlConfig.forceCrawlNemotronParse,
       force_nemoretriever_parse: crawlConfig.forceCrawlNemotronParse,
       extract_linked_files: crawlConfig.extractLinkedFiles,
+      skip_phase3: crawlConfig.skipPhase3,
     };
 
     if (Object.keys(extraMeta).length > 0) {

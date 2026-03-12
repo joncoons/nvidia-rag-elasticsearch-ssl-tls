@@ -72,6 +72,7 @@ interface CrawlConfiguration {
   useSitemap: boolean;           // seed BFS from robots.txt sitemaps
   allowedUrlPrefixes: string;    // comma-separated; auto-derived from startUrl path
   extractLinkedFiles: boolean;
+  skipPhase3: boolean;
   useCrawlNemotronParse: boolean;
   forceCrawlNemotronParse: boolean;
 }
@@ -313,6 +314,7 @@ const defaultCrawlConfig: CrawlConfiguration = {
   useSitemap: false,
   allowedUrlPrefixes: "",
   extractLinkedFiles: false,
+  skipPhase3: false,
   useCrawlNemotronParse: false,
   forceCrawlNemotronParse: false,
 };

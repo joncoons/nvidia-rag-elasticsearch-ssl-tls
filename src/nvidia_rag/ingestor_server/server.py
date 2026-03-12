@@ -744,6 +744,15 @@ class CrawlRequest(BaseModel):
             "and blocked_url_patterns.  Default False."
         ),
     )
+    skip_phase3: bool = Field(
+        default=False,
+        description=(
+            "When True, skip Phase 3 binary file ingestion after HTML BFS completes.  "
+            "Binary files are still recorded in the manifest during crawling so they "
+            "can be ingested later via POST /ingest-media or a subsequent crawl run "
+            "with skip_phase3=False."
+        ),
+    )
     extra_metadata: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -969,6 +978,7 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             video_repo_dir=CONFIG.video_repo_dir,
             max_media_file_mb=CONFIG.max_media_file_mb,
             task_id=task_id,
+            skip_phase3=payload.skip_phase3,
             extra_metadata=payload.extra_metadata,
         )
 
