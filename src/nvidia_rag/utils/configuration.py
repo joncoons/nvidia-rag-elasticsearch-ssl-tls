@@ -1368,3 +1368,79 @@ class NvidiaRAGConfig(_ConfigBase):
             width=120,
             allow_unicode=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# URL → product mapping used by SimpleWebCrawler and backfill scripts.
+# Each entry: (url_prefix_substring, product_family, product_name | None)
+# First match wins; entries ordered from most-specific to least-specific.
+# ---------------------------------------------------------------------------
+CRAWLER_PRODUCT_URL_MAP: list[tuple[str, str, str | None]] = [
+    # ── CUDA ecosystem ────────────────────────────────────────────────────────
+    ("docs.nvidia.com/cuda/profiler-users-guide",   "CUDA",          "CUDA Profiler"),
+    ("docs.nvidia.com/cuda/cuda-gdb",               "CUDA",          "CUDA-GDB"),
+    ("docs.nvidia.com/cuda/cuda-memcheck",          "CUDA",          "CUDA-MEMCHECK"),
+    ("docs.nvidia.com/cuda/thrust",                 "CUDA",          "Thrust"),
+    ("docs.nvidia.com/cuda",                        "CUDA",          "CUDA Toolkit"),
+    ("developer.nvidia.com/cuda",                   "CUDA",          "CUDA Toolkit"),
+    # ── Deep Learning ─────────────────────────────────────────────────────────
+    ("docs.nvidia.com/deeplearning/tensorrt",        "TensorRT",      "TensorRT"),
+    ("docs.nvidia.com/deeplearning/cudnn",           "cuDNN",         "cuDNN"),
+    ("docs.nvidia.com/deeplearning/nemo",            "NeMo",          "NeMo Framework"),
+    ("docs.nvidia.com/deeplearning/triton",          "Triton",        "Triton Inference Server"),
+    ("docs.nvidia.com/deeplearning/performance",     "Deep Learning", "Deep Learning Performance"),
+    ("docs.nvidia.com/deeplearning/frameworks",      "Deep Learning", "Deep Learning Frameworks"),
+    ("docs.nvidia.com/deeplearning",                 "Deep Learning", None),
+    ("developer.nvidia.com/deep-learning",           "Deep Learning", None),
+    # ── Triton (GitHub) ───────────────────────────────────────────────────────
+    ("github.com/triton-inference-server",           "Triton",        "Triton Inference Server"),
+    # ── NIM / NIMs ────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/nim",                          "NIM",           "NVIDIA NIM"),
+    ("build.nvidia.com",                             "NIM",           "NVIDIA NIM"),
+    # ── Data Center / GPUs ────────────────────────────────────────────────────
+    ("docs.nvidia.com/datacenter/tesla",             "Data Center",   "Tesla GPU"),
+    ("docs.nvidia.com/datacenter/cloud-native",      "Data Center",   "Cloud Native"),
+    ("docs.nvidia.com/datacenter",                   "Data Center",   "Data Center GPU"),
+    ("docs.nvidia.com/dgx",                          "DGX",           "NVIDIA DGX"),
+    # ── GPU architectures ─────────────────────────────────────────────────────
+    ("docs.nvidia.com/blackwell",                    "Blackwell",     "Blackwell Architecture"),
+    ("docs.nvidia.com/hopper",                       "Hopper",        "Hopper Architecture"),
+    ("docs.nvidia.com/ampere",                       "Ampere",        "Ampere Architecture"),
+    ("developer.nvidia.com/blackwell",               "Blackwell",     "Blackwell Architecture"),
+    # ── Networking ────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/networking/mlnx_ofed",         "Networking",    "MLNX OFED"),
+    ("docs.nvidia.com/networking",                   "Networking",    "NVIDIA Networking"),
+    ("docs.mellanox.com",                            "Networking",    "NVIDIA Networking"),
+    # ── Autonomous vehicles ───────────────────────────────────────────────────
+    ("docs.nvidia.com/drive",                        "DRIVE",         "NVIDIA DRIVE"),
+    # ── Embedded / Jetson ─────────────────────────────────────────────────────
+    ("docs.nvidia.com/jetson",                       "Jetson",        "Jetson"),
+    ("developer.nvidia.com/embedded",                "Jetson",        "Jetson"),
+    ("developer.nvidia.com/jetson",                  "Jetson",        "Jetson"),
+    # ── Isaac ─────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/isaac",                        "Isaac",         "Isaac"),
+    ("developer.nvidia.com/isaac",                   "Isaac",         "Isaac"),
+    # ── Profiling / Dev tools ─────────────────────────────────────────────────
+    ("docs.nvidia.com/nsight-systems",               "Nsight",        "Nsight Systems"),
+    ("docs.nvidia.com/nsight-compute",               "Nsight",        "Nsight Compute"),
+    ("docs.nvidia.com/nsight-visual-studio-code",    "Nsight",        "Nsight VSCode"),
+    ("docs.nvidia.com/nsight",                       "Nsight",        "Nsight"),
+    # ── RAPIDS ────────────────────────────────────────────────────────────────
+    ("docs.rapids.ai",                               "RAPIDS",        "RAPIDS"),
+    ("developer.nvidia.com/rapids",                  "RAPIDS",        "RAPIDS"),
+    ("rapids.ai",                                    "RAPIDS",        "RAPIDS"),
+    # ── Modulus / Physics ML ──────────────────────────────────────────────────
+    ("docs.nvidia.com/modulus",                      "Modulus",       "NVIDIA Modulus"),
+    ("developer.nvidia.com/modulus",                 "Modulus",       "NVIDIA Modulus"),
+    # ── AI Enterprise / Fleet Command ─────────────────────────────────────────
+    ("docs.nvidia.com/ai-enterprise",                "AI Enterprise", "NVIDIA AI Enterprise"),
+    ("docs.nvidia.com/fleet-command",                "Fleet Command", "Fleet Command"),
+    # ── Developer blog / general ──────────────────────────────────────────────
+    ("developer.nvidia.com/blog",                    "Blog",          "NVIDIA Developer Blog"),
+    ("developer.nvidia.com/technical-blog",          "Blog",          "NVIDIA Technical Blog"),
+    ("developer.nvidia.com",                         "NVIDIA Developer", None),
+    ("docs.nvidia.com",                              "NVIDIA Docs",   None),
+    ("www.nvidia.com/en-us/technologies",            "NVIDIA",        None),
+    ("github.com/nvidia",                            "NVIDIA",        None),
+    ("github.com/NVIDIA",                            "NVIDIA",        None),
+]

@@ -389,6 +389,21 @@ class SimpleWebCrawler:
         # Caller-supplied metadata defaults — merged at chunk-build time.
         # Crawler-auto-populated fields always win over these.
         self.extra_metadata: dict = dict(extra_metadata or {})
+        # Load URL→product mapping. Allow runtime override via JSON file.
+        from nvidia_rag.utils.configuration import CRAWLER_PRODUCT_URL_MAP  # noqa: PLC0415
+        _map_override = os.environ.get("APP_CRAWLER_PRODUCT_MAP")
+        if _map_override:
+            try:
+                import json as _json  # noqa: PLC0415
+                with open(_map_override) as _f:
+                    self._product_url_map: list[tuple[str, str, str | None]] = [
+                        (e[0], e[1], e[2] if len(e) > 2 else None) for e in _json.load(_f)
+                    ]
+            except Exception as _e:
+                logger.warning("Failed to load APP_CRAWLER_PRODUCT_MAP %s: %s", _map_override, _e)
+                self._product_url_map = CRAWLER_PRODUCT_URL_MAP
+        else:
+            self._product_url_map = CRAWLER_PRODUCT_URL_MAP
         self.allowed_url_prefixes = [p.rstrip("/") for p in allowed_url_prefixes] if allowed_url_prefixes else None
         self.max_depth = max_depth
         # Strip trailing slashes so e.g. "/pull/" also blocks "/pulls" (listing pages).
@@ -456,6 +471,28 @@ class SimpleWebCrawler:
             )
         finally:
             _CRAWL_CANCEL.pop(self.task_id, None)
+
+    # ------------------------------------------------------------------
+    # URL → product metadata resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_product_metadata(self, url: str) -> dict:
+        """Return product_family / product_name metadata derived from *url*.
+
+        Iterates self._product_url_map (most-specific first) and returns the
+        first matching entry as a dict.  Returns an empty dict when no prefix
+        matches, so callers can safely use ``{**self._resolve_product_metadata(url), ...}``.
+        The caller-supplied extra_metadata and crawler-auto fields both take
+        precedence over the values returned here (see base_meta construction).
+        """
+        lower_url = url.lower()
+        for prefix, family, name in self._product_url_map:
+            if prefix.lower() in lower_url:
+                meta: dict = {"product_family": family}
+                if name is not None:
+                    meta["product_name"] = name
+                return meta
+        return {}
 
     # ------------------------------------------------------------------
     # Internal sync implementation (runs in a thread-pool executor)
@@ -826,10 +863,11 @@ class SimpleWebCrawler:
                     is_changed = bool(reg_entry.get("last_ingested") and stored_hash and stored_hash != new_hash)
                     if is_changed:
                         changed_urls.add(url)
-                    # New or changed — extract semantic elements, chunk, queue for ingest
-                    # extra_metadata provides user-set defaults; crawler-auto
-                    # fields are listed last so they always take precedence.
+                    # New or changed — extract semantic elements, chunk, queue for ingest.
+                    # Precedence (low → high):
+                    #   URL-derived product tags → caller extra_metadata → crawler-auto fields.
                     base_meta = {
+                        **self._resolve_product_metadata(url),
                         **self.extra_metadata,
                         "source_uri": url,
                         "filename": url.rstrip("/").rsplit("/", 1)[-1] or self._netloc,
@@ -1152,6 +1190,7 @@ class SimpleWebCrawler:
                         {
                             "filename": os.path.basename(r["local_path"]),
                             "metadata": {
+                                **self._resolve_product_metadata(r.get("referring_page_url") or r["source_uri"]),
                                 **self.extra_metadata,
                                 "source_uri": r["source_uri"],
                                 "filename": r["filename"],

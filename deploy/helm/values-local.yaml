@@ -96,6 +96,9 @@ envVars:
   # deployment.yaml extraSecretEnv block below).
   # ---------------------------------------------------------------------------
   APP_TAVILY_ENABLED: "true"
+  # Default collection — overrides baseline default of 'multimodal_data'.
+  # The frontend sends the selected collection per-request; this is the fallback.
+  COLLECTION_NAME: "nvidia"
 
 # ECK CA cert volume — mounts into the nvidia-blueprint-rag container
 # ConfigMap eck-es-ca-cert must be pre-created (not managed by this chart):
