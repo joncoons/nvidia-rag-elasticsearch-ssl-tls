@@ -80,8 +80,8 @@ const MessageContainer = ({
           : isError 
             ? 'var(--color-red-100)' 
             : 'var(--background-color-component-track-inverse)',
-        color: role === "user" 
-          ? 'black' 
+        color: role === "user"
+          ? 'white'
           : isError
             ? 'var(--color-red-900)'
             : 'var(--text-color-accent-green)',

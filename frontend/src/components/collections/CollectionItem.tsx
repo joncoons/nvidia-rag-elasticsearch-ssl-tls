@@ -28,7 +28,7 @@ interface CollectionItemProps {
 }
 
 const SpinnerIcon = () => (
-  <div className="w-4 h-4 animate-spin rounded-full border-2 border-gray-600 border-t-[var(--nv-green)]" />
+  <div className="w-4 h-4 animate-spin rounded-full border-2 border-white/20 border-t-[var(--nv-green)]" />
 );
 
 const MoreIcon = () => (
