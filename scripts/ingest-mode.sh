@@ -71,9 +71,13 @@ case "${1:-disable}" in
         ;;
     disable|off)
         echo "Disabling ingest mode — restoring inference layout..."
-        # Step 1: free GPU slots held by nemotron-parse
+        # Step 1: free ALL GPU slots (nemotron-parse + placeholders) so nim-llm
+        #         has a clear first-fit shot at GPU0; avoids CrashLoopBackOff due
+        #         to "low free GPU memory" when placeholders are already running.
         scale nemotron-parse-v12 0
+        scale gpu0-placeholder 0
         wait_down nemotron-parse-v12
+        wait_down gpu0-placeholder
         # Step 2: ensure nim-llm uses the correct TP1 NVFP4 profile
         echo "  → setting nim-llm profile to ${NIM_LLM_PROFILE}"
         kubectl set env -n "${NAMESPACE}" deploy/nim-llm \
