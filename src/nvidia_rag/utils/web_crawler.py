@@ -879,7 +879,7 @@ class SimpleWebCrawler:
                     }
                     html_elements = self._html_to_elements(html_content)
                     if html_elements:
-                        from nvidia_rag.ingestor_server.document_classifier_router import (  # noqa: PLC0415
+                        from nvidia_rag.tools.parse_document import (  # noqa: PLC0415
                             DocumentClassifierRouter,
                         )
                         chunk_pairs = DocumentClassifierRouter._split_by_semantic_elements(

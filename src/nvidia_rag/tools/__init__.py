@@ -13,25 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Compatibility shim — re-exports from nvidia_rag.tools.parse_document.
+nvidia_rag.tools — end-to-end ingest tools.
 
-The canonical implementation has moved to nvidia_rag.tools.parse_document.
-This module is retained so that any existing imports of
-``nvidia_rag.ingestor_server.document_classifier_router`` continue to work
-without modification.
+Each tool owns its full pipeline from input (file, URL) to storage (ES).
+Tools use nvidia_rag.storage.embed_store as the shared storage primitive.
+
+Tools:
+    parse_document  — PDF → Nemotron-Parse → semantic chunks → ES
+    crawl           — URL → BFS crawl → HTML chunks + binaries → ES  (Phase 3)
 """
-from nvidia_rag.tools.parse_document import (  # noqa: F401
-    COMPLEX_ELEMENT_CLASSES,
-    NEMO_PARSE_MODEL_DEFAULT,
-    VLM_DESCRIBE_MODEL_DEFAULT,
-    DocumentClassifierRouter,
-    parse_and_ingest,
-)
-
-__all__ = [
-    "COMPLEX_ELEMENT_CLASSES",
-    "NEMO_PARSE_MODEL_DEFAULT",
-    "VLM_DESCRIBE_MODEL_DEFAULT",
-    "DocumentClassifierRouter",
-    "parse_and_ingest",
-]

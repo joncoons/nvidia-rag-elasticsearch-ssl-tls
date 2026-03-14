@@ -406,7 +406,7 @@ class NvidiaRAGIngestor:
             use_nemoretriever_parse = True
 
         if use_nemoretriever_parse and self.config.nemo_parse.endpoint_url:
-            from nvidia_rag.ingestor_server.document_classifier_router import (
+            from nvidia_rag.tools.parse_document import (
                 DocumentClassifierRouter,
             )
 
