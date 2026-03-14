@@ -335,7 +335,12 @@ class NvIngestConfig(_ConfigBase):
     chunk_size: int = Field(
         default=2048,
         env="APP_NVINGEST_CHUNKSIZE",
-        description="Maximum size of text chunks in tokens",
+        description="Maximum size of text chunks in tokens (used by direct-ingest/embed_store path)",
+    )
+    nv_ingest_split_chunk_size: int = Field(
+        default=512,
+        env="APP_NVINGEST_SPLIT_CHUNKSIZE",
+        description="Chunk size in tokens for the NV-Ingest split task (binary files via nv-ingest pipeline)",
     )
     chunk_overlap: int = Field(
         default=150,

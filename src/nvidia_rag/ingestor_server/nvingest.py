@@ -163,7 +163,7 @@ def get_nv_ingest_ingestor(
         )
         ingestor = ingestor.split(
             tokenizer=config.nv_ingest.tokenizer,
-            chunk_size=split_options.get("chunk_size", config.nv_ingest.chunk_size),
+            chunk_size=split_options.get("chunk_size", config.nv_ingest.nv_ingest_split_chunk_size),
             chunk_overlap=split_options.get(
                 "chunk_overlap", config.nv_ingest.chunk_overlap
             ),
@@ -188,6 +188,13 @@ def get_nv_ingest_ingestor(
         )
 
     # Add Embedding task (only when VDB operations are enabled)
+    # NOTE: The NV-Ingest embed step is TEXT-ONLY in the current deployment.
+    # Image/chart/infographic records extracted from PDFs crash nv_ingest_api
+    # embed_text.py (_get_pandas_image_content UnboundLocalError) when no VLM
+    # captioning task has been run to populate image_metadata.caption.
+    # Keep APP_NVINGEST_EXTRACTIMAGES=false and APP_NVINGEST_EXTRACTINFOGRAPHICS=false.
+    # Charts (APP_NVINGEST_EXTRACTCHARTS) work only when they produce text captions
+    # via a prior .caption() task pointing at nim-vlm; otherwise disable those too.
     enable_nv_ingest_vdb_upload = (
         True  # When enabled entire ingestion would be performed using nv-ingest
     )

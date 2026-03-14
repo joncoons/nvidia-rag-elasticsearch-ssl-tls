@@ -56,3 +56,15 @@ COPY src/nvidia_rag/utils/minio_operator.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/minio_operator.py
 COPY src/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py \
      /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py
+
+# New packages: storage (embed_store primitive) and tools (parse_document, crawl)
+COPY src/nvidia_rag/storage/__init__.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/storage/__init__.py
+COPY src/nvidia_rag/storage/embed_store.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/storage/embed_store.py
+COPY src/nvidia_rag/tools/__init__.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/tools/__init__.py
+COPY src/nvidia_rag/tools/parse_document.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/tools/parse_document.py
+COPY src/nvidia_rag/tools/crawl.py \
+     /workspace/.venv/lib/python3.13/site-packages/nvidia_rag/tools/crawl.py

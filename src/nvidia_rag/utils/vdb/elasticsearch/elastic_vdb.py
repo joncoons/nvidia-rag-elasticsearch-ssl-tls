@@ -305,24 +305,45 @@ class ElasticVDB(VDBRagIngest):
             meta_fields=self.meta_fields,
         )
 
-        # Build source_name → source_uri lookup from meta_dataframe (if available).
+        # Build source_name → source_uri lookup and source_name → custom fields lookup
+        # from meta_dataframe (if available).
+        #
         # The add_metadata() path in the Milvus utility was designed for Milvus and
-        # silently fails in the ES path.  We inject source_uri directly here into
-        # content_metadata.content_url (already mapped as keyword in ES) so it is
-        # reliably queryable for upsert delete-by-query operations.
+        # silently fails in the ES path.  We inject all custom CSV fields directly
+        # into content_metadata here so they are reliably written to ES.
+        # source_uri is handled specially → content_url (keyword, used for upsert).
         #
         # NOTE: NV-Ingest stores source_name as os.path.basename(file_path) (e.g.
         # "webcrawl_xyz.md"), while the CSV "source" column has the full path
-        # "/tmp/webcrawl_xyz.md".  Index both so the lookup always resolves.
+        # "/tmp/webcrawl_xyz.md".  Index both so lookups always resolve.
         source_uri_lookup: dict[str, str] = {}
-        if meta_dataframe is not None and "source_uri" in meta_dataframe.columns and self.meta_source_field:
+        custom_meta_lookup: dict[str, dict] = {}
+        if meta_dataframe is not None and self.meta_source_field:
+            # Columns to skip: the source key column and source_uri (handled separately)
+            skip_cols = {self.meta_source_field, "source_uri"}
             for _, row in meta_dataframe.iterrows():
                 sname = str(row.get(self.meta_source_field, ""))
+                if not sname:
+                    continue
+                keys = [sname, os.path.basename(sname)]
+
                 suri = str(row.get("source_uri", ""))
-                if sname and suri and suri != "nan":
-                    source_uri_lookup[sname] = suri
-                    # Also index by basename — NV-Ingest sets source_name to basename only
-                    source_uri_lookup[os.path.basename(sname)] = suri
+                if suri and suri != "nan":
+                    for k in keys:
+                        source_uri_lookup[k] = suri
+
+                # Collect all other non-null CSV fields as custom metadata
+                extra = {
+                    col: val
+                    for col, val in row.items()
+                    if col not in skip_cols
+                    and val is not None
+                    and str(val) != "nan"
+                    and str(val) != ""
+                }
+                if extra:
+                    for k in keys:
+                        custom_meta_lookup[k] = extra
 
         # Prepare texts, embeddings, and metadatas from cleaned records
         texts, embeddings, metadatas = [], [], []
@@ -331,6 +352,10 @@ class ElasticVDB(VDBRagIngest):
             embeddings.append(cleaned_record.get("vector"))
             content_meta = dict(cleaned_record.get("content_metadata") or {})
             source_name = (cleaned_record.get("source") or {}).get("source_name", "")
+            # Merge custom CSV fields first (lower precedence), then content_url
+            if source_name in custom_meta_lookup:
+                for k, v in custom_meta_lookup[source_name].items():
+                    content_meta.setdefault(k, v)
             if source_name in source_uri_lookup:
                 content_meta["content_url"] = source_uri_lookup[source_name]
             metadatas.append(
