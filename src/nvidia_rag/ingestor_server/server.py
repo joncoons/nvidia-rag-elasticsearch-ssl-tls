@@ -945,7 +945,7 @@ async def upload_document(
 async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskResponse:
     """Crawl a website and ingest discovered pages and linked files into the vector store."""
     from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
-    from nvidia_rag.utils.web_crawler import SimpleWebCrawler
+    from nvidia_rag.tools.crawl import SimpleWebCrawler
 
     try:
         from uuid import uuid4
@@ -1017,7 +1017,7 @@ async def cancel_task(task_id: str) -> IngestionTaskResponse:
     transitions to CANCELLED in Redis.
     """
     from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
-    from nvidia_rag.utils.web_crawler import _CRAWL_CANCEL
+    from nvidia_rag.tools.crawl import _CRAWL_CANCEL
 
     cancel_event = _CRAWL_CANCEL.get(task_id)
     if cancel_event is not None:
@@ -1064,7 +1064,7 @@ async def get_media_queue(
         media_type: Optional filter — ``"audio"`` or ``"video"``.
                     Omit to return all pending media rows.
     """
-    from nvidia_rag.utils.web_crawler import load_binary_manifest
+    from nvidia_rag.tools.crawl import load_binary_manifest
 
     registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
     try:
@@ -1125,7 +1125,7 @@ async def ingest_media(request: Request, payload: MediaIngestRequest) -> Ingesti
     the file no longer appears in ``GET /media-queue`` until its content changes.
     """
     from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
-    from nvidia_rag.utils.web_crawler import load_binary_manifest, save_binary_manifest
+    from nvidia_rag.tools.crawl import load_binary_manifest, save_binary_manifest
     from uuid import uuid4
 
     try:
@@ -1201,7 +1201,7 @@ async def ingest_media(request: Request, payload: MediaIngestRequest) -> Ingesti
 async def get_task_status(task_id: str):
     """Get the status of an ingestion task (upload or crawl)."""
     from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
-    from nvidia_rag.utils.web_crawler import _CRAWL_PROGRESS
+    from nvidia_rag.tools.crawl import _CRAWL_PROGRESS
 
     logger.info(f"Getting status of task {task_id}")
     try:
@@ -1867,7 +1867,7 @@ async def delete_collections(
         # Clean up URL registry and error-matrix CSV files for every
         # successfully deleted collection so that subsequent crawls start fresh.
         if result.successful:
-            from nvidia_rag.utils.web_crawler import SimpleWebCrawler
+            from nvidia_rag.tools.crawl import SimpleWebCrawler
 
             registry_dir = os.getenv("APP_CRAWLER_REGISTRY_DIR", "/tmp")
             for name in result.successful:
