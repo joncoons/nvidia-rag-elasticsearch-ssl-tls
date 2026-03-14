@@ -2456,7 +2456,7 @@ class NvidiaRAGIngestor:
         ``__build_ingestion_response()`` — results is an empty list since
         per-document nv-ingest metadata is not available on this path.
         """
-        from nvidia_rag.utils.direct_ingest import ingest_chunk_files
+        from nvidia_rag.storage.embed_store import ingest_chunk_files
 
         logger.info(
             "_run_direct_ingest: embedding %d chunk file(s) → collection=%s",
