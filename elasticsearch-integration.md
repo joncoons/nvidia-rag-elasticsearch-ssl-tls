@@ -253,11 +253,12 @@ bulk_write_to_es()           # POST /<index>/_bulk in batches of 200
 
 Performance: ~1s vs ~26s for 145 chunks — a 26× speedup.
 
-### 2.2 `direct_ingest.py` (New File)
+### 2.2 `embed_store.py` — Storage Primitive (Phase 1 Refactor)
 
-**File**: `src/nvidia_rag/utils/direct_ingest.py`
+**Canonical file**: `src/nvidia_rag/storage/embed_store.py`
+**Compatibility shim**: `src/nvidia_rag/utils/direct_ingest.py` (re-exports from canonical path)
 
-This file does not exist in the baseline. It provides two entry points:
+`embed_store.py` is the shared transport layer for all direct ingest paths. It provides two entry points:
 
 - `ingest_text(text, source_uri, ...)` — for single HTML pages converted to markdown
 - `ingest_chunk_files(chunk_files, source_uri_map, ...)` — for batches of pre-chunked `.md` files produced by nemoretriever-parse or the web crawler
@@ -293,9 +294,10 @@ Key implementation details:
 }
 ```
 
-### 2.3 `document_classifier_router.py` (New File)
+### 2.3 `parse_document.py` — PDF Parse Tool (Phase 2 Refactor)
 
-**File**: `src/nvidia_rag/ingestor_server/document_classifier_router.py`
+**Canonical file**: `src/nvidia_rag/tools/parse_document.py`
+**Compatibility shim**: `src/nvidia_rag/ingestor_server/document_classifier_router.py` (re-exports from canonical path)
 
 Not present in the baseline. Implements a two-pass nemoretriever-parse classifier for PDFs:
 
@@ -361,8 +363,10 @@ Inference mode: nim-llm=1, gpu0-placeholder=3, nemotron-parse=1, nim-vlm=1
 
 | File | Change |
 |---|---|
-| `src/nvidia_rag/utils/direct_ingest.py` | New — async embed + ES bulk write path |
-| `src/nvidia_rag/ingestor_server/document_classifier_router.py` | New — nemoretriever-parse two-pass PDF classifier |
+| `src/nvidia_rag/storage/embed_store.py` | **Canonical** — async embed + ES bulk write transport primitive |
+| `src/nvidia_rag/utils/direct_ingest.py` | Compatibility shim → re-exports from `storage.embed_store` |
+| `src/nvidia_rag/tools/parse_document.py` | **Canonical** — nemoretriever-parse two-pass PDF classifier + `parse_and_ingest()` tool |
+| `src/nvidia_rag/ingestor_server/document_classifier_router.py` | Compatibility shim → re-exports from `tools.parse_document` |
 | `src/nvidia_rag/ingestor_server/main.py` | Added `_all_md_pre_chunked` / `_use_direct_ingest` detection, direct ingest branch, `APP_NEMOPARSE_ENABLED` wiring |
 | `src/nvidia_rag/utils/k8s_scaler.py` | New — GPU mode switching for ingest vs. inference |
 | `src/nvidia_rag/utils/configuration.py` | Added `NemoParseConfig`, `nv_ingest.enable_direct_ingest`, `pdf_repo_dir`, `docs_repo_dir` |
@@ -376,7 +380,7 @@ The baseline has no web crawling capability. This section describes the full BFS
 
 ### 3.1 Overview
 
-The web crawler (`src/nvidia_rag/utils/web_crawler.py`) is a new file with no upstream counterpart. It implements:
+The web crawler (`src/nvidia_rag/tools/crawl.py`) is a new file with no upstream counterpart. It implements:
 
 - BFS crawl over HTML pages with configurable depth, page limits, and URL prefix filters
 - Selenium fallback for JS-rendered pages (`_is_js_sparse()` threshold: 300 visible chars)
@@ -545,7 +549,8 @@ This reads `chunk_doc_names` from the URL registry (populated after the first cr
 
 | File | Change |
 |---|---|
-| `src/nvidia_rag/utils/web_crawler.py` | New — full BFS crawler with delta upsert, redirect tracking, binary manifest, Phase 3, cancellation |
+| `src/nvidia_rag/tools/crawl.py` | **Canonical** — full BFS crawler with delta upsert, redirect tracking, binary manifest, Phase 3, cancellation |
+| `src/nvidia_rag/utils/web_crawler.py` | Compatibility shim → re-exports from `tools.crawl` |
 | `src/nvidia_rag/utils/vdb/elasticsearch/elastic_vdb.py` | Added `content_url` injection in `write_to_index()`; added `delete_by_content_url()` |
 | `src/nvidia_rag/ingestor_server/main.py` | Added `source_uris_to_delete` param on `upload_documents()`; added `purge_deleted_urls()` |
 | `src/nvidia_rag/ingestor_server/server.py` | Added `POST /crawl`, `POST /cancel`, crawl-mode endpoints; `CrawlRequest` model |
@@ -553,3 +558,134 @@ This reads `chunk_doc_names` from the URL registry (populated after the first cr
 | `scripts/backfill_content_url.py` | New — retroactive `content_url` backfill for pre-existing chunks |
 | `frontend/src/components/drawer/WebCrawlSection.tsx` | New — crawl configuration UI in collection drawer |
 | `frontend/src/hooks/useCollectionActions.ts` | Added `handleStartCrawl()` |
+
+---
+
+## Section 4 — Tool Decomposition Refactor
+
+The original implementation placed all pipeline logic in flat utility modules (`utils/direct_ingest.py`, `ingestor_server/document_classifier_router.py`, `utils/web_crawler.py`). A three-phase refactor reorganizes this into a layered package structure with explicit dependencies and backward-compatible shims at every old import path.
+
+### 4.1 Three-Layer Architecture
+
+```
+Layer 0 — Storage primitive
+  nvidia_rag.storage.embed_store
+      chunk_text(), embed_chunks(), bulk_write_to_es()
+      ingest_text(), ingest_chunk_files()
+      No domain knowledge — just embeds and stores.
+
+Layer 1 — Domain tools
+  nvidia_rag.tools.parse_document     ← depends on storage.embed_store
+      DocumentClassifierRouter, parse_and_ingest()
+      Owns the full PDF → Nemotron-Parse → embed → ES pipeline.
+
+  nvidia_rag.tools.crawl              ← depends on tools.parse_document + storage.embed_store
+      SimpleWebCrawler, _CRAWL_PROGRESS, _CRAWL_CANCEL
+      load_binary_manifest(), save_binary_manifest()
+      Owns the full URL → BFS crawl → HTML/binary → ES pipeline.
+
+Layer 2 — Ingestor server (orchestration only)
+  nvidia_rag.ingestor_server.main     ← calls tools, not storage directly
+  nvidia_rag.ingestor_server.server   ← HTTP endpoints; delegates to main + tools
+```
+
+### 4.2 Compatibility Shims
+
+All old import paths are preserved as thin re-export shims. No callers outside the package needed updating.
+
+| Old path (shim) | Canonical path |
+|---|---|
+| `nvidia_rag.utils.direct_ingest` | `nvidia_rag.storage.embed_store` |
+| `nvidia_rag.ingestor_server.document_classifier_router` | `nvidia_rag.tools.parse_document` |
+| `nvidia_rag.utils.web_crawler` | `nvidia_rag.tools.crawl` |
+
+### 4.3 `parse_and_ingest()` — High-Level Parse Tool
+
+New function added in `tools/parse_document.py` that owns the complete single-document ingest lifecycle:
+
+```python
+async def parse_and_ingest(
+    filepath: str,
+    collection_name: str,
+    config: "NvidiaRAGConfig",
+    embed_semaphore: asyncio.Semaphore,
+    source_uri: str | None = None,
+    extra_meta: dict | None = None,
+    force: bool = False,
+) -> dict:
+    """
+    Returns: {"ingested": int, "chunks": int, "pipeline_type": str,
+              "fallback": bool, "filename": str}
+    """
+```
+
+Internally: calls `DocumentClassifierRouter.route_document()` → `embed_store.ingest_chunk_files()` → cleans up temp `.md` files in a `finally` block. The caller never handles temp file lifecycle.
+
+### 4.4 Phase-by-Phase Commit Summary
+
+| Phase | Commit | What moved | Shim created at |
+|---|---|---|---|
+| 1 | `refactor(phase1)` | `utils/direct_ingest.py` → `storage/embed_store.py` | `utils/direct_ingest.py` |
+| 2 | `refactor(phase2)` | `ingestor_server/document_classifier_router.py` → `tools/parse_document.py` | `ingestor_server/document_classifier_router.py` |
+| 3 | `refactor(phase3)` | `utils/web_crawler.py` → `tools/crawl.py` | `utils/web_crawler.py` |
+
+### 4.5 Files Changed — Section 4
+
+| File | Change |
+|---|---|
+| `src/nvidia_rag/storage/__init__.py` | New package init |
+| `src/nvidia_rag/storage/embed_store.py` | Canonical embed+ES transport (moved from `direct_ingest.py`) |
+| `src/nvidia_rag/tools/__init__.py` | New package init with tool inventory |
+| `src/nvidia_rag/tools/parse_document.py` | Canonical PDF parse pipeline (moved from `document_classifier_router.py`) + new `parse_and_ingest()` |
+| `src/nvidia_rag/tools/crawl.py` | Canonical web crawl pipeline (moved from `web_crawler.py`) |
+| `src/nvidia_rag/utils/direct_ingest.py` | Replaced with compatibility shim |
+| `src/nvidia_rag/ingestor_server/document_classifier_router.py` | Replaced with compatibility shim |
+| `src/nvidia_rag/utils/web_crawler.py` | Replaced with compatibility shim |
+| `src/nvidia_rag/ingestor_server/server.py` | Updated 6 lazy imports from `utils.web_crawler` → `tools.crawl` |
+| `src/nvidia_rag/ingestor_server/main.py` | Updated lazy imports for `embed_store` and `parse_document` |
+
+---
+
+## Section 5 — Additional Fixes and Operational Scripts
+
+### 5.1 `CRAWLER_PRODUCT_URL_MAP` — Product Metadata Enrichment
+
+**File**: `src/nvidia_rag/utils/configuration.py`
+
+A module-level constant (60 URL prefix entries) maps source URLs to `product_family` / `product_name` pairs:
+
+```python
+CRAWLER_PRODUCT_URL_MAP: list[tuple[str, str, str | None]] = [
+    ("docs.nvidia.com/cuda/profiler-users-guide", "CUDA", "CUDA Profiler"),
+    ("docs.nvidia.com/cuda",                      "CUDA", "CUDA Toolkit"),
+    ("docs.nvidia.com/deeplearning/tensorrt",      "TensorRT", "TensorRT"),
+    # ... 60 entries total
+    ("github.com/NVIDIA",                          "NVIDIA", None),
+]
+```
+
+The web crawler resolves each ingested URL against this map (longest-prefix wins) and stores `product_family` / `product_name` in `metadata.content_metadata`. This enables product-scoped retrieval filters in the RAG query path.
+
+**Backfill for existing chunks** (`scripts/backfill_product_metadata.py`): PIT-scroll all ES chunks, resolve product from `content_url`, bulk-update `metadata.content_metadata.product_family` / `product_name`. Run once after deploying the map. Result: 194,516 / 200,319 chunks updated.
+
+### 5.2 `ingest-mode.sh` — GPU Ordering Fix
+
+**File**: `scripts/ingest-mode.sh`
+
+The `disable` (restore inference mode) case previously only scaled `nemotron-parse-v12` to 0 before bringing `nim-llm` up. The GPU device-plugin allocates on a first-fit basis, so `gpu0-placeholder` (3 replicas) could still hold GPU0 slots when `nim-llm` tried to start — causing `CrashLoopBackOff` with "low free GPU memory".
+
+**Fix**: scale both `nemotron-parse-v12` AND `gpu0-placeholder` to 0 and wait for both to terminate before starting `nim-llm`:
+
+```bash
+# Step 1: free ALL non-nim-llm GPU0 slots
+kubectl scale deployment nemotron-parse-v12 --replicas=0 -n rag
+kubectl scale deployment gpu0-placeholder   --replicas=0 -n rag
+wait_down nemotron-parse-v12
+wait_down gpu0-placeholder
+# Step 2: start nim-llm (now guaranteed to find free GPU1 slots)
+kubectl scale deployment nim-llm --replicas=1 -n rag
+wait_running nim-llm
+# Step 3: restore placeholders and nemotron-parse
+kubectl scale deployment gpu0-placeholder   --replicas=3 -n rag
+kubectl scale deployment nemotron-parse-v12 --replicas=1 -n rag
+```
