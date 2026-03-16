@@ -3357,7 +3357,7 @@ class NvidiaRAGIngestor:
             Tuple[bool, List[Dict[str, Any]]]: (validation_status, validation_errors)
             validation_errors is a list of error dictionaries in the original format
         """
-        logger.info(
+        logger.debug(
             f"Metadata schema for collection {collection_name}: {metadata_schema_data}"
         )
         # Validate that metadata filenames match the files being ingested

@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 EMBED_BATCH_SIZE = 32
 
 # Documents per ES _bulk request.  200 is safe for 2 KB average text.
-ES_BULK_BATCH_SIZE = 200
+ES_BULK_BATCH_SIZE = 50
 
 # Rough chars-per-token ratio used when converting token-based config values
 # (chunk_size, chunk_overlap) to character counts for client-side chunking.

@@ -1001,8 +1001,14 @@ class DocumentClassifierRouter:
 
             # ── Section boundary ──────────────────────────────────────────
             if cls_l in _SECTION_STARTERS:
-                flush()
                 level = 1 if cls_l == "title" else 2
+                # Title (h1) always flushes — it's a major document boundary.
+                # Section-header (h2-h6) only flushes when the current chunk
+                # already has meaningful content (> 1/4 of max_chars).  This
+                # groups short API-reference entries under the same heading into
+                # a single chunk rather than producing one tiny chunk per entry.
+                if cls_l == "title" or chars > max_chars // 4:
+                    flush()
                 headers[level] = text
                 for k in list(headers):
                     if k > level:
@@ -1010,7 +1016,7 @@ class DocumentClassifierRouter:
                 section_path = DocumentClassifierRouter._section_path_string(headers)
                 header_md = "#" * level + " " + text
                 parts.append(header_md)
-                chars = len(header_md)
+                chars += len(header_md)
                 continue
 
             # ── Picture: emit VLM description (if available) + caption ───

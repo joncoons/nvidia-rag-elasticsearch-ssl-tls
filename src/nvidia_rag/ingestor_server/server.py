@@ -67,6 +67,45 @@ from nvidia_rag.utils.observability.tracing import get_tracer, trace_function
 
 logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
+
+
+class _SuppressHeartbeats(logging.Filter):
+    """Drop uvicorn access-log lines for noisy health/status polling endpoints.
+
+    Filters out successful (2xx) GET requests to endpoints that are polled
+    at high frequency by the frontend, which would otherwise flood the pod
+    log buffer and push out useful crawl/ingest progress lines.
+    """
+    _SUPPRESSED = frozenset({
+        "/crawl-mode/status",
+        "/health",
+        "/v1/health",
+    })
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # uvicorn access format: '10.x.x.x - "GET /path HTTP/1.1" 2xx ...'
+        if '" 2' in msg:
+            for path in self._SUPPRESSED:
+                if path in msg:
+                    return False
+        return True
+
+
+logging.getLogger("elastic_transport.transport").setLevel(logging.WARNING)
+
+
+def _install_heartbeat_filter() -> None:
+    """Attach (or re-attach) the heartbeat filter after uvicorn has finished
+    setting up its own loggers.  Safe to call multiple times."""
+    lg = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _SuppressHeartbeats) for f in lg.filters):
+        lg.addFilter(_SuppressHeartbeats())
+
+# Install eagerly so it is present from the first request even if the
+# startup hook somehow fires late.
+_install_heartbeat_filter()
+
 TRACER = get_tracer("nvidia_rag.ingestor.server")
 
 tags_metadata = [
@@ -95,6 +134,12 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_tags=tags_metadata,
 )
+
+@app.on_event("startup")
+async def _reattach_heartbeat_filter() -> None:
+    """Re-attach after uvicorn has fully initialised its access logger."""
+    _install_heartbeat_filter()
+
 
 # Allow access in browser from RAG UI and Storybook (development)
 origins = ["*"]
@@ -630,15 +675,21 @@ class CrawlRequest(BaseModel):
     max_pages: int | None = Field(
         50, ge=1, description="Maximum number of HTML pages to crawl. Omit or set to null for unlimited."
     )
-    use_nemoretriever_parse: bool = Field(
-        default=False,
-        description="Route complex PDF/document elements through nemoretriever-parse VLM.",
+    use_nemotron_parse: bool = Field(
+        default=True,
+        description=(
+            "When True, binary files (PDFs, DOCX, etc.) discovered during the crawl "
+            "are processed through Nemotron-Parse for high-quality semantic extraction. "
+            "Disable to use the lightweight nv-ingest text-only pipeline instead."
+        ),
     )
-    force_nemoretriever_parse: bool = Field(
+    force_nemotron_parse: bool = Field(
         default=False,
         description=(
-            "Skip Pass 1 classification and unconditionally run all PDF pages "
-            "through nemoretriever-parse VLM. Implies use_nemoretriever_parse=True."
+            "When True, all files (including HTML-converted markdown) are routed "
+            "through Nemotron-Parse regardless of type.  Only applies when "
+            "use_nemotron_parse is also True.  Use for maximum extraction quality "
+            "at the cost of higher latency."
         ),
     )
     extract_linked_files: bool = Field(
@@ -653,6 +704,16 @@ class CrawlRequest(BaseModel):
             "Number of collected files that triggers an ingest batch dispatch while "
             "crawling continues asynchronously.  Smaller values increase crawl/ingest "
             "parallelism; larger values reduce per-batch overhead.  Default is 20."
+        ),
+    )
+    binary_batch_size: int = Field(
+        default=1,
+        ge=1,
+        le=50,
+        description=(
+            "Number of binary files (PDFs, DOCX, etc.) per Phase 3 ingest batch.  "
+            "Keep small (1-5) to avoid overwhelming Nemotron-Parse on large PDFs.  "
+            "Default is 1."
         ),
     )
     max_concurrent_batches: int = Field(
@@ -958,11 +1019,13 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             max_pages=payload.max_pages,
             extract_linked_files=payload.extract_linked_files,
             batch_ingest_size=payload.batch_ingest_size,
+            binary_batch_size=payload.binary_batch_size,
             max_concurrent_batches=payload.max_concurrent_batches,
             force_recrawl=payload.force_recrawl,
             registry_dir=registry_dir,
             collection_name=payload.collection_name,
-            use_nemoretriever_parse=payload.use_nemoretriever_parse,
+            use_nemoretriever_parse=payload.use_nemotron_parse,
+            force_nemoretriever_parse=payload.force_nemotron_parse,
             allowed_url_prefixes=payload.allowed_url_prefixes,
             use_selenium=payload.use_selenium,
             selenium_content_threshold=payload.selenium_content_threshold,
@@ -970,7 +1033,6 @@ async def crawl_web(request: Request, payload: CrawlRequest) -> IngestionTaskRes
             max_depth=payload.max_depth,
             blocked_url_patterns=payload.blocked_url_patterns,
             use_sitemap=payload.use_sitemap,
-            force_nemoretriever_parse=payload.force_nemoretriever_parse,
             export_dir=export_dir,
             pdf_repo_dir=CONFIG.pdf_repo_dir,
             docs_repo_dir=CONFIG.docs_repo_dir,

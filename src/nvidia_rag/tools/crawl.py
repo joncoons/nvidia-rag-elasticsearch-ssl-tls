@@ -87,18 +87,18 @@ import json
 import logging
 import os
 import re
+import ssl
 import tempfile
-import threading
-import time
+import time  # retained for _capture_screenshot time.sleep(2)
 import xml.etree.ElementTree as ET
 from collections import deque
-from concurrent.futures import Future as ConcurrentFuture
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
 
-import requests
+import aiohttp
+import requests  # retained for _fetch_sitemap_seeds (one-time startup, not hot path)
 
 from nvidia_rag.utils.k8s_scaler import disable_crawl_mode, enable_crawl_mode
 from nvidia_rag.utils.xml_preprocessor import xml_to_markdown
@@ -115,7 +115,20 @@ _CRAWL_PROGRESS: dict[str, dict] = {}
 
 # Cancellation events keyed by task_id.  Set by POST /cancel; checked at the top
 # of the BFS loop so the crawl exits gracefully (finally block still runs).
-_CRAWL_CANCEL: dict[str, "threading.Event"] = {}
+_CRAWL_CANCEL: dict[str, asyncio.Event] = {}
+
+
+class _FetchUnchanged:
+    """Returned by _fetch_html when the body hash matches the cached hash.
+
+    Carries the cached hrefs from the previous parse so BFS link-following
+    can continue without re-running BeautifulSoup on the unchanged body.
+    """
+    __slots__ = ("hrefs",)
+
+    def __init__(self, hrefs: list[str]) -> None:
+        self.hrefs = hrefs
+
 
 # Sentinel returned by _collect_binary_file when server responds 304 Not Modified.
 _UNCHANGED: tuple = ()
@@ -174,9 +187,34 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 
+_BLOCKED_URL_SUFFIXES: frozenset[str] = frozenset({
+    ".inv",       # Sphinx intersphinx inventory files — binary, not ingestable
+})
+
+# URL substrings that are blocked on every crawl regardless of caller config.
+# These cover non-HTTP schemes, known-403 CDN domains, and high-noise low-value
+# paths that would waste crawl budget across all collections.
+_DEFAULT_BLOCKED_PATTERNS: tuple[str, ...] = (
+    # Non-HTTP schemes picked up as href values
+    "mailto:",
+    "javascript:",
+    "tel:",
+    "ftp:",
+    # docscontent.nvidia.com — NVIDIA's legacy DITA CDN; all PDFs return 403
+    "docscontent.nvidia.com",
+    # Binary download mirrors — large files, no readable text
+    "developer.download.nvidia.com/compute",
+    "network.nvidia.com/pdf",
+    # Forum uploads — user-generated attachments, not product docs
+    "forums.developer.nvidia.com/uploads",
+)
+
+
 def _is_binary_url(url: str) -> bool:
     """Return True if *url* points to a binary document file."""
     path = urlparse(url).path.lower()
+    if any(path.endswith(s) for s in _BLOCKED_URL_SUFFIXES):
+        return False
     return any(path.endswith(ext) for ext in _BINARY_EXTENSIONS)
 
 
@@ -347,6 +385,7 @@ class SimpleWebCrawler:
         max_pages: int | None = 50,
         extract_linked_files: bool = False,
         batch_ingest_size: int = 20,
+        binary_batch_size: int = 1,
         max_concurrent_batches: int = 3,
         force_recrawl: bool = False,
         registry_dir: str = "/tmp",
@@ -379,6 +418,7 @@ class SimpleWebCrawler:
         self.max_pages = max_pages
         self.extract_linked_files = extract_linked_files
         self.batch_ingest_size = max(1, batch_ingest_size)
+        self.binary_batch_size = max(1, binary_batch_size)
         self.max_concurrent_batches = max(1, max_concurrent_batches)
         self.force_recrawl = force_recrawl
         self.registry_dir = registry_dir
@@ -415,7 +455,9 @@ class SimpleWebCrawler:
         self.allowed_url_prefixes = [p.rstrip("/") for p in allowed_url_prefixes] if allowed_url_prefixes else None
         self.max_depth = max_depth
         # Strip trailing slashes so e.g. "/pull/" also blocks "/pulls" (listing pages).
-        self.blocked_url_patterns = [p.rstrip("/") for p in (blocked_url_patterns or [])]
+        self.blocked_url_patterns = list(_DEFAULT_BLOCKED_PATTERNS) + [
+            p.rstrip("/") for p in (blocked_url_patterns or [])
+        ]
         self.use_sitemap = use_sitemap
         self.use_selenium = use_selenium
         self._selenium_content_threshold = selenium_content_threshold
@@ -427,13 +469,18 @@ class SimpleWebCrawler:
         # Chrome startup cost (~5-10 s).  Quit in the crawl finally block.
         self._selenium_driver: Any = None
 
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": user_agent})
-        # Disable environment variable passthrough so that REQUESTS_CA_BUNDLE
-        # (which points to the ECK-internal CA) does not override standard CA
-        # validation for outbound public HTTPS requests.  With trust_env=False
-        # requests uses the certifi bundle it ships with (verify=True default).
-        self._session.trust_env = False
+        # aiohttp.ClientSession is created per-crawl inside _crawl_async so it
+        # can be bound to the running event loop.  self._session holds a reference
+        # during the crawl so _fetch_html / _collect_binary_file can use it.
+        self._session: aiohttp.ClientSession | None = None
+        # asyncio.Lock instances created at crawl start (needs running event loop).
+        # _selenium_lock serialises headless-Chrome calls (driver is not coroutine-safe).
+        # _manifest_lock guards self._live_manifest during concurrent binary downloads.
+        self._selenium_lock: asyncio.Lock | None = None
+        self._manifest_lock: asyncio.Lock | None = None
+        # In-memory binary manifest — loaded once at crawl start, mutated under
+        # _manifest_lock, saved to disk at batch dispatch time and in the finally block.
+        self._live_manifest: list[dict] = []
         self._netloc = urlparse(start_url).netloc
 
     # ------------------------------------------------------------------
@@ -463,20 +510,11 @@ class SimpleWebCrawler:
         dict
             Summary dict compatible with ``UploadDocumentResponse``.
         """
-        loop = asyncio.get_running_loop()
-        cancel_event = threading.Event()
+        cancel_event = asyncio.Event()
         if self.task_id:
             _CRAWL_CANCEL[self.task_id] = cancel_event
         try:
-            return await loop.run_in_executor(
-                None,
-                self._crawl_sync,
-                ingestor,
-                collection_name,
-                vdb_auth_token,
-                loop,
-                cancel_event,
-            )
+            return await self._crawl_async(ingestor, collection_name, vdb_auth_token, cancel_event)
         finally:
             _CRAWL_CANCEL.pop(self.task_id, None)
 
@@ -503,50 +541,55 @@ class SimpleWebCrawler:
         return {}
 
     # ------------------------------------------------------------------
-    # Internal sync implementation (runs in a thread-pool executor)
+    # Internal async implementation
     # ------------------------------------------------------------------
 
-    def _crawl_sync(
+    _FETCH_CONCURRENCY: int = 10  # max simultaneous page / binary-file fetches
+    _FETCH_304 = object()          # sentinel: server returned 304 Not Modified
+
+    async def _crawl_async(
         self,
         ingestor: "NvidiaRAGIngestor",
         collection_name: str,
         vdb_auth_token: str,
-        loop: asyncio.AbstractEventLoop,
-        cancel_event: threading.Event | None = None,
+        cancel_event: asyncio.Event,
     ) -> dict[str, Any]:
         """
-        Streaming-batch crawl with back-pressure, eager harvesting, and delta detection.
+        Async streaming-batch crawl with concurrent fetching, back-pressure,
+        eager harvesting, and delta detection.
 
         Phase 1 -- BFS fetch with rolling dispatch:
-            Every ``batch_ingest_size`` files, dispatch an ingest batch.
-            If ``max_concurrent_batches`` slots are full, block (poll/sleep)
-            until a batch completes before dispatching the next one.
-            Unchanged pages/files (per URL registry) are skipped.
+            Fetch up to _FETCH_CONCURRENCY pages concurrently per iteration.
+            Every ``batch_ingest_size`` files, dispatch an ingest batch as an
+            asyncio.Task.  If ``max_concurrent_batches`` tasks are in-flight,
+            await the first completion (asyncio.wait FIRST_COMPLETED) before
+            dispatching the next.
 
         Phase 2 -- Drain:
-            Submit the final partial batch, then poll until all in-flight
-            futures complete (no timeout -- waits as long as nv-ingest needs).
-            Registry is saved after all futures settle.
+            Submit the final partial batch, then await all remaining tasks.
+
+        Phase 3 -- Binary ingest:
+            NFS-persisted documents ingested serially by type (PDFs then others).
         """
+        # ── Build SSL context once (certifi public CA, ignores ECK internal CA) ─
+        try:
+            import certifi  # noqa: PLC0415
+            _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            _ssl_ctx = ssl.create_default_context()
+
+        conn = aiohttp.TCPConnector(ssl=_ssl_ctx, limit=20)
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        headers = {"User-Agent": self._user_agent}
+
+        # Create per-crawl locks (need running event loop)
+        self._selenium_lock = asyncio.Lock()
+        self._manifest_lock = asyncio.Lock()
+
         visited_html: set[str] = set()
         visited_files: set[str] = set()
         queue: deque[tuple[str, int]] = deque([(self.start_url, 0)])
 
-        # ── Sitemap seeding ───────────────────────────────────────────────
-        # If enabled, pre-populate the BFS queue with all URLs from the
-        # domain's sitemaps.  This guarantees full-tree coverage for sites
-        # that render navigation via JavaScript (where BFS link discovery
-        # alone would miss large parts of the site).
-        if self.use_sitemap:
-            seed_urls = self._fetch_sitemap_seeds()
-            already_queued = {self.start_url}
-            for seed_url in seed_urls:
-                if seed_url not in already_queued:
-                    queue.append((seed_url, 0))
-                    already_queued.add(seed_url)
-            logger.info("sitemap: seeded BFS queue with %d URLs (total queue=%d)", len(seed_urls), len(queue))
-
-        # All temp file paths -- cleaned up in finally after all futures settle.
         all_temp_files: list[str] = []
         errors: list[dict] = []
         error_matrix: dict[str, list[dict]] = {
@@ -556,55 +599,39 @@ class SimpleWebCrawler:
             "batch_errors": [],
         }
         pages_crawled = 0
-        pages_skipped = 0   # unchanged HTML pages (hash match)
-        files_skipped = 0   # unchanged inline binary files (304)
+        pages_skipped = 0
+        files_skipped = 0
         total_files_dispatched = 0
         files_ingested = 0
-        binary_files_ingested = 0   # NFS-persisted documents ingested in Phase 3
-        binary_files_skipped = 0    # NFS-persisted documents skipped (unchanged)
+        binary_files_ingested = 0
+        binary_files_skipped = 0
 
-        # Current batch being accumulated before dispatch
         pending: list[tuple[str, dict]] = []
 
-        # In-flight ingest futures:
-        #   (future, batch_number, file_count, urls_to_mark_ingested, uri_to_chunk_names)
-        # urls_to_mark_ingested: source_uris whose last_ingested should be set on success
-        #   (changed URLs whose last_ingested was cleared before dispatch).
-        # uri_to_chunk_names: source_uri → [dispatched file basenames] for ALL URLs in
-        #   the batch, stored in the registry so backfill scripts can reverse-map chunks
-        #   to their source URLs without a re-crawl.
-        in_flight: list[tuple[ConcurrentFuture, int, int, set[str], dict[str, list[str]]]] = []
+        # in_flight: (task, batch_number, file_count, urls_to_mark_ingested, uri_to_chunk_names)
+        in_flight: list[tuple[asyncio.Task, int, int, set[str], dict[str, list[str]]]] = []
         batch_num = 0
 
-        # URL registry: loaded once at start, saved in finally
         registry: dict[str, dict] = self._load_registry()
+        self._registry_last_saved: float = time.monotonic()  # throttle registry writes
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Track URLs whose content changed since the last crawl so that stale
-        # vector chunks can be deleted from ES before new chunks are written.
-        # last_ingested is cleared for these URLs before dispatch and only restored
-        # after the batch completes successfully (atomic upsert semantics).
         changed_urls: set[str] = set()
-
-        # Track previously-ingested URLs that returned 404/410 during this crawl.
-        # Their ES chunks and registry entries are purged in the finally block.
         deleted_urls: set[str] = set()
-
-        # Track URLs that redirected to a new location.
-        # ES chunks are purged (content moved) but the registry entry is kept
-        # with redirect_to so future crawls skip re-purging.
         redirected_urls: set[str] = set()
 
+        # ── Inner helpers ───────────────────────────────────────────────────
+
         def _harvest_done() -> None:
-            """Move any completed futures out of in_flight, record results."""
+            """Move completed asyncio.Tasks out of in_flight, record results."""
             nonlocal files_ingested
-            remaining: list[tuple[ConcurrentFuture, int, int, set[str], dict[str, list[str]]]] = []
-            for f, bnum, fcount, urls_to_mark, uri_to_chunk_names in in_flight:
-                if not f.done():
-                    remaining.append((f, bnum, fcount, urls_to_mark, uri_to_chunk_names))
+            remaining: list[tuple[asyncio.Task, int, int, set[str], dict[str, list[str]]]] = []
+            for task, bnum, fcount, urls_to_mark, uri_to_chunk_names in in_flight:
+                if not task.done():
+                    remaining.append((task, bnum, fcount, urls_to_mark, uri_to_chunk_names))
                     continue
                 try:
-                    result = f.result()
+                    result = task.result()
                     failed_docs = (
                         result.get("failed_documents", [])
                         if isinstance(result, dict) else []
@@ -618,14 +645,9 @@ class SimpleWebCrawler:
                         })
                     files_ingested += fcount - len(failed_docs)
                     completed_iso = datetime.now(timezone.utc).isoformat()
-                    # Store chunk_doc_names for ALL URLs in this batch so a backfill
-                    # script can reverse-map chunk filenames → source URLs without
-                    # needing a force re-crawl.
                     for uri, chunk_names in uri_to_chunk_names.items():
                         if uri in registry:
                             registry[uri] = {**registry[uri], "chunk_doc_names": chunk_names}
-                    # Restore last_ingested for changed URLs now that new chunks
-                    # are confirmed written to ES.
                     for uri in urls_to_mark:
                         if uri in registry:
                             registry[uri] = {**registry[uri], "last_ingested": completed_iso}
@@ -648,39 +670,36 @@ class SimpleWebCrawler:
                     })
             in_flight[:] = remaining
 
-        def _dispatch_batch(batch: list[tuple[str, dict]]) -> None:
-            """Submit *batch* to upload_documents(), blocking if at capacity."""
+        async def _dispatch_batch_async(batch: list[tuple[str, dict]]) -> None:
+            """Submit *batch* to upload_documents(); await a slot if at capacity."""
             nonlocal batch_num, total_files_dispatched
             if not batch:
                 return
-            # Back-pressure: wait until a concurrent slot is free
-            while len(in_flight) >= self.max_concurrent_batches:
-                time.sleep(0.5)
+
+            # Back-pressure: if all slots busy, wait until at least one completes.
+            if len(in_flight) >= self.max_concurrent_batches:
+                done, _ = await asyncio.wait(
+                    [t for t, *_ in in_flight],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 _harvest_done()
+
             batch_num += 1
             filepaths = [p for p, _ in batch]
             custom_metadata = [m for _, m in batch]
-            # Build source_uri → [dispatched file basenames] for registry tracking.
-            # Stored in registry after batch success so backfill scripts can
-            # reverse-map chunk doc_names → source URLs without a force re-crawl.
+
             uri_to_chunk_names: dict[str, list[str]] = {}
             for fp, m in batch:
                 uri = m.get("metadata", {}).get("source_uri", "")
                 if uri:
                     uri_to_chunk_names.setdefault(uri, []).append(os.path.basename(fp))
-            # Collect source URIs in this batch that had stale chunks in ES
-            # (content changed since last crawl) so the ingestor can delete them first.
+
             uris_to_delete = list({
                 m["metadata"]["source_uri"]
                 for _, m in batch
                 if m.get("metadata", {}).get("source_uri") in changed_urls
             })
             if uris_to_delete:
-                # Atomic pre-delete: clear last_ingested from registry NOW (before ES
-                # delete + re-ingest) so registry and ES stay in sync.  If the re-ingest
-                # fails, both registry and ES show the URL as not-ingested and it will
-                # be retried on the next crawl.  last_ingested is restored in
-                # _harvest_done() once the batch future resolves successfully.
                 for uri in uris_to_delete:
                     if uri in registry:
                         entry = dict(registry[uri])
@@ -694,11 +713,13 @@ class SimpleWebCrawler:
                     "will pre-delete stale ES chunks and restore after success",
                     batch_num, len(uris_to_delete),
                 )
+
             logger.info(
                 "Dispatching ingest batch %d: %d files  [%d/%d slots used]",
                 batch_num, len(filepaths), len(in_flight), self.max_concurrent_batches,
             )
-            future: ConcurrentFuture = asyncio.run_coroutine_threadsafe(
+
+            task = asyncio.create_task(
                 ingestor.upload_documents(
                     filepaths=filepaths,
                     collection_name=collection_name,
@@ -710,293 +731,381 @@ class SimpleWebCrawler:
                     source_system="web_crawl",
                     is_final_batch=False,
                     source_uris_to_delete=uris_to_delete or None,
-                ),
-                loop,
+                )
             )
-            in_flight.append((future, batch_num, len(filepaths), set(uris_to_delete), uri_to_chunk_names))
+            in_flight.append((task, batch_num, len(filepaths), set(uris_to_delete), uri_to_chunk_names))
             total_files_dispatched += len(filepaths)
-            # Flush registry + error CSV after every batch so artifacts are
-            # up-to-date on the host-mounted dir mid-crawl.
             self._save_registry(registry)
             self._flush_errors_to_csv(errors, error_matrix)
             self._export_crawl_artifacts()
 
-        max_pages_display = self.max_pages if self.max_pages is not None else "unlimited"
-        logger.info(
-            "Crawl starting at %s (max_pages=%s, batch_ingest_size=%d, "
-            "max_concurrent_batches=%d, force_recrawl=%s, registry_entries=%d)",
-            self.start_url, max_pages_display,
-            self.batch_ingest_size, self.max_concurrent_batches,
-            self.force_recrawl, len(registry),
-        )
+        # ── Open aiohttp session ────────────────────────────────────────────
+        async with aiohttp.ClientSession(
+            connector=conn,
+            timeout=timeout,
+            headers=headers,
+        ) as session:
+            self._session = session
 
-        # Ensure the collection exists before dispatching any ingest batches.
-        try:
-            result = ingestor.create_collection(collection_name=collection_name)
-            logger.info("Collection '%s': %s", collection_name, result.get("message", result))
-        except Exception as exc:
-            logger.warning("create_collection('%s') raised: %r — proceeding anyway", collection_name, exc)
+            max_pages_display = self.max_pages if self.max_pages is not None else "unlimited"
 
-        # Switch to crawl-optimised GPU layout (nim-llm off, max nemotron-parse replicas).
-        enable_crawl_mode()
-
-        # Seed progress entry immediately so the frontend sees the task the moment
-        # crawling begins, before any pages are counted.
-        if self.task_id:
-            _CRAWL_PROGRESS[self.task_id] = {
-                "task_type": "crawl",
-                "start_url": self.start_url,
-                "collection_name": self.collection_name,
-                "pages_crawled": 0,
-                "pages_queued": len(queue),
-                "pages_skipped": 0,
-                "files_dispatched": 0,
-            }
-
-        # Initialise the shared Selenium driver once for the whole crawl so that
-        # JS-heavy pages don't each pay the ~5-10 s Chrome startup cost.
-        if self.use_selenium:
-            self._selenium_driver = self._create_selenium_driver()
-
-        try:
-            # ── Phase 1: BFS crawl with rolling batch dispatch ───────────────
-            while queue and (self.max_pages is None or pages_crawled < self.max_pages):
-                if cancel_event and cancel_event.is_set():
-                    logger.info(
-                        "Crawl cancelled by request after %d pages — "
-                        "saving registry and cleaning up.",
-                        pages_crawled,
-                    )
-                    break
-                url, depth = queue.popleft()
-                if url in visited_html:
-                    continue
-                visited_html.add(url)
-
-                # Opportunistically harvest completed futures while crawling
-                _harvest_done()
-
-                logger.info("Crawling [depth=%d] %s", depth, url)
-                html_content, page_title, meta_desc, section_h1, linked_urls, fetch_error, resp_meta = (
-                    self._fetch_html(url)
+            # ── Sitemap seeding ─────────────────────────────────────────────
+            if self.use_sitemap:
+                seed_urls = await asyncio.to_thread(self._fetch_sitemap_seeds)
+                already_queued = {self.start_url}
+                for seed_url in seed_urls:
+                    if seed_url not in already_queued:
+                        queue.append((seed_url, 0))
+                        already_queued.add(seed_url)
+                logger.info(
+                    "sitemap: seeded BFS queue with %d URLs (total queue=%d)",
+                    len(seed_urls), len(queue),
                 )
 
-                if html_content is None:
-                    if fetch_error:
-                        errors.append({"url": url, **fetch_error})
-                        # Detect deleted pages: 404/410 on a previously-ingested URL.
-                        # Queue for ES chunk purge + registry removal in finally block.
-                        if fetch_error.get("status_code") in (404, 410):
+            logger.info(
+                "Crawl starting at %s (max_pages=%s, batch_ingest_size=%d, "
+                "max_concurrent_batches=%d, force_recrawl=%s, registry_entries=%d, "
+                "fetch_concurrency=%d)",
+                self.start_url, max_pages_display,
+                self.batch_ingest_size, self.max_concurrent_batches,
+                self.force_recrawl, len(registry), self._FETCH_CONCURRENCY,
+            )
+
+            try:
+                result = await asyncio.to_thread(
+                    ingestor.create_collection, collection_name=collection_name
+                )
+                logger.info("Collection '%s': %s", collection_name, result.get("message", result))
+            except Exception as exc:
+                logger.warning("create_collection('%s') raised: %r — proceeding anyway", collection_name, exc)
+
+            await asyncio.to_thread(enable_crawl_mode)
+
+            if self.task_id:
+                _CRAWL_PROGRESS[self.task_id] = {
+                    "task_type": "crawl",
+                    "start_url": self.start_url,
+                    "collection_name": self.collection_name,
+                    "pages_crawled": 0,
+                    "pages_queued": len(queue),
+                    "pages_skipped": 0,
+                    "files_dispatched": 0,
+                }
+
+            if self.use_selenium:
+                self._selenium_driver = await asyncio.to_thread(self._create_selenium_driver)
+
+            # Load binary manifest into memory once (avoids O(n²) disk reads)
+            self._live_manifest = self._load_binary_manifest()
+
+            try:
+                # ── Phase 1: async BFS with concurrent page fetching ────────
+                while queue and (self.max_pages is None or pages_crawled < self.max_pages):
+                    if cancel_event.is_set():
+                        logger.info(
+                            "Crawl cancelled by request after %d pages — "
+                            "saving registry and cleaning up.",
+                            pages_crawled,
+                        )
+                        break
+
+                    # Collect up to _FETCH_CONCURRENCY un-visited URLs
+                    to_fetch: list[tuple[str, int]] = []
+                    while queue and len(to_fetch) < self._FETCH_CONCURRENCY:
+                        url, depth = queue.popleft()
+                        if url in visited_html:
+                            continue
+                        visited_html.add(url)
+                        to_fetch.append((url, depth))
+
+                    if not to_fetch:
+                        break
+
+                    # Harvest any completed ingest tasks while we have a moment
+                    _harvest_done()
+
+                    # Fetch all pages in this mini-batch concurrently
+                    # Pass registry entry so _fetch_html can send conditional headers
+                    fetch_results = await asyncio.gather(
+                        *[self._fetch_html(url, reg_entry=registry.get(url)) for url, _ in to_fetch],
+                        return_exceptions=True,
+                    )
+
+                    # ── Collect binary file URLs from this page batch ────────
+                    binary_fetch_args: list[tuple] = []  # (url, depth, file_reg, abs_href)
+                    # We collect them first so we can download them concurrently below.
+
+                    for (url, depth), result in zip(to_fetch, fetch_results):
+                        if isinstance(result, Exception):
+                            logger.warning("Fetch exception for %s: %r", url, result)
+                            errors.append({
+                                "url": url,
+                                "error_type": "broken_link",
+                                "status_code": None,
+                                "error": repr(result),
+                            })
+                            continue
+
+                        # 304 Not Modified — content unchanged, no body transferred
+                        if result is self._FETCH_304:
+                            pages_crawled += 1
+                            pages_skipped += 1
+                            logger.info(
+                                "Skipping unchanged page %d/%s: %s  [304 Not Modified, skipped=%d]",
+                                pages_crawled, max_pages_display, url, pages_skipped,
+                            )
+                            reg_entry = registry.get(url, {})
+                            registry[url] = {**reg_entry, "last_seen": now_iso}
+                            continue
+
+                        # Hash match with cached links — body downloaded but BS4 parse skipped
+                        if isinstance(result, _FetchUnchanged):
+                            pages_crawled += 1
+                            pages_skipped += 1
+                            logger.info(
+                                "Skipping unchanged page %d/%s: %s  [hash match, cached links, skipped=%d]",
+                                pages_crawled, max_pages_display, url, pages_skipped,
+                            )
+                            reg_entry = registry.get(url, {})
+                            registry[url] = {**reg_entry, "last_seen": now_iso}
+                            # Follow cached links to keep BFS graph intact
+                            for href in result.hrefs:
+                                href = href.split("#")[0]
+                                if not href:
+                                    continue
+                                try:
+                                    abs_href = urljoin(url, href)
+                                except ValueError:
+                                    continue
+                                if self._is_blocked_url(abs_href):
+                                    continue
+                                if self.extract_linked_files and _is_binary_url(abs_href):
+                                    if abs_href not in visited_files:
+                                        visited_files.add(abs_href)
+                                        file_reg = registry.get(abs_href, {})
+                                        if_none_match = file_reg.get("etag") if not self.force_recrawl else None
+                                        if_modified_since = (
+                                            file_reg.get("last_modified")
+                                            if not self.force_recrawl and not if_none_match else None
+                                        )
+                                        binary_fetch_args.append((
+                                            abs_href, depth + 1, file_reg,
+                                            if_none_match, if_modified_since, url,
+                                        ))
+                                elif (
+                                    not _is_binary_url(abs_href)
+                                    and _same_domain(abs_href, self._netloc)
+                                    and self._is_allowed_url(abs_href)
+                                    and not self._is_blocked_url(abs_href)
+                                    and abs_href not in visited_html
+                                    and (self.max_pages is None or pages_crawled < self.max_pages)
+                                    and (self.max_depth is None or depth + 1 <= self.max_depth)
+                                ):
+                                    queue.append((abs_href, depth + 1))
+                            continue
+
+                        html_content, page_title, meta_desc, section_h1, linked_urls, fetch_error, resp_meta = result
+
+                        if html_content is None:
+                            if fetch_error:
+                                errors.append({"url": url, **fetch_error})
+                                if fetch_error.get("status_code") in (404, 410):
+                                    reg_entry = registry.get(url, {})
+                                    if reg_entry.get("last_ingested"):
+                                        deleted_urls.add(url)
+                                        logger.info(
+                                            "Deleted URL detected (HTTP %s): %s — "
+                                            "will purge ES chunks and remove from registry",
+                                            fetch_error["status_code"], url,
+                                        )
+                            continue
+
+                        pages_crawled += 1
+
+                        # ── Redirect detection ──────────────────────────────
+                        final_url = resp_meta.pop("final_url", None)
+                        if final_url:
+                            logger.info("Redirect detected: %s → %s", url, final_url)
+                            if (
+                                not _is_binary_url(final_url)
+                                and _same_domain(final_url, self._netloc)
+                                and self._is_allowed_url(final_url)
+                                and not self._is_blocked_url(final_url)
+                                and final_url not in visited_html
+                                and (self.max_depth is None or depth + 1 <= self.max_depth)
+                            ):
+                                queue.appendleft((final_url, depth))
                             reg_entry = registry.get(url, {})
                             if reg_entry.get("last_ingested"):
-                                deleted_urls.add(url)
-                                logger.info(
-                                    "Deleted URL detected (HTTP %s): %s — "
-                                    "will purge ES chunks and remove from registry",
-                                    fetch_error["status_code"], url,
+                                redirected_urls.add(url)
+                                logger.info("Deprecated redirect URL %s — scheduling ES chunk purge", url)
+                            registry[url] = {
+                                "redirect_to": final_url,
+                                "last_seen": now_iso,
+                                "status_code": resp_meta.get("status_code", 301),
+                            }
+                            continue
+
+                        # Progress update every 5 pages
+                        if self.task_id and pages_crawled % 5 == 0:
+                            _CRAWL_PROGRESS[self.task_id] = {
+                                "task_type": "crawl",
+                                "start_url": self.start_url,
+                                "collection_name": self.collection_name,
+                                "pages_crawled": pages_crawled,
+                                "pages_queued": len(queue) + len(in_flight),
+                                "pages_skipped": pages_skipped,
+                                "files_dispatched": total_files_dispatched,
+                            }
+
+                        # ── Delta check ─────────────────────────────────────
+                        new_hash = resp_meta.get("content_hash", "")
+                        reg_entry = registry.get(url, {})
+                        stored_hash = reg_entry.get("content_hash", "")
+
+                        if not self.force_recrawl and stored_hash and stored_hash == new_hash:
+                            pages_skipped += 1
+                            logger.info(
+                                "Skipping unchanged page %d/%s: %s  [hash match, skipped=%d]",
+                                pages_crawled, max_pages_display, url, pages_skipped,
+                            )
+                            registry[url] = {**reg_entry, "last_seen": now_iso}
+                        else:
+                            is_changed = bool(
+                                reg_entry.get("last_ingested") and (
+                                    self.force_recrawl or (stored_hash and stored_hash != new_hash)
                                 )
-                    # Still process any links if we got a non-HTML content type
-                    # (fetch_error is None for silent skips like wrong content type)
-                    continue
+                            )
+                            if is_changed:
+                                changed_urls.add(url)
+                            base_meta = {
+                                **self._resolve_product_metadata(url),
+                                **self.extra_metadata,
+                                "source_uri": url,
+                                "filename": url.rstrip("/").rsplit("/", 1)[-1] or self._netloc,
+                                "page_title": page_title,
+                                "crawl_depth": depth,
+                                "section_h1": section_h1,
+                                "meta_description": meta_desc,
+                                "source_system": "web_crawl",
+                            }
+                            html_elements = self._html_to_elements(html_content)
+                            if html_elements:
+                                from nvidia_rag.tools.parse_document import (  # noqa: PLC0415
+                                    DocumentClassifierRouter,
+                                )
+                                chunk_pairs = DocumentClassifierRouter._split_by_semantic_elements(
+                                    html_elements, self._html_chunk_max_tokens, chunk_overlap=150,
+                                )
+                                for chunk_text, section_path in chunk_pairs:
+                                    if not chunk_text.strip():
+                                        continue
+                                    tmp_path = self._save_temp(chunk_text.encode("utf-8"), suffix=".md")
+                                    all_temp_files.append(tmp_path)
+                                    meta = {**base_meta}
+                                    if section_path:
+                                        meta["section_path"] = section_path
+                                        meta["heading"] = section_path.split(" > ")[-1].strip()
+                                    pending.append((
+                                        tmp_path,
+                                        {"filename": os.path.basename(tmp_path), "metadata": meta},
+                                    ))
+                            else:
+                                screenshot_added = False
+                                if self.use_selenium and self._selenium_screenshot_fallback:
+                                    ss_dir = tempfile.gettempdir()
+                                    ss_path = await asyncio.to_thread(self._capture_screenshot, url, ss_dir)
+                                    if ss_path:
+                                        all_temp_files.append(ss_path)
+                                        pending.append((
+                                            ss_path,
+                                            {"filename": os.path.basename(ss_path), "metadata": base_meta},
+                                        ))
+                                        logger.info("Screenshot added to batch for JS-sparse page: %s", url)
+                                        screenshot_added = True
+                                if not screenshot_added:
+                                    tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
+                                    all_temp_files.append(tmp_path)
+                                    pending.append((
+                                        tmp_path,
+                                        {"filename": os.path.basename(tmp_path), "metadata": base_meta},
+                                    ))
 
-                pages_crawled += 1
+                            reg_update = {
+                                "last_seen": now_iso,
+                                "last_modified": resp_meta.get("last_modified"),
+                                "etag": resp_meta.get("etag"),
+                                "content_hash": new_hash,
+                                "status_code": resp_meta.get("status_code", 200),
+                                "linked_hrefs": linked_urls,
+                            }
+                            if not is_changed:
+                                reg_update["last_ingested"] = now_iso
+                            registry[url] = reg_update
+                            logger.info(
+                                "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
+                                pages_crawled, max_pages_display, url, len(pending), len(in_flight),
+                            )
 
-                # ── Redirect detection ───────────────────────────────────────
-                # If the server redirected to a different URL, queue the final
-                # destination and record the deprecated URL as a redirect.
-                # Stale ES chunks for the old URL are purged (same as a 410).
-                final_url = resp_meta.pop("final_url", None)
-                if final_url:
-                    logger.info(
-                        "Redirect detected: %s → %s", url, final_url
-                    )
-                    # Queue the destination if it is within scope and not seen.
-                    if (
-                        not _is_binary_url(final_url)
-                        and _same_domain(final_url, self._netloc)
-                        and self._is_allowed_url(final_url)
-                        and not self._is_blocked_url(final_url)
-                        and final_url not in visited_html
-                        and (self.max_depth is None or depth + 1 <= self.max_depth)
-                    ):
-                        queue.appendleft((final_url, depth))  # same depth — not a new hop
-                    # Mark old URL as redirect in registry; purge any stale ES chunks.
-                    # Keep the registry entry (with redirect_to) so future crawls
-                    # recognise this as a known redirect without re-purging.
-                    reg_entry = registry.get(url, {})
-                    if reg_entry.get("last_ingested"):
-                        # Has previously ingested chunks — purge from ES but keep
-                        # registry entry (unlike deleted_urls which removes it).
-                        redirected_urls.add(url)
-                        logger.info(
-                            "Deprecated redirect URL %s — scheduling ES chunk purge", url
-                        )
-                    # Store redirect record; strip last_ingested so the finally
-                    # block does not attempt a second purge on the next crawl.
-                    registry[url] = {
-                        "redirect_to": final_url,
-                        "last_seen": now_iso,
-                        "status_code": resp_meta.get("status_code", 301),
-                    }
-                    continue  # do not ingest content under the old URL
-
-                # Publish live progress every 5 pages for frontend polling.
-                if self.task_id and pages_crawled % 5 == 0:
-                    _CRAWL_PROGRESS[self.task_id] = {
-                        "task_type": "crawl",
-                        "start_url": self.start_url,
-                        "collection_name": self.collection_name,
-                        "pages_crawled": pages_crawled,
-                        "pages_queued": len(queue) + len(in_flight),
-                        "pages_skipped": pages_skipped,
-                        "files_dispatched": total_files_dispatched,
-                    }
-
-                # ── Delta check for HTML: compare content hash ───────────────
-                new_hash = resp_meta.get("content_hash", "")
-                reg_entry = registry.get(url, {})
-                stored_hash = reg_entry.get("content_hash", "")
-
-                if not self.force_recrawl and stored_hash and stored_hash == new_hash:
-                    pages_skipped += 1
-                    logger.info(
-                        "Skipping unchanged page %d/%s: %s  [hash match, skipped=%d]",
-                        pages_crawled, max_pages_display, url, pages_skipped,
-                    )
-                    # Update last_seen but do NOT update last_ingested
-                    registry[url] = {**reg_entry, "last_seen": now_iso}
-                else:
-                    # Track changed (not new) URLs so stale ES chunks can be deleted
-                    # before the new chunks are written (upsert semantics).
-                    is_changed = bool(reg_entry.get("last_ingested") and stored_hash and stored_hash != new_hash)
-                    if is_changed:
-                        changed_urls.add(url)
-                    # New or changed — extract semantic elements, chunk, queue for ingest.
-                    # Precedence (low → high):
-                    #   URL-derived product tags → caller extra_metadata → crawler-auto fields.
-                    base_meta = {
-                        **self._resolve_product_metadata(url),
-                        **self.extra_metadata,
-                        "source_uri": url,
-                        "filename": url.rstrip("/").rsplit("/", 1)[-1] or self._netloc,
-                        "page_title": page_title,
-                        "crawl_depth": depth,
-                        "section_h1": section_h1,
-                        "meta_description": meta_desc,
-                        "source_system": "web_crawl",
-                    }
-                    html_elements = self._html_to_elements(html_content)
-                    if html_elements:
-                        from nvidia_rag.tools.parse_document import (  # noqa: PLC0415
-                            DocumentClassifierRouter,
-                        )
-                        chunk_pairs = DocumentClassifierRouter._split_by_semantic_elements(
-                            html_elements, self._html_chunk_max_tokens, chunk_overlap=150,
-                        )
-                        for chunk_text, section_path in chunk_pairs:
-                            if not chunk_text.strip():
+                        # Collect binary file links for concurrent download below
+                        for href in linked_urls:
+                            href = href.split("#")[0]
+                            if not href:
                                 continue
-                            tmp_path = self._save_temp(chunk_text.encode("utf-8"), suffix=".md")
-                            all_temp_files.append(tmp_path)
-                            meta = {**base_meta}
-                            if section_path:
-                                meta["section_path"] = section_path
-                                # heading = most immediate parent heading — better
-                                # for exact-match pre-filtering than full breadcrumb.
-                                meta["heading"] = section_path.split(" > ")[-1].strip()
-                            pending.append((
-                                tmp_path,
-                                {"filename": os.path.basename(tmp_path), "metadata": meta},
-                            ))
-                    else:
-                        # No semantic elements extracted — try screenshot before raw HTML.
-                        # If Selenium screenshot fallback is enabled and Selenium is active,
-                        # capture a full-page JPEG so Nemotron-Parse can read visual content.
-                        screenshot_added = False
-                        if self.use_selenium and self._selenium_screenshot_fallback:
-                            ss_dir = tempfile.gettempdir()
-                            ss_path = self._capture_screenshot(url, ss_dir)
-                            if ss_path:
-                                all_temp_files.append(ss_path)
-                                pending.append((
-                                    ss_path,
-                                    {"filename": os.path.basename(ss_path), "metadata": base_meta},
-                                ))
-                                logger.info(
-                                    "Screenshot added to batch for JS-sparse page: %s", url
+                            try:
+                                abs_href = urljoin(url, href)
+                            except ValueError:
+                                logger.debug("Skipping malformed href (bracket host): %r from %s", href, url)
+                                continue
+                            if self._is_blocked_url(abs_href):
+                                continue
+                            if self.extract_linked_files and _is_binary_url(abs_href):
+                                if abs_href not in visited_files:
+                                    visited_files.add(abs_href)
+                                    file_reg = registry.get(abs_href, {})
+                                    if_none_match = file_reg.get("etag") if not self.force_recrawl else None
+                                    if_modified_since = (
+                                        file_reg.get("last_modified")
+                                        if not self.force_recrawl and not if_none_match else None
+                                    )
+                                    binary_fetch_args.append((
+                                        abs_href, depth + 1, file_reg,
+                                        if_none_match, if_modified_since, url,
+                                    ))
+                            elif (
+                                not _is_binary_url(abs_href)
+                                and _same_domain(abs_href, self._netloc)
+                                and self._is_allowed_url(abs_href)
+                                and not self._is_blocked_url(abs_href)
+                                and abs_href not in visited_html
+                                and (self.max_pages is None or pages_crawled < self.max_pages)
+                                and (self.max_depth is None or depth + 1 <= self.max_depth)
+                            ):
+                                queue.append((abs_href, depth + 1))
+
+                    # ── Concurrent binary file downloads for this page batch ─
+                    if binary_fetch_args:
+                        binary_results = await asyncio.gather(
+                            *[
+                                self._collect_binary_file(
+                                    abs_href, d, all_temp_files, errors,
+                                    referring_page_url=ref_url,
+                                    if_none_match=ifnm,
+                                    if_modified_since=ifms,
                                 )
-                                screenshot_added = True
-                        if not screenshot_added:
-                            # Final fallback: save raw HTML
-                            tmp_path = self._save_temp(html_content.encode("utf-8"), suffix=".html")
-                            all_temp_files.append(tmp_path)
-                            pending.append((
-                                tmp_path,
-                                {"filename": os.path.basename(tmp_path), "metadata": base_meta},
-                            ))
-                    # Update registry entry.  For changed URLs, omit last_ingested here —
-                    # it is cleared atomically before dispatch and restored by _harvest_done
-                    # only after the new chunks are confirmed written to ES.
-                    # For new URLs, set last_ingested optimistically (no old chunks to worry about).
-                    reg_update = {
-                        "last_seen": now_iso,
-                        "last_modified": resp_meta.get("last_modified"),
-                        "etag": resp_meta.get("etag"),
-                        "content_hash": new_hash,
-                        "status_code": resp_meta.get("status_code", 200),
-                    }
-                    if not is_changed:
-                        reg_update["last_ingested"] = now_iso
-                    registry[url] = reg_update
-                    logger.info(
-                        "Collected page %d/%s: %s  [pending=%d, in_flight=%d]",
-                        pages_crawled, max_pages_display, url, len(pending), len(in_flight),
-                    )
-
-                # Collect any linked binary files
-                for href in linked_urls:
-                    # Strip fragment (#...) before resolving — same-page anchors
-                    # produce duplicate registry entries otherwise (e.g. page#section).
-                    href = href.split("#")[0]
-                    if not href:
-                        continue
-                    try:
-                        abs_href = urljoin(url, href)
-                    except ValueError:
-                        # Python 3.13 urlsplit raises ValueError for bracketed
-                        # non-IPv6 hosts (e.g. href="/config/[server_ip]/...").
-                        # Skip these malformed template URLs.
-                        logger.debug("Skipping malformed href (bracket host): %r from %s", href, url)
-                        continue
-                    if self._is_blocked_url(abs_href):
-                        continue
-                    if self.extract_linked_files and _is_binary_url(abs_href):
-                        if abs_href not in visited_files:
-                            visited_files.add(abs_href)
-
-                            # Build conditional-GET headers from registry
-                            file_reg = registry.get(abs_href, {})
-                            if_none_match = (
-                                file_reg.get("etag")
-                                if not self.force_recrawl else None
-                            )
-                            if_modified_since = (
-                                file_reg.get("last_modified")
-                                if not self.force_recrawl and not if_none_match else None
-                            )
-
-                            entry, file_meta = self._collect_binary_file(
-                                abs_href, depth + 1, all_temp_files, errors,
-                                referring_page_url=url,
-                                if_none_match=if_none_match,
-                                if_modified_since=if_modified_since,
-                            )
+                                for abs_href, d, file_reg, ifnm, ifms, ref_url in binary_fetch_args
+                            ],
+                            return_exceptions=True,
+                        )
+                        for (abs_href, d, file_reg, ifnm, ifms, ref_url), br in zip(binary_fetch_args, binary_results):
+                            if isinstance(br, Exception):
+                                logger.warning("Binary fetch exception for %s: %r", abs_href, br)
+                                continue
+                            entry, file_meta = br
                             if entry is _UNCHANGED:
                                 files_skipped += 1
-                                # Refresh last_seen
                                 registry[abs_href] = {**file_reg, "last_seen": now_iso}
                             elif entry is None:
-                                # Fetch failed — check for 404/410 on a previously-ingested file
                                 if file_meta.get("status_code") in (404, 410) and file_reg.get("last_ingested"):
                                     deleted_urls.add(abs_href)
                                     logger.info(
@@ -1005,31 +1114,33 @@ class SimpleWebCrawler:
                                         file_meta["status_code"], abs_href,
                                     )
                             elif entry is _MANIFEST:
-                                # NFS-persisted document file — recorded in binary manifest,
-                                # will be batch-ingested in Phase 2 after HTML drain.
                                 file_is_changed = bool(
-                                    file_reg.get("last_ingested")
-                                    and file_reg.get("content_hash")
-                                    and file_meta.get("content_hash")
-                                    and file_reg["content_hash"] != file_meta["content_hash"]
+                                    file_reg.get("last_ingested") and (
+                                        self.force_recrawl or (
+                                            file_reg.get("content_hash")
+                                            and file_meta.get("content_hash")
+                                            and file_reg["content_hash"] != file_meta["content_hash"]
+                                        )
+                                    )
                                 )
                                 if file_is_changed:
                                     changed_urls.add(abs_href)
-                                file_reg_update = {
+                                registry[abs_href] = {
                                     "last_seen": now_iso,
                                     "last_modified": file_meta.get("last_modified"),
                                     "etag": file_meta.get("etag"),
                                     "content_hash": file_meta.get("content_hash"),
                                     "status_code": file_meta.get("status_code", 200),
                                 }
-                                registry[abs_href] = file_reg_update
                             else:
-                                # Inline binary file (images, audio, text) — add to pending batch.
                                 file_is_changed = bool(
-                                    file_reg.get("last_ingested")
-                                    and file_reg.get("content_hash")
-                                    and file_meta.get("content_hash")
-                                    and file_reg["content_hash"] != file_meta["content_hash"]
+                                    file_reg.get("last_ingested") and (
+                                        self.force_recrawl or (
+                                            file_reg.get("content_hash")
+                                            and file_meta.get("content_hash")
+                                            and file_reg["content_hash"] != file_meta["content_hash"]
+                                        )
+                                    )
                                 )
                                 if file_is_changed:
                                     changed_urls.add(abs_href)
@@ -1044,175 +1155,167 @@ class SimpleWebCrawler:
                                 if not file_is_changed:
                                     file_reg_update["last_ingested"] = now_iso
                                 registry[abs_href] = file_reg_update
-                    elif (
-                        not _is_binary_url(abs_href)
-                        and _same_domain(abs_href, self._netloc)
-                        and self._is_allowed_url(abs_href)
-                        and not self._is_blocked_url(abs_href)
-                        and abs_href not in visited_html
-                        and (self.max_pages is None or pages_crawled < self.max_pages)
-                        and (self.max_depth is None or depth + 1 <= self.max_depth)
-                    ):
-                        queue.append((abs_href, depth + 1))
 
-                # Dispatch a batch when threshold is reached
-                if len(pending) >= self.batch_ingest_size:
-                    _dispatch_batch(pending)
-                    pending = []
+                    # ── Dispatch batch if threshold reached ─────────────────
+                    if len(pending) >= self.batch_ingest_size:
+                        await _dispatch_batch_async(pending)
+                        pending = []
 
+                # ── Phase 2: flush remainder, drain all in-flight tasks ──────
+                await _dispatch_batch_async(pending)
+                pending = []
 
-            # ── Phase 2: flush remainder, then drain all in-flight batches ───
-            _dispatch_batch(pending)
-            pending = []
+                if not in_flight and total_files_dispatched == 0:
+                    return {
+                        "message": "Crawl complete: no content collected.",
+                        "pages_crawled": pages_crawled,
+                        "pages_skipped": pages_skipped,
+                        "files_skipped": files_skipped,
+                        "files_ingested": 0,
+                        "errors": errors,
+                        "error_matrix": {
+                            "broken_links": [],
+                            "missing_files": [],
+                            "ingest_failures": [],
+                            "batch_errors": [],
+                        },
+                    }
 
-            if not in_flight and total_files_dispatched == 0:
-                return {
-                    "message": "Crawl complete: no content collected.",
-                    "pages_crawled": pages_crawled,
-                    "pages_skipped": pages_skipped,
-                    "files_skipped": files_skipped,
-                    "files_ingested": 0,
-                    "errors": errors,
-                    "error_matrix": {
-                        "broken_links": [],
-                        "missing_files": [],
-                        "ingest_failures": [],
-                        "batch_errors": [],
-                    },
-                }
-
-            logger.info(
-                "Crawl BFS complete (%d pages, %d skipped-unchanged).  "
-                "Draining %d remaining in-flight batch(es)...",
-                pages_crawled, pages_skipped, len(in_flight),
-            )
-
-            # Poll until all HTML in-flight futures complete.
-            # Bound the wait so a permanently-stuck future cannot block forever;
-            # each future has its own internal 600 s nv-ingest timeout, so
-            # drain_timeout gives a generous outer guard on top of that.
-            drain_deadline = time.monotonic() + max(self.max_concurrent_batches * 700, 2100)
-            while in_flight:
-                if time.monotonic() > drain_deadline:
-                    logger.warning(
-                        "Drain deadline exceeded — %d in-flight batch(es) forcibly abandoned",
-                        len(in_flight),
-                    )
-                    for f, bnum, *_ in in_flight:
-                        f.cancel()
-                    in_flight.clear()
-                    break
-                time.sleep(2)
-                _harvest_done()
-
-            # ── Phase 3: batch-ingest NFS-persisted binary documents ─────────
-            # All HTML batches are now drained.  Read the binary manifest and
-            # ingest any rows whose content_hash changed since last ingest.
-            if self.skip_phase3 or (cancel_event and cancel_event.is_set()):
                 logger.info(
-                    "Phase 3 binary ingest skipped (%s).",
-                    "skip_phase3=True" if self.skip_phase3 else "cancel requested",
+                    "Crawl BFS complete (%d pages, %d skipped-unchanged).  "
+                    "Draining %d remaining in-flight task(s)...",
+                    pages_crawled, pages_skipped, len(in_flight),
                 )
-                binary_manifest = []
-                binary_files_ingested = 0
-                binary_files_skipped = 0
-            else:
-                binary_manifest = self._load_binary_manifest()
-                binary_files_ingested = 0
-                binary_files_skipped = 0
-            if binary_manifest:
-                pending_binary = [
-                    row for row in binary_manifest
-                    if (
-                        # Already on NFS: file exists and hash changed since last ingest
-                        (row.get("local_path") and os.path.exists(row["local_path"])
-                         and row.get("content_hash") != row.get("last_ingested_hash", ""))
-                        # Deferred inline: URL recorded during BFS, not yet successfully ingested
-                        or (not row.get("local_path") and row.get("source_uri")
-                            and row.get("media_type") == "inline"
-                            and not row.get("last_ingested_hash"))
-                    )
-                ]
-                logger.info(
-                    "Phase 3 binary ingest: %d/%d manifest rows need ingest",
-                    len(pending_binary), len(binary_manifest),
-                )
-                binary_files_skipped = len(binary_manifest) - len(pending_binary)
 
-                # Download deferred inline binaries (local_path empty) before ingest.
-                deferred_rows = [r for r in pending_binary if not r.get("local_path")]
-                deferred_temp_files: list[str] = []
-                if deferred_rows:
-                    logger.info(
-                        "Phase 3: downloading %d deferred inline binary file(s)", len(deferred_rows)
+                if in_flight:
+                    drain_deadline = asyncio.get_event_loop().time() + max(
+                        self.max_concurrent_batches * 700, 2100
                     )
-                    for row in deferred_rows:
-                        dl_url = row["source_uri"]
-                        dl_suffix = Path(urlparse(dl_url).path).suffix or ".bin"
-                        try:
-                            dl_resp = self._session.get(
-                                dl_url, stream=True, timeout=self.request_timeout
-                            )
-                            dl_resp.raise_for_status()
-                            if dl_suffix.lower() == ".xml":
-                                xml_bytes = b"".join(dl_resp.iter_content(65536))
-                                markdown_text = xml_to_markdown(xml_bytes)
-                                if not markdown_text.strip():
-                                    logger.warning(
-                                        "Phase 3: XML produced no content for %s — skipping", dl_url
-                                    )
-                                    continue
-                                tmp_path = self._save_temp(markdown_text.encode("utf-8"), suffix=".md")
-                            else:
-                                tmp_path = self._save_temp_stream(dl_resp, suffix=dl_suffix)
-                            deferred_temp_files.append(tmp_path)
-                            with open(tmp_path, "rb") as fh:
-                                content_hash = _sha256(fh.read())
-                            row["local_path"] = tmp_path
-                            row["content_hash"] = content_hash
-                            row["downloaded_at"] = datetime.now(UTC).isoformat()
-                            logger.debug("Phase 3: downloaded %s → %s", dl_url, tmp_path)
-                        except Exception as exc:
+                    while in_flight:
+                        if asyncio.get_event_loop().time() > drain_deadline:
                             logger.warning(
-                                "Phase 3: failed to download deferred binary %s: %r", dl_url, exc
+                                "Drain deadline exceeded — %d in-flight task(s) forcibly cancelled",
+                                len(in_flight),
                             )
-                            # local_path stays empty → retried on next crawl
+                            for task, *_ in in_flight:
+                                task.cancel()
+                            in_flight.clear()
+                            break
+                        done_tasks = [t for t, *_ in in_flight if t.done()]
+                        if done_tasks:
+                            _harvest_done()
+                        else:
+                            await asyncio.sleep(2)
+                            _harvest_done()
 
-                # Group by media type and file type for appropriate ingest flags.
-                # Only process document and inline media_type rows here; audio/video are
-                # pending for manual trigger via POST /ingest-media.
-                pending_docs = [
-                    r for r in pending_binary
-                    if r.get("media_type", "document") in ("document", "inline")
-                    and r.get("local_path")
-                ]
-                pdf_rows = [r for r in pending_docs if r["local_path"].lower().endswith(".pdf")]
-                other_rows = [r for r in pending_docs if not r["local_path"].lower().endswith(".pdf")]
+                # ── Phase 3: batch-ingest NFS-persisted binary documents ─────
+                if self.skip_phase3 or cancel_event.is_set():
+                    logger.info(
+                        "Phase 3 binary ingest skipped (%s).",
+                        "skip_phase3=True" if self.skip_phase3 else "cancel requested",
+                    )
+                    binary_manifest = []
+                    binary_files_ingested = 0
+                    binary_files_skipped = 0
+                else:
+                    binary_manifest = self._live_manifest
+                    binary_files_ingested = 0
+                    binary_files_skipped = 0
 
-                def _ingest_binary_batch(rows: list[dict], use_parse: bool, force_parse: bool) -> int:
-                    """Submit one batch of binary rows; return count successfully ingested."""
-                    if not rows:
-                        return 0
-                    filepaths = [r["local_path"] for r in rows]
-                    custom_metadata = [
-                        {
-                            "filename": os.path.basename(r["local_path"]),
-                            "metadata": {
-                                **self._resolve_product_metadata(r.get("referring_page_url") or r["source_uri"]),
-                                **self.extra_metadata,
-                                "source_uri": r["source_uri"],
-                                "filename": r["filename"],
-                                "referring_page_url": r.get("referring_page_url", ""),
-                                "crawl_depth": int(r.get("crawl_depth", 0)),
-                                "document_type": Path(r["filename"]).suffix.lstrip(".").lower(),
-                                "source_system": "web_crawl",
-                            },
-                        }
-                        for r in rows
+                if binary_manifest:
+                    pending_binary = [
+                        row for row in binary_manifest
+                        if (
+                            (row.get("local_path") and os.path.exists(row["local_path"])
+                             and row.get("content_hash") != row.get("last_ingested_hash", ""))
+                            or (not row.get("local_path") and row.get("source_uri")
+                                and row.get("media_type") == "inline"
+                                and not row.get("last_ingested_hash"))
+                        )
                     ]
-                    try:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            ingestor.upload_documents(
+                    logger.info(
+                        "Phase 3 binary ingest: %d/%d manifest rows need ingest",
+                        len(pending_binary), len(binary_manifest),
+                    )
+                    binary_files_skipped = len(binary_manifest) - len(pending_binary)
+
+                    # Download deferred inline binaries concurrently
+                    deferred_rows = [r for r in pending_binary if not r.get("local_path")]
+                    deferred_temp_files: list[str] = []
+                    if deferred_rows:
+                        logger.info(
+                            "Phase 3: downloading %d deferred inline binary file(s) concurrently",
+                            len(deferred_rows),
+                        )
+
+                        async def _download_deferred(row: dict) -> None:
+                            dl_url = row["source_uri"]
+                            dl_suffix = Path(urlparse(dl_url).path).suffix or ".bin"
+                            try:
+                                async with session.get(dl_url) as dl_resp:
+                                    dl_resp.raise_for_status()
+                                    if dl_suffix.lower() == ".xml":
+                                        xml_bytes = await dl_resp.read()
+                                        markdown_text = xml_to_markdown(xml_bytes)
+                                        if not markdown_text.strip():
+                                            logger.warning(
+                                                "Phase 3: XML produced no content for %s — skipping", dl_url
+                                            )
+                                            return
+                                        tmp_path = self._save_temp(markdown_text.encode("utf-8"), suffix=".md")
+                                    else:
+                                        tmp_path = await self._save_temp_stream_async(dl_resp, suffix=dl_suffix)
+                                    deferred_temp_files.append(tmp_path)
+                                    with open(tmp_path, "rb") as fh:
+                                        content_hash = _sha256(fh.read())
+                                    row["local_path"] = tmp_path
+                                    row["content_hash"] = content_hash
+                                    row["downloaded_at"] = datetime.now(UTC).isoformat()
+                                    logger.debug("Phase 3: downloaded %s → %s", dl_url, tmp_path)
+                            except Exception as exc:
+                                logger.warning("Phase 3: failed to download deferred binary %s: %r", dl_url, exc)
+                                errors.append({
+                                    "url": dl_url,
+                                    "error_type": "missing_file",
+                                    "status_code": getattr(exc, "status", None),
+                                    "message": str(exc),
+                                })
+
+                        await asyncio.gather(
+                            *[_download_deferred(row) for row in deferred_rows],
+                            return_exceptions=True,
+                        )
+
+                    pending_docs = [
+                        r for r in pending_binary
+                        if r.get("media_type", "document") in ("document", "inline")
+                        and r.get("local_path")
+                    ]
+                    pdf_rows = [r for r in pending_docs if r["local_path"].lower().endswith(".pdf")]
+                    other_rows = [r for r in pending_docs if not r["local_path"].lower().endswith(".pdf")]
+
+                    async def _ingest_binary_batch_async(rows: list[dict], use_parse: bool, force_parse: bool) -> int:
+                        if not rows:
+                            return 0
+                        filepaths = [r["local_path"] for r in rows]
+                        custom_metadata = [
+                            {
+                                "filename": os.path.basename(r["local_path"]),
+                                "metadata": {
+                                    **self._resolve_product_metadata(r.get("referring_page_url") or r["source_uri"]),
+                                    **self.extra_metadata,
+                                    "source_uri": r["source_uri"],
+                                    "filename": r["filename"],
+                                    "referring_page_url": r.get("referring_page_url", ""),
+                                    "crawl_depth": int(r.get("crawl_depth", 0)),
+                                    "document_type": Path(r["filename"]).suffix.lstrip(".").lower(),
+                                    "source_system": "web_crawl",
+                                },
+                            }
+                            for r in rows
+                        ]
+                        try:
+                            result = await ingestor.upload_documents(
                                 filepaths=filepaths,
                                 collection_name=collection_name,
                                 vdb_auth_token=vdb_auth_token,
@@ -1222,132 +1325,102 @@ class SimpleWebCrawler:
                                 force_nemoretriever_parse=force_parse,
                                 source_system="web_crawl",
                                 is_final_batch=False,
-                            ),
-                            loop,
+                            )
+                            failed = {
+                                fd.get("document_name", "")
+                                for fd in (result or {}).get("failed_documents", [])
+                            } if isinstance(result, dict) else set()
+                            for r in rows:
+                                if os.path.basename(r["local_path"]) not in failed:
+                                    r["last_ingested_hash"] = r["content_hash"]
+                            return len(rows) - len(failed)
+                        except Exception as exc:
+                            logger.error("Phase 3 binary ingest batch failed: %r", exc)
+                            return 0
+
+                    for i in range(0, len(pdf_rows), self.binary_batch_size):
+                        batch = pdf_rows[i : i + self.binary_batch_size]
+                        binary_files_ingested += await _ingest_binary_batch_async(
+                            batch, use_parse=self.use_nemoretriever_parse, force_parse=self.force_nemoretriever_parse,
                         )
-                        result = fut.result(timeout=600)
-                        failed = {
-                            fd.get("document_name", "")
-                            for fd in (result or {}).get("failed_documents", [])
-                        } if isinstance(result, dict) else set()
-                        # Mark successfully ingested rows
-                        for r in rows:
-                            if os.path.basename(r["local_path"]) not in failed:
-                                r["last_ingested_hash"] = r["content_hash"]
-                        return len(rows) - len(failed)
-                    except Exception as exc:
-                        logger.error("Phase 3 binary ingest batch failed: %r", exc)
-                        return 0
+                    for i in range(0, len(other_rows), self.binary_batch_size):
+                        batch = other_rows[i : i + self.binary_batch_size]
+                        binary_files_ingested += await _ingest_binary_batch_async(
+                            batch, use_parse=False, force_parse=False,
+                        )
 
-                # Process in batch_ingest_size chunks
-                for i in range(0, len(pdf_rows), self.batch_ingest_size):
-                    batch = pdf_rows[i : i + self.batch_ingest_size]
-                    binary_files_ingested += _ingest_binary_batch(
-                        batch,
-                        use_parse=self.use_nemoretriever_parse,
-                        force_parse=self.force_nemoretriever_parse,
-                    )
-                for i in range(0, len(other_rows), self.batch_ingest_size):
-                    batch = other_rows[i : i + self.batch_ingest_size]
-                    binary_files_ingested += _ingest_binary_batch(
-                        batch, use_parse=False, force_parse=False,
+                    # Clean up deferred temp files
+                    successfully_ingested_paths = {
+                        r["local_path"] for r in deferred_rows
+                        if r.get("local_path") and r.get("last_ingested_hash") == r.get("content_hash")
+                    }
+                    for tp in deferred_temp_files:
+                        try:
+                            os.unlink(tp)
+                        except OSError:
+                            pass
+                    for row in deferred_rows:
+                        if row.get("local_path") in deferred_temp_files:
+                            row["local_path"] = ""
+
+                    self._save_binary_manifest(binary_manifest)
+                    logger.info(
+                        "Phase 3 complete: %d binary files ingested, %d skipped (unchanged)",
+                        binary_files_ingested, binary_files_skipped,
                     )
 
-                # Clean up deferred temp files and reset local_path so rows
-                # that failed ingest are retried on the next crawl.
-                successfully_ingested_paths = {
-                    r["local_path"] for r in deferred_rows
-                    if r.get("local_path") and r.get("last_ingested_hash") == r.get("content_hash")
-                }
-                for tp in deferred_temp_files:
+            finally:
+                self._session = None
+                self._selenium_lock = None
+                self._manifest_lock = None
+
+                for tp in all_temp_files:
                     try:
                         os.unlink(tp)
                     except OSError:
                         pass
-                for row in deferred_rows:
-                    if row.get("local_path") in deferred_temp_files:
-                        if row["local_path"] not in successfully_ingested_paths:
-                            row["local_path"] = ""  # retry next crawl
-                        else:
-                            row["local_path"] = ""  # always clear — ephemeral temp path
 
-                self._save_binary_manifest(binary_manifest)
-                logger.info(
-                    "Phase 3 complete: %d binary files ingested, %d skipped (unchanged)",
-                    binary_files_ingested, binary_files_skipped,
-                )
+                if self._selenium_driver is not None:
+                    try:
+                        self._selenium_driver.quit()
+                    except Exception:
+                        pass
+                    self._selenium_driver = None
 
-        finally:
-            for tp in all_temp_files:
-                try:
-                    os.unlink(tp)
-                except OSError:
-                    pass
-
-            # Quit the shared Selenium driver if one was created.
-            if self._selenium_driver is not None:
-                try:
-                    self._selenium_driver.quit()
-                except Exception:
-                    pass
-                self._selenium_driver = None
-
-            # Purge ES chunks for redirected URLs (content moved to new URL).
-            # Registry entries are preserved with redirect_to — not removed.
-            if redirected_urls:
-                logger.info(
-                    "Purging ES chunks for %d redirected URL(s)...", len(redirected_urls)
-                )
-                try:
-                    redir_purge = asyncio.run_coroutine_threadsafe(
-                        ingestor.purge_deleted_urls(
+                if redirected_urls:
+                    logger.info("Purging ES chunks for %d redirected URL(s)...", len(redirected_urls))
+                    try:
+                        await ingestor.purge_deleted_urls(
                             collection_name=collection_name,
                             source_uris=list(redirected_urls),
                             vdb_auth_token=vdb_auth_token,
-                        ),
-                        loop,
-                    )
-                    redir_purge.result(timeout=120)
-                except Exception as exc:
-                    logger.warning("ES purge of redirected URLs failed: %s", exc)
+                        )
+                    except Exception as exc:
+                        logger.warning("ES purge of redirected URLs failed: %s", exc)
 
-            # Purge ES chunks + registry entries for URLs that returned 404/410.
-            if deleted_urls:
-                logger.info(
-                    "Purging %d deleted URL(s) from ES and registry...", len(deleted_urls)
-                )
-                try:
-                    purge_future = asyncio.run_coroutine_threadsafe(
-                        ingestor.purge_deleted_urls(
+                if deleted_urls:
+                    logger.info("Purging %d deleted URL(s) from ES and registry...", len(deleted_urls))
+                    try:
+                        await ingestor.purge_deleted_urls(
                             collection_name=collection_name,
                             source_uris=list(deleted_urls),
                             vdb_auth_token=vdb_auth_token,
-                        ),
-                        loop,
-                    )
-                    purge_future.result(timeout=120)
-                except Exception as exc:
-                    logger.warning("ES purge of deleted URLs failed: %s", exc)
-                # Remove deleted URLs from registry regardless of ES purge outcome.
-                for uri in deleted_urls:
-                    registry.pop(uri, None)
-                logger.info(
-                    "Removed %d deleted URL(s) from registry", len(deleted_urls)
-                )
+                        )
+                    except Exception as exc:
+                        logger.warning("ES purge of deleted URLs failed: %s", exc)
+                    for uri in deleted_urls:
+                        registry.pop(uri, None)
+                    logger.info("Removed %d deleted URL(s) from registry", len(deleted_urls))
 
-            # Always persist the updated registry + error CSV + binary manifest
-            # and export artifacts — even on interrupt/SIGTERM.
-            self._save_registry(registry)
-            self._flush_errors_to_csv(errors, error_matrix)
-            self._export_crawl_artifacts()
+                self._save_registry(registry, force=True)
+                self._flush_errors_to_csv(errors, error_matrix)
+                self._export_crawl_artifacts()
 
-            # Restore inference GPU layout in a background thread (non-blocking).
-            disable_crawl_mode()
+                await asyncio.to_thread(disable_crawl_mode)
 
         inline_binary_files = total_files_dispatched - (pages_crawled - pages_skipped)
         total_binary_ingested = inline_binary_files + binary_files_ingested
 
-        # Remove live progress entry — task is now FINISHED/FAILED.
         _CRAWL_PROGRESS.pop(self.task_id, None)
 
         return {
@@ -1555,14 +1628,23 @@ class SimpleWebCrawler:
             logger.warning("Could not load URL registry from %s: %s — starting fresh", path, exc)
         return {}
 
-    def _save_registry(self, registry: dict[str, dict]) -> None:
-        """Atomically write the URL registry to disk."""
+    def _save_registry(self, registry: dict[str, dict], *, force: bool = False) -> None:
+        """Atomically write the URL registry to disk.
+
+        Writes are throttled to at most once every 60 seconds unless *force* is
+        True (used for end-of-crawl flush).  Compact JSON (no indent) is used
+        to minimise file size and serialisation time.
+        """
+        now = time.monotonic()
+        if not force and (now - self._registry_last_saved) < 60.0:
+            return
+        self._registry_last_saved = now
         path = self._registry_path()
         tmp_path = path + ".tmp"
         try:
             os.makedirs(self.registry_dir, exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(registry, fh, indent=2)
+                json.dump(registry, fh, separators=(",", ":"))
             os.replace(tmp_path, path)
             logger.info("URL registry saved to %s (%d entries)", path, len(registry))
         except Exception as exc:
@@ -1572,19 +1654,18 @@ class SimpleWebCrawler:
             except OSError:
                 pass
 
-    def _fetch_html(
-        self, url: str
+    async def _fetch_html(
+        self, url: str, reg_entry: dict | None = None
     ) -> tuple[str | None, str, str, str, list[str], dict | None, dict]:
         """
+        Async version of _fetch_html using aiohttp.
+
         Fetch *url*, parse it, and return
         ``(html_text, title, meta_desc, h1, hrefs, fetch_error, response_meta)``.
 
-        ``fetch_error`` is ``None`` on success, or a dict with keys
-        ``error_type``, ``status_code``, and ``error`` on failure.
-        Returns ``(None, ..., None, {})`` for non-HTML content (silently skipped).
-
-        ``response_meta`` contains ``last_modified``, ``etag``,
-        ``content_hash`` (SHA-256 of body), and ``status_code``.
+        When *reg_entry* is provided, sends ``If-None-Match`` / ``If-Modified-Since``
+        conditional headers.  A ``304 Not Modified`` response returns the
+        ``_FETCH_304`` sentinel immediately without downloading the body.
         """
         empty_meta: dict = {}
         try:
@@ -1596,31 +1677,55 @@ class SimpleWebCrawler:
                 "error": "beautifulsoup4 not installed",
             }, empty_meta
 
+        session = self._session
+        if session is None:
+            return None, "", "", "", [], {
+                "error_type": "broken_link", "status_code": None,
+                "error": "aiohttp session not initialised",
+            }, empty_meta
+
+        # Build conditional request headers from registry entry
+        req_headers: dict[str, str] = {}
+        if reg_entry and not self.force_recrawl:
+            if reg_entry.get("etag"):
+                req_headers["If-None-Match"] = reg_entry["etag"]
+            elif reg_entry.get("last_modified"):
+                req_headers["If-Modified-Since"] = reg_entry["last_modified"]
+
         try:
-            resp = self._session.get(url, timeout=self.request_timeout)
-            resp.raise_for_status()
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" not in content_type and "text/plain" not in content_type:
-                logger.debug("Skipping non-HTML URL %s (Content-Type: %s)", url, content_type)
-                return None, "", "", "", [], None, empty_meta  # silently skip
-            html_text = resp.text
-            resp_meta: dict = {
-                "last_modified": resp.headers.get("Last-Modified"),
-                "etag": resp.headers.get("ETag"),
-                "content_hash": _sha256(html_text.encode("utf-8")),
-                "status_code": resp.status_code,
-            }
-            # Detect redirects: requests follows them silently; record the
-            # final URL so the caller can queue it and avoid attributing
-            # content to the deprecated source URL.
-            final_url = resp.url
-            if final_url and final_url.rstrip("/") != url.rstrip("/"):
-                resp_meta["final_url"] = final_url
-        except requests.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
+            async with session.get(url, allow_redirects=True, headers=req_headers) as resp:
+                # 304 Not Modified — skip body download entirely
+                if resp.status == 304:
+                    return self._FETCH_304  # type: ignore[return-value]
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/html" not in content_type and "text/plain" not in content_type:
+                    logger.debug("Skipping non-HTML URL %s (Content-Type: %s)", url, content_type)
+                    return None, "", "", "", [], None, empty_meta
+                html_text = await resp.text()
+                new_hash = _sha256(html_text.encode("utf-8"))
+                resp_meta: dict = {
+                    "last_modified": resp.headers.get("Last-Modified"),
+                    "etag": resp.headers.get("ETag"),
+                    "content_hash": new_hash,
+                    "status_code": resp.status,
+                }
+                # Detect redirects: aiohttp follows them silently; record final URL.
+                final_url = str(resp.url)
+                if final_url and final_url.rstrip("/") != url.rstrip("/"):
+                    resp_meta["final_url"] = final_url
+                # Early-exit: hash unchanged and we have cached hrefs → skip BS4 parse
+                if (
+                    not self.force_recrawl
+                    and reg_entry
+                    and reg_entry.get("content_hash") == new_hash
+                    and reg_entry.get("linked_hrefs") is not None
+                ):
+                    return _FetchUnchanged(hrefs=reg_entry["linked_hrefs"])  # type: ignore[return-value]
+        except aiohttp.ClientResponseError as exc:
             logger.warning("HTTP error fetching %s: %s", url, exc)
             return None, "", "", "", [], {
-                "error_type": "broken_link", "status_code": status_code,
+                "error_type": "broken_link", "status_code": exc.status,
                 "error": str(exc),
             }, empty_meta
         except Exception as exc:
@@ -1630,12 +1735,11 @@ class SimpleWebCrawler:
                 "error": str(exc),
             }, empty_meta
 
-        # ── Selenium JS-rendering fallback ───────────────────────────────────
-        # If the static HTML is sparse (JS-rendered SPA) and Selenium is
-        # enabled, re-fetch with headless Chromium so BS4 sees rendered content.
+        # ── Selenium JS-rendering fallback ──────────────────────────────────
         if self.use_selenium and self._is_js_sparse(html_text):
             logger.info("Static HTML sparse — retrying with Selenium: %s", url)
-            rendered_html = self._render_with_selenium(url)
+            async with self._selenium_lock:
+                rendered_html = await asyncio.to_thread(self._render_with_selenium, url)
             if rendered_html:
                 html_text = rendered_html
                 resp_meta["content_hash"] = _sha256(html_text.encode("utf-8"))
@@ -1810,7 +1914,7 @@ class SimpleWebCrawler:
             logger.warning("Failed to convert screenshot to JPEG for %s: %s", url, exc)
             return None
 
-    def _collect_binary_file(
+    async def _collect_binary_file(
         self,
         url: str,
         depth: int,
@@ -1821,193 +1925,176 @@ class SimpleWebCrawler:
         if_modified_since: str | None = None,
     ) -> tuple[tuple[str, dict] | tuple | None, dict]:
         """
-        Download *url* to a temp file and return ``(entry, response_meta)``.
+        Async version of _collect_binary_file using aiohttp.
 
-        ``entry`` is one of:
-        * ``(tmp_path, metadata_dict)`` — new or changed file, add to batch.
-        * ``_UNCHANGED`` (empty tuple sentinel) — server returned 304, skip.
-        * ``_MANIFEST`` — NFS-persisted document (PDF/Office); row appended to
-          binary manifest for Phase 3 batch ingest.  No temp file added.
-        * ``None`` — download or pre-processing failed, error logged.
-
-        ``response_meta`` carries ``last_modified``, ``etag``,
-        ``content_hash``, and ``status_code`` for registry updates.
-        XML files are pre-processed to Markdown before collection.
+        Download *url* and return ``(entry, response_meta)``.
+        Uses self._live_manifest (in-memory) protected by self._manifest_lock.
         """
         suffix = Path(urlparse(url).path).suffix or ".bin"
         empty_meta: dict = {}
 
-        # Build conditional-GET headers
-        headers: dict[str, str] = {}
+        req_headers: dict[str, str] = {}
         if if_none_match:
-            headers["If-None-Match"] = if_none_match
+            req_headers["If-None-Match"] = if_none_match
         elif if_modified_since:
-            headers["If-Modified-Since"] = if_modified_since
+            req_headers["If-Modified-Since"] = if_modified_since
+
+        session = self._session
+        if session is None:
+            return None, empty_meta
 
         try:
-            resp = self._session.get(
-                url, stream=True, timeout=self.request_timeout, headers=headers
-            )
-            if resp.status_code == 304:
-                logger.debug("304 Not Modified (unchanged): %s", url)
-                return _UNCHANGED, empty_meta
-            resp.raise_for_status()
+            async with session.get(url, headers=req_headers) as resp:
+                if resp.status == 304:
+                    logger.debug("304 Not Modified (unchanged): %s", url)
+                    return _UNCHANGED, empty_meta
+                resp.raise_for_status()
 
-            suffix_lower = suffix.lower()
-            is_nfs_document = suffix_lower in _NFS_DOCUMENT_EXTENSIONS
-            is_pdf = suffix_lower == ".pdf"
-            is_nfs_media = suffix_lower in _NFS_MEDIA_EXTENSIONS
+                suffix_lower = suffix.lower()
+                is_nfs_document = suffix_lower in _NFS_DOCUMENT_EXTENSIONS
+                is_pdf = suffix_lower == ".pdf"
+                is_nfs_media = suffix_lower in _NFS_MEDIA_EXTENSIONS
 
-            # ── media file size cap ──────────────────────────────────────────
-            if is_nfs_media:
-                content_length = int(resp.headers.get("Content-Length", 0))
-                max_bytes = self.max_media_file_mb * 1024 * 1024
-                if content_length > 0 and content_length > max_bytes:
-                    size_mb = content_length // (1024 * 1024)
-                    logger.warning(
-                        "Media file too large (%d MB > %d MB limit), skipping: %s",
-                        size_mb, self.max_media_file_mb, url,
-                    )
-                    errors.append({
-                        "url": url,
-                        "error_type": "missing_file",
-                        "status_code": resp.status_code,
-                        "error": f"file size {size_mb} MB exceeds limit {self.max_media_file_mb} MB",
-                    })
-                    return None, {"status_code": resp.status_code}
-
-            if is_nfs_document:
-                # Route to typed NFS persistent repo so files survive pod restarts.
-                if is_pdf and self.pdf_repo_dir:
-                    dest_dir = Path(self.pdf_repo_dir) / self.collection_name
-                    manifest_media_type = "document"
-                elif not is_pdf and self.docs_repo_dir:
-                    dest_dir = Path(self.docs_repo_dir) / self.collection_name
-                    manifest_media_type = "document"
-                else:
-                    # NFS not configured — fall through to temp-file path below.
-                    is_nfs_document = False
-                    dest_dir = None  # silence linter
-                    manifest_media_type = ""
-            elif is_nfs_media:
-                # Route audio/video to typed NFS repo for manual ingest queue.
-                if suffix_lower in _NFS_AUDIO_EXTENSIONS and self.audio_repo_dir:
-                    dest_dir = Path(self.audio_repo_dir) / self.collection_name
-                    manifest_media_type = "audio"
-                elif suffix_lower in _NFS_VIDEO_EXTENSIONS and self.video_repo_dir:
-                    dest_dir = Path(self.video_repo_dir) / self.collection_name
-                    manifest_media_type = "video"
-                else:
-                    # NFS not configured — fall through to temp-file path below.
-                    is_nfs_media = False
-                    dest_dir = None  # silence linter
-                    manifest_media_type = ""
-            else:
-                manifest_media_type = ""
-
-            if is_nfs_document or is_nfs_media:
-                dest_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
-                filename = Path(urlparse(url).path).name or f"download{suffix}"
-                tmp_path = str(dest_dir / filename)
-                with open(tmp_path, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            fh.write(chunk)
-                logger.debug(
-                    "Downloaded %s (%s) to NFS repo: %s",
-                    suffix_lower, manifest_media_type, tmp_path,
-                )
-
-                # Validate PDFs before registering them.
-                if is_pdf:
-                    try:
-                        from pdf2image import pdfinfo_from_path as _pdfinfo
-                        _pdfinfo(tmp_path)
-                    except Exception as pdf_exc:
+                # ── media file size cap ────────────────────────────────────
+                if is_nfs_media:
+                    content_length = int(resp.headers.get("Content-Length", 0))
+                    max_bytes = self.max_media_file_mb * 1024 * 1024
+                    if content_length > 0 and content_length > max_bytes:
+                        size_mb = content_length // (1024 * 1024)
                         logger.warning(
-                            "Corrupt or unreadable PDF at %s (pdfinfo failed: %s) — skipping",
-                            url, pdf_exc,
+                            "Media file too large (%d MB > %d MB limit), skipping: %s",
+                            size_mb, self.max_media_file_mb, url,
                         )
                         errors.append({
                             "url": url,
-                            "error_type": "corrupt_file",
-                            "status_code": resp.status_code,
-                            "error": f"pdfinfo validation failed: {pdf_exc}",
+                            "error_type": "missing_file",
+                            "status_code": resp.status,
+                            "error": f"file size {size_mb} MB exceeds limit {self.max_media_file_mb} MB",
                         })
-                        return None, {"status_code": resp.status_code}
+                        return None, {"status_code": resp.status}
 
-                # Compute hash and append to binary manifest.
-                with open(tmp_path, "rb") as fh:
-                    content_hash = _sha256(fh.read())
-                file_size = os.path.getsize(tmp_path)
-                content_type = resp.headers.get("Content-Type", "")
-                file_meta: dict = {
-                    "last_modified": resp.headers.get("Last-Modified"),
-                    "etag": resp.headers.get("ETag"),
-                    "content_hash": content_hash,
-                    "status_code": resp.status_code,
-                }
-                # Load existing manifest, remove any stale row for this URL,
-                # then append the fresh row.
-                manifest = self._load_binary_manifest()
-                manifest = [r for r in manifest if r.get("source_uri") != url]
-                manifest.append({
-                    "source_uri": url,
-                    "filename": filename,
-                    "local_path": tmp_path,
-                    "referring_page_url": referring_page_url,
-                    "content_hash": content_hash,
-                    "crawl_depth": depth,
-                    "file_size_bytes": file_size,
-                    "content_type": content_type,
-                    "downloaded_at": datetime.now(UTC).isoformat(),
-                    "last_ingested_hash": "",
-                    "collection_name": self.collection_name,
-                    "media_type": manifest_media_type,
-                })
-                self._save_binary_manifest(manifest)
-                return _MANIFEST, file_meta
-            else:
-                # Defer download to Phase 3 — record URL in binary manifest only.
-                # The GET body is never consumed (stream=True); response headers
-                # supply ETag/Last-Modified for future delta checks.
-                resp.close()
-                file_meta = {
-                    "last_modified": resp.headers.get("Last-Modified"),
-                    "etag": resp.headers.get("ETag"),
-                    "content_hash": "",  # computed at Phase 3 download time
-                    "status_code": resp.status_code,
-                }
-                filename = Path(urlparse(url).path).name or f"download{suffix}"
-                manifest = self._load_binary_manifest()
-                manifest = [r for r in manifest if r.get("source_uri") != url]
-                manifest.append({
-                    "source_uri": url,
-                    "filename": filename,
-                    "local_path": "",  # empty = not yet downloaded
-                    "referring_page_url": referring_page_url,
-                    "content_hash": "",
-                    "crawl_depth": depth,
-                    "file_size_bytes": int(resp.headers.get("Content-Length") or 0),
-                    "content_type": resp.headers.get("Content-Type", ""),
-                    "downloaded_at": "",
-                    "last_ingested_hash": "",
-                    "collection_name": self.collection_name,
-                    "media_type": "inline",
-                })
-                self._save_binary_manifest(manifest)
-                return _MANIFEST, file_meta
+                if is_nfs_document:
+                    if is_pdf and self.pdf_repo_dir:
+                        dest_dir = Path(self.pdf_repo_dir) / self.collection_name
+                        manifest_media_type = "document"
+                    elif not is_pdf and self.docs_repo_dir:
+                        dest_dir = Path(self.docs_repo_dir) / self.collection_name
+                        manifest_media_type = "document"
+                    else:
+                        is_nfs_document = False
+                        dest_dir = None
+                        manifest_media_type = ""
+                elif is_nfs_media:
+                    if suffix_lower in _NFS_AUDIO_EXTENSIONS and self.audio_repo_dir:
+                        dest_dir = Path(self.audio_repo_dir) / self.collection_name
+                        manifest_media_type = "audio"
+                    elif suffix_lower in _NFS_VIDEO_EXTENSIONS and self.video_repo_dir:
+                        dest_dir = Path(self.video_repo_dir) / self.collection_name
+                        manifest_media_type = "video"
+                    else:
+                        is_nfs_media = False
+                        dest_dir = None
+                        manifest_media_type = ""
+                else:
+                    manifest_media_type = ""
 
-        except requests.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
+                if is_nfs_document or is_nfs_media:
+                    dest_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
+                    filename = Path(urlparse(url).path).name or f"download{suffix}"
+                    tmp_path = str(dest_dir / filename)
+
+                    # Stream to disk — sync write inside async-for is fast (memory→disk buffer)
+                    with open(tmp_path, "wb") as _fh:
+                        async for _chunk in resp.content.iter_chunked(65536):
+                            _fh.write(_chunk)
+                    logger.debug(
+                        "Downloaded %s (%s) to NFS repo: %s",
+                        suffix_lower, manifest_media_type, tmp_path,
+                    )
+
+                    # Validate PDFs
+                    if is_pdf:
+                        try:
+                            from pdf2image import pdfinfo_from_path as _pdfinfo  # noqa: PLC0415
+                            await asyncio.to_thread(_pdfinfo, tmp_path)
+                        except Exception as pdf_exc:
+                            logger.warning(
+                                "Corrupt or unreadable PDF at %s (pdfinfo failed: %s) — skipping",
+                                url, pdf_exc,
+                            )
+                            errors.append({
+                                "url": url,
+                                "error_type": "corrupt_file",
+                                "status_code": resp.status,
+                                "error": f"pdfinfo validation failed: {pdf_exc}",
+                            })
+                            return None, {"status_code": resp.status}
+
+                    with open(tmp_path, "rb") as fh:
+                        content_hash = _sha256(fh.read())
+                    file_size = os.path.getsize(tmp_path)
+                    content_type = resp.headers.get("Content-Type", "")
+                    file_meta: dict = {
+                        "last_modified": resp.headers.get("Last-Modified"),
+                        "etag": resp.headers.get("ETag"),
+                        "content_hash": content_hash,
+                        "status_code": resp.status,
+                    }
+                    new_row = {
+                        "source_uri": url,
+                        "filename": filename,
+                        "local_path": tmp_path,
+                        "referring_page_url": referring_page_url,
+                        "content_hash": content_hash,
+                        "crawl_depth": depth,
+                        "file_size_bytes": file_size,
+                        "content_type": content_type,
+                        "downloaded_at": datetime.now(UTC).isoformat(),
+                        "last_ingested_hash": "",
+                        "collection_name": self.collection_name,
+                        "media_type": manifest_media_type,
+                    }
+                    async with self._manifest_lock:
+                        self._live_manifest = [r for r in self._live_manifest if r.get("source_uri") != url]
+                        self._live_manifest.append(new_row)
+                    return _MANIFEST, file_meta
+                else:
+                    # Defer download — record in manifest, don't consume body
+                    file_meta = {
+                        "last_modified": resp.headers.get("Last-Modified"),
+                        "etag": resp.headers.get("ETag"),
+                        "content_hash": "",
+                        "status_code": resp.status,
+                    }
+                    filename = Path(urlparse(url).path).name or f"download{suffix}"
+                    new_row = {
+                        "source_uri": url,
+                        "filename": filename,
+                        "local_path": "",
+                        "referring_page_url": referring_page_url,
+                        "content_hash": "",
+                        "crawl_depth": depth,
+                        "file_size_bytes": int(resp.headers.get("Content-Length") or 0),
+                        "content_type": resp.headers.get("Content-Type", ""),
+                        "downloaded_at": "",
+                        "last_ingested_hash": "",
+                        "collection_name": self.collection_name,
+                        "media_type": "inline",
+                    }
+                    async with self._manifest_lock:
+                        self._live_manifest = [r for r in self._live_manifest if r.get("source_uri") != url]
+                        self._live_manifest.append(new_row)
+                    return _MANIFEST, file_meta
+
+        except aiohttp.ClientResponseError as exc:
             logger.warning("Failed to download binary file %s: %s", url, exc)
             errors.append({
                 "url": url,
                 "error_type": "missing_file",
-                "status_code": status_code,
+                "status_code": exc.status,
                 "error": str(exc),
             })
-            return None, {"status_code": status_code}
+            return None, {"status_code": exc.status}
         except Exception as exc:
             logger.warning("Failed to download binary file %s: %s", url, exc)
             errors.append({
@@ -2168,6 +2255,16 @@ class SimpleWebCrawler:
         fd, path = tempfile.mkstemp(suffix=suffix, prefix="webcrawl_")
         with os.fdopen(fd, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    fh.write(chunk)
+        return path
+
+    @staticmethod
+    async def _save_temp_stream_async(resp: "aiohttp.ClientResponse", suffix: str = ".bin") -> str:
+        """Stream aiohttp response body to a named temp file and return its path."""
+        fd, path = tempfile.mkstemp(suffix=suffix, prefix="webcrawl_")
+        with os.fdopen(fd, "wb") as fh:
+            async for chunk in resp.content.iter_chunked(65536):
                 if chunk:
                     fh.write(chunk)
         return path

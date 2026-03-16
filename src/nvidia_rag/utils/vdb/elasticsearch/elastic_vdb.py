@@ -889,7 +889,7 @@ class ElasticVDB(VDBRagIngest):
             "info_value": info_value,
         }
         self._es_connection.index(index=DEFAULT_DOCUMENT_INFO_COLLECTION, body=data)
-        logger.info(
+        logger.debug(
             f"Document info added to the ES index {DEFAULT_DOCUMENT_INFO_COLLECTION}. \
             Document info: {info_type}, {document_name}, {info_value}."
         )
@@ -908,7 +908,7 @@ class ElasticVDB(VDBRagIngest):
         if len(response["hits"]["hits"]) > 0:
             return response["hits"]["hits"][0]["_source"]["info_value"]
         else:
-            logger.info(
+            logger.debug(
                 f"No document info found for collection: {collection_name}, document: {document_name}, info type: {info_type}"
             )
             return {}

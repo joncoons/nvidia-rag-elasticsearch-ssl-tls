@@ -1407,6 +1407,13 @@ CRAWLER_PRODUCT_URL_MAP: list[tuple[str, str, str | None]] = [
     ("docs.nvidia.com/datacenter/cloud-native",      "Data Center",   "Cloud Native"),
     ("docs.nvidia.com/datacenter",                   "Data Center",   "Data Center GPU"),
     ("docs.nvidia.com/dgx",                          "DGX",           "NVIDIA DGX"),
+    ("docs.nvidia.com/gpudirect-storage",            "Data Center",   "GPUDirect Storage"),
+    # ── NVIDIA Virtual GPU (vGPU / GRID) ──────────────────────────────────────
+    ("docs.nvidia.com/vgpu",                         "NVIDIA Virtual GPU", "NVIDIA vGPU Software"),
+    ("docs.nvidia.com/grid",                         "NVIDIA Virtual GPU", "NVIDIA GRID"),
+    ("docscontent.nvidia.com/dita",                  "NVIDIA Virtual GPU", "NVIDIA GRID/vGPU"),
+    # ── CUDA deployment tools ─────────────────────────────────────────────────
+    ("docs.nvidia.com/deploy",                       "CUDA",          "CUDA Deployment Tools"),
     # ── GPU architectures ─────────────────────────────────────────────────────
     ("docs.nvidia.com/blackwell",                    "Blackwell",     "Blackwell Architecture"),
     ("docs.nvidia.com/hopper",                       "Hopper",        "Hopper Architecture"),
@@ -1434,12 +1441,68 @@ CRAWLER_PRODUCT_URL_MAP: list[tuple[str, str, str | None]] = [
     ("docs.rapids.ai",                               "RAPIDS",        "RAPIDS"),
     ("developer.nvidia.com/rapids",                  "RAPIDS",        "RAPIDS"),
     ("rapids.ai",                                    "RAPIDS",        "RAPIDS"),
+    ("docs.nvidia.com/spark-rapids",                 "RAPIDS",        "Spark RAPIDS"),
+    ("docs.nvidia.com/cupynumeric",                  "RAPIDS",        "cuPyNumeric"),
+    ("docs.nvidia.com/legate",                       "RAPIDS",        "Legate NumPy"),
     # ── Modulus / Physics ML ──────────────────────────────────────────────────
     ("docs.nvidia.com/modulus",                      "Modulus",       "NVIDIA Modulus"),
     ("developer.nvidia.com/modulus",                 "Modulus",       "NVIDIA Modulus"),
-    # ── AI Enterprise / Fleet Command ─────────────────────────────────────────
+    ("docs.nvidia.com/physicsnemo",                  "Modulus",       "PhysicsNeMo"),
+    # ── HPC ───────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/hpc-sdk",                      "HPC",           "NVIDIA HPC SDK"),
+    ("docs.nvidia.com/nvpl",                         "HPC",           "NVIDIA Performance Libraries"),
+    ("docs.nvidia.com/nvshmem",                      "HPC",           "NVSHMEM"),
+    ("support.brightcomputing.com",                  "HPC",           "Bright Computing HPC"),
+    # ── Holoscan / Clara ──────────────────────────────────────────────────────
+    ("docs.nvidia.com/holoscan",                     "Holoscan",      "NVIDIA Holoscan"),
+    ("docs.nvidia.com/clara-holoscan",               "Holoscan",      "NVIDIA Holoscan"),
+    ("docs.nvidia.com/clara",                        "Holoscan",      "NVIDIA Clara"),
+    # ── Aerial (CUDA-Accelerated RAN) ─────────────────────────────────────────
+    ("docs.nvidia.com/aerial",                       "Aerial",        "NVIDIA Aerial"),
+    # ── TAO Toolkit ───────────────────────────────────────────────────────────
+    ("docs.nvidia.com/tao",                          "TAO Toolkit",   "NVIDIA TAO Toolkit"),
+    # ── NeMo Framework ────────────────────────────────────────────────────────
+    ("docs.nvidia.com/nemo",                         "NeMo",          "NeMo Framework"),
+    ("docs.nvidia.com/nemo-framework",               "NeMo",          "NeMo Framework"),
+    # ── BioNeMo ───────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/bionemo-framework",            "BioNeMo",       "NVIDIA BioNeMo"),
+    # ── Cosmos ────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/cosmos",                       "Cosmos",        "NVIDIA Cosmos"),
+    # ── Metropolis ────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/metropolis",                   "Metropolis",    "NVIDIA Metropolis"),
+    # ── Morpheus ──────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/morpheus",                     "Morpheus",      "NVIDIA Morpheus"),
+    # ── Maxine ────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/maxine",                       "Maxine",        "NVIDIA Maxine"),
+    # ── DOCA (Data Center / Networking) ───────────────────────────────────────
+    ("docs.nvidia.com/doca",                         "Networking",    "NVIDIA DOCA"),
+    # ── cuOpt ─────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/cuopt",                        "cuOpt",         "NVIDIA cuOpt"),
+    # ── ACE (AI Character Engine) ──────────────────────────────────────────────
+    ("docs.nvidia.com/ace",                          "AI Enterprise", "NVIDIA ACE"),
+    # ── NGC Catalog ───────────────────────────────────────────────────────────
+    ("docs.nvidia.com/ngc",                          "NGC",           "NGC Catalog"),
+    ("assets.ngc.nvidia.com",                        "NGC",           "NGC Catalog"),
+    # ── Base Command Platform / LaunchPad ─────────────────────────────────────
+    ("docs.nvidia.com/base-command-platform",        "Base Command",  "NVIDIA Base Command Platform"),
+    ("docs.nvidia.com/base-command-manager",         "Base Command",  "NVIDIA Base Command Manager"),
+    ("docs.nvidia.com/launchpad",                    "Base Command",  "NVIDIA LaunchPad"),
+    # ── Dynamo ────────────────────────────────────────────────────────────────
+    ("docs.nvidia.com/dynamo",                       "Dynamo",        "NVIDIA Dynamo"),
+    ("docs.dynamo.nvidia.com",                       "Dynamo",        "NVIDIA Dynamo"),
+    ("github.com/ai-dynamo",                         "Dynamo",        "NVIDIA Dynamo"),
+    # ── AI Enterprise / Fleet Command / Licensing ─────────────────────────────
     ("docs.nvidia.com/ai-enterprise",                "AI Enterprise", "NVIDIA AI Enterprise"),
     ("docs.nvidia.com/fleet-command",                "Fleet Command", "Fleet Command"),
+    ("docs.nvidia.com/license-system",               "AI Enterprise", "NVIDIA License System"),
+    # ── CUDA tooling (compute-sanitizer, cutlass, cupti) ──────────────────────
+    ("docs.nvidia.com/compute-sanitizer",            "CUDA",          "CUDA Compute Sanitizer"),
+    ("docs.nvidia.com/cutlass",                      "CUDA",          "CUTLASS"),
+    ("docs.nvidia.com/cupti",                        "CUDA",          "CUDA CUPTI"),
+    # ── Data Center infra (HGX, multi-node NVLink, attestation) ──────────────
+    ("docs.nvidia.com/hgx-platforms",                "Data Center",   "NVIDIA HGX"),
+    ("docs.nvidia.com/multi-node-nvlink-systems",    "Data Center",   "Multi-Node NVLink"),
+    ("docs.nvidia.com/attestation",                  "Data Center",   "NVIDIA Attestation"),
     # ── Developer blog / general ──────────────────────────────────────────────
     ("developer.nvidia.com/blog",                    "Blog",          "NVIDIA Developer Blog"),
     ("developer.nvidia.com/technical-blog",          "Blog",          "NVIDIA Technical Blog"),

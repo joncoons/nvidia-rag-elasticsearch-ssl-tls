@@ -48,7 +48,7 @@ export function useCrawlModeStatus() {
     refetchInterval: (query) => {
       const data = query.state.data;
       if (!data) return 10_000;
-      return (data.active || data.restoring) ? 5_000 : 15_000;
+      return (data.active || data.restoring) ? 10_000 : 30_000;
     },
     refetchIntervalInBackground: true,
     retry: false,
