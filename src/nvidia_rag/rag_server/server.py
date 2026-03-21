@@ -56,7 +56,7 @@ from nvidia_rag.rag_server.response_generator import (
     TextContent,
     error_response_generator,
 )
-from nvidia_rag.utils.configuration import NvidiaRAGConfig
+from nvidia_rag.utils.configuration import NvidiaRAGConfig, RAGServerConfig
 from nvidia_rag.utils.health_models import (
     DatabaseHealthInfo,
     NIMServiceHealthInfo,
@@ -68,7 +68,7 @@ logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
 # Create config instance - loads from environment variables and defaults
-CONFIG = NvidiaRAGConfig()
+CONFIG = RAGServerConfig()
 
 logger.info("Configuration loaded successfully")
 logger.debug(f"Configuration:\n{CONFIG}")

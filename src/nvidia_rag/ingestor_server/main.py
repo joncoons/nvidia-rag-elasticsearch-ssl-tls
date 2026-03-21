@@ -59,7 +59,7 @@ from nvidia_rag.ingestor_server.nvingest import (
     get_nv_ingest_ingestor,
 )
 from nvidia_rag.ingestor_server.task_handler import INGESTION_TASK_HANDLER
-from nvidia_rag.rag_server.main import APIError
+from nvidia_rag.utils.api_errors import APIError
 from nvidia_rag.utils.batch_utils import calculate_dynamic_batch_parameters
 from nvidia_rag.utils.common import (
     create_catalog_metadata,

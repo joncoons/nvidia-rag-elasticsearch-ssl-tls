@@ -157,6 +157,17 @@ class MinioOperator:
             self.client.remove_object(self.default_bucket_name, object_name)
 
 
+_MINIO_OPERATOR_INSTANCE = None
+
+
+def get_minio_operator_instance() -> "MinioOperator":
+    """Lazy-initialize and return a shared MinioOperator instance."""
+    global _MINIO_OPERATOR_INSTANCE
+    if _MINIO_OPERATOR_INSTANCE is None:
+        _MINIO_OPERATOR_INSTANCE = get_minio_operator()
+    return _MINIO_OPERATOR_INSTANCE
+
+
 def get_minio_operator(
     default_bucket_name: str = DEFAULT_BUCKET_NAME,
     config: NvidiaRAGConfig | None = None,

@@ -69,7 +69,7 @@ from langchain_core.runnables import RunnableAssign, RunnableLambda
 from langchain_elasticsearch import ElasticsearchStore
 from opentelemetry import context as otel_context
 
-from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping
+from nvidia_rag.utils.api_errors import APIError, ErrorCodeMapping
 from nvidia_rag.utils.common import (
     get_current_timestamp,
     perform_document_info_aggregation,

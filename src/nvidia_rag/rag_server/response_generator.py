@@ -50,43 +50,16 @@ try:
 except ImportError:
     _ES_EXCEPTIONS = ()
 
+from nvidia_rag.utils.api_errors import APIError, ErrorCodeMapping  # re-exported for backward compat
 from nvidia_rag.utils.minio_operator import (
     get_minio_operator,
+    get_minio_operator_instance,  # re-exported for backward compat
     get_unique_thumbnail_id,
     get_unique_thumbnail_id_from_result,
 )
 from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
 
 logger = logging.getLogger(__name__)
-
-
-class ErrorCodeMapping:
-    """Centralized mapping for HTTP status codes based on error types"""
-
-    SUCCESS = 200
-    ACCEPTED = 202
-    BAD_REQUEST = 400
-    UNAUTHORIZED = 401
-    FORBIDDEN = 403
-    NOT_FOUND = 404
-    METHOD_NOT_ALLOWED = 405
-    REQUEST_TIMEOUT = 408
-    UNPROCESSABLE_ENTITY = 422
-    CLIENT_CLOSED_REQUEST = 499
-    INTERNAL_SERVER_ERROR = 500
-    SERVICE_UNAVAILABLE = 503
-
-
-class APIError(Exception):
-    """Custom exception class for API errors."""
-
-    def __init__(self, message: str, status_code: int | None = None):
-        if status_code is None:
-            status_code = ErrorCodeMapping.BAD_REQUEST
-        logger.error("APIError occurred: %s with HTTP status: %d", message, status_code)
-        self.message = message
-        self.status_code = status_code
-        super().__init__(message)
 
 
 class RAGResponse:
@@ -102,17 +75,6 @@ SUMMARY_POLL_INTERVAL_SECONDS = 2
 FALLBACK_EXCEPTION_MSG = (
     "Error from rag-server. Please check rag-server logs for more details."
 )
-
-MINIO_OPERATOR = None
-
-
-def get_minio_operator_instance():
-    """Lazy initialize the MinioOperator instance"""
-    global MINIO_OPERATOR
-    if MINIO_OPERATOR is None:
-        MINIO_OPERATOR = get_minio_operator()
-    return MINIO_OPERATOR
-
 
 class Usage(BaseModel):
     """Token usage information."""

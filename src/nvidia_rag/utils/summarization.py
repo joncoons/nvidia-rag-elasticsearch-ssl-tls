@@ -37,7 +37,7 @@ from langchain_core.output_parsers.string import StrOutputParser
 from langchain_core.prompts.chat import ChatPromptTemplate
 from transformers import AutoTokenizer
 
-from nvidia_rag.rag_server.response_generator import get_minio_operator_instance
+from nvidia_rag.utils.minio_operator import get_minio_operator_instance
 from nvidia_rag.utils.configuration import NvidiaRAGConfig
 from nvidia_rag.utils.llm import get_llm, get_prompts
 from nvidia_rag.utils.minio_operator import get_unique_thumbnail_id

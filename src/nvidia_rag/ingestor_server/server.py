@@ -52,8 +52,8 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
 
 from nvidia_rag.ingestor_server.main import Mode, NvidiaRAGIngestor
-from nvidia_rag.rag_server.main import APIError
-from nvidia_rag.utils.configuration import NvidiaRAGConfig
+from nvidia_rag.utils.api_errors import APIError
+from nvidia_rag.utils.configuration import IngestorServerConfig, NvidiaRAGConfig
 from nvidia_rag.utils.health_models import (
     DatabaseHealthInfo,
     IngestorHealthResponse,
@@ -155,7 +155,7 @@ app.add_middleware(
 EXAMPLE_DIR = "./"
 
 # Initialize configuration and ingestor
-CONFIG = NvidiaRAGConfig()
+CONFIG = IngestorServerConfig()
 PROMPT_CONFIG_FILE = os.environ.get("PROMPT_CONFIG_FILE", "/prompt.yaml")
 NV_INGEST_INGESTOR = NvidiaRAGIngestor(
     mode=Mode.SERVER,

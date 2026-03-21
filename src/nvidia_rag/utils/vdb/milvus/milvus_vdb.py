@@ -76,7 +76,7 @@ from pymilvus import (
 )
 from pymilvus.orm.types import CONSISTENCY_STRONG
 
-from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping
+from nvidia_rag.utils.api_errors import APIError, ErrorCodeMapping
 from nvidia_rag.utils.common import (
     get_current_timestamp,
     perform_document_info_aggregation,

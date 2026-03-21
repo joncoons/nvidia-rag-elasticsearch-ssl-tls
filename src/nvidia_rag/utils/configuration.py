@@ -1376,6 +1376,37 @@ class NvidiaRAGConfig(_ConfigBase):
         )
 
 
+class RAGServerConfig(NvidiaRAGConfig):
+    """Configuration for the RAG query/chat server.
+
+    Inherits all fields from NvidiaRAGConfig.  Instantiate this in
+    ``rag_server/`` instead of ``NvidiaRAGConfig`` directly so the type
+    system makes server ownership explicit.
+
+    RAG-server-specific sub-configs: llm, query_rewriter,
+    filter_expression_generator, ranking, retriever, vlm,
+    query_decomposition, reflection, tavily.
+
+    Top-level flags: enable_guardrails, enable_citations,
+    enable_vlm_inference, vlm_to_llm_fallback, default_confidence_threshold.
+    """
+
+
+class IngestorServerConfig(NvidiaRAGConfig):
+    """Configuration for the document ingestor server.
+
+    Inherits all fields from NvidiaRAGConfig.  Instantiate this in
+    ``ingestor_server/`` instead of ``NvidiaRAGConfig`` directly so the type
+    system makes server ownership explicit.
+
+    Ingestor-specific sub-configs: nv_ingest, nemo_parse, text_splitter,
+    summarizer, minio, metadata.
+
+    Top-level fields: temp_dir, pdf_repo_dir, docs_repo_dir,
+    audio_repo_dir, video_repo_dir, max_media_file_mb.
+    """
+
+
 # ---------------------------------------------------------------------------
 # URL → product mapping used by SimpleWebCrawler and backfill scripts.
 # Each entry: (url_prefix_substring, product_family, product_name | None)

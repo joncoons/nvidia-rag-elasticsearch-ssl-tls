@@ -35,7 +35,7 @@ from langchain_core.language_models.llms import LLM
 from langchain_core.language_models.chat_models import SimpleChatModel
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping
+from nvidia_rag.utils.api_errors import APIError, ErrorCodeMapping
 from nvidia_rag.utils.common import (
     NVIDIA_API_DEFAULT_HEADERS,
     combine_dicts,
