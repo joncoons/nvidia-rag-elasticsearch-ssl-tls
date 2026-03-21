@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # Redis connection configuration constants
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2
 REDIS_SOCKET_TIMEOUT_SECONDS = 2
-REDIS_STATUS_TTL_SECONDS = 86400  # 24 hours
+REDIS_STATUS_TTL_SECONDS = 172800  # 48 hours (nv-ingest 26.3.0 default)
 REDIS_MAX_CONNECTIONS = 50  # Connection pool size
 
 

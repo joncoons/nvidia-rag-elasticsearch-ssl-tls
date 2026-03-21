@@ -311,7 +311,8 @@ class NvIngestConfig(_ConfigBase):
     pdf_extract_method: str | None = Field(
         default=None,
         env="APP_NVINGEST_PDFEXTRACTMETHOD",
-        description="Method to use for PDF extraction",
+        description="Method to use for PDF extraction. Options: None, pdfium, pdfium_hybrid, ocr, nemotron_parse. "
+        "pdfium_hybrid and ocr target scanned/image-based PDFs (added in nv-ingest 26.3.0).",
     )
 
     @field_validator("pdf_extract_method", mode="before")
